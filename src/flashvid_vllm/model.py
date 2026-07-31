@@ -232,7 +232,7 @@ class FlashVIDQwen3_5ForConditionalGeneration(
                 retention_mask=retention_mask,
             )
             output.append(final)
-            logger.info(
+            logger.warning(
                 "FlashVID compressed video %d: %d -> %d tokens (%.2f ms)",
                 index,
                 result.original_tokens,

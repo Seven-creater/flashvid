@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashvid-vllm"
+version = "0.1.0"
+description = "FlashVID vision-side token compression for Qwen3.5 and vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Seven-creater" }]
+dependencies = [
+  "torch>=2.8",
+]
+
+[project.optional-dependencies]
+serve = [
+  "vllm==0.25.1",
+]
+test = [
+  "pytest>=8",
+]
+bench = [
+  "aiohttp>=3.10",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+flashvid-serve = "flashvid_vllm.cli:main"
+
+[project.entry-points."vllm.general_plugins"]
+flashvid_qwen3_5 = "flashvid_vllm.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+

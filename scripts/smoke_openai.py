@@ -10,15 +10,20 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="qwen3.5-4b-flashvid")
     media = parser.add_mutually_exclusive_group()
-    media.add_argument("--video-url")
+    media.add_argument(
+        "--video-url",
+        action="append",
+        help="Video URL; repeat the flag to exercise multi-video requests.",
+    )
     media.add_argument("--image-url")
     parser.add_argument("--prompt", default="Describe this video concisely.")
     args = parser.parse_args()
 
     content = []
     if args.video_url:
-        content.append(
-            {"type": "video_url", "video_url": {"url": args.video_url}}
+        content.extend(
+            {"type": "video_url", "video_url": {"url": url}}
+            for url in args.video_url
         )
     elif args.image_url:
         content.append(

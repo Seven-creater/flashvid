@@ -15,7 +15,8 @@ def test_cli_maps_retention_to_vllm_pruning():
             "8",
         ]
     )
-    assert command[:3] == ["vllm", "serve", "/models/qwen"]
+    assert command[0].endswith(("vllm", "vllm.exe"))
+    assert command[1:3] == ["serve", "/models/qwen"]
     rate_index = command.index("--video-pruning-rate") + 1
     assert float(command[rate_index]) == pytest.approx(0.9)
     override_index = command.index("--hf-overrides") + 1
@@ -37,4 +38,3 @@ def test_cli_rejects_conflicting_internal_flags():
         build_vllm_command(
             ["model", "--vision-retention-ratio", "0.5", "--video-pruning-rate", "0.2"]
         )
-

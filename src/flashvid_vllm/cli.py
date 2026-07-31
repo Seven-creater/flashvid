@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -37,8 +38,11 @@ def build_vllm_command(argv: list[str]) -> tuple[list[str], dict[str, str]]:
             "flashvid-serve manages them."
         )
 
+    executable = Path(sys.executable).with_name(
+        "vllm.exe" if os.name == "nt" else "vllm"
+    )
     command = [
-        "vllm",
+        str(executable),
         "serve",
         args.model,
         "--hf-overrides",
@@ -56,4 +60,3 @@ def build_vllm_command(argv: list[str]) -> tuple[list[str], dict[str, str]]:
 def main() -> None:
     command, environment = build_vllm_command(sys.argv[1:])
     raise SystemExit(subprocess.call(command, env=environment))
-

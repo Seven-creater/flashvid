@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 
 from . import ARCHITECTURE
 
@@ -63,6 +64,22 @@ def build_vllm_command(argv: list[str]) -> tuple[list[str], dict[str, str]]:
             if existing
             else str(compatibility_library)
         )
+    cuda_toolkit = Path(sysconfig.get_path("purelib")) / "nvidia" / "cu13"
+    if cuda_toolkit.is_dir():
+        environment["CUDA_HOME"] = str(cuda_toolkit)
+        environment["CUDA_PATH"] = str(cuda_toolkit)
+        environment["CUDA_LIB_PATH"] = str(cuda_toolkit / "lib")
+        environment["FLASHINFER_NVCC"] = str(cuda_toolkit / "bin" / "nvcc")
+        environment["PATH"] = (
+            f"{cuda_toolkit / 'bin'}:{environment.get('PATH', '')}"
+        )
+    project_root = environment_root.parent
+    cache_root = project_root / ".cache"
+    environment.setdefault("XDG_CACHE_HOME", str(cache_root))
+    environment.setdefault("FLASHINFER_WORKSPACE_BASE", str(project_root))
+    environment.setdefault(
+        "TORCH_EXTENSIONS_DIR", str(cache_root / "torch_extensions")
+    )
     return command, environment
 
 

@@ -99,7 +99,9 @@ bash scripts/download_model.sh
 
 `setup_server.sh` installs the CUDA 13 forward-compatibility userspace library
 inside `.venv` when required by the pinned vLLM wheel. It does not replace the
-host driver or require root.
+host driver or require root. The launcher also binds the wheel-provided CUDA
+toolkit for JIT compilation and redirects vLLM, FlashInfer, and Torch caches to
+the project `.cache/` directory.
 
 Start the recommended 8×A6000 throughput configuration:
 

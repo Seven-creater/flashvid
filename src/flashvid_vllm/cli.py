@@ -54,6 +54,15 @@ def build_vllm_command(argv: list[str]) -> tuple[list[str], dict[str, str]]:
     environment = os.environ.copy()
     environment["FLASHVID_VISION_RETENTION_RATIO"] = str(ratio)
     environment.setdefault("VLLM_PLUGINS", "flashvid_qwen3_5")
+    environment_root = Path(sys.executable).resolve().parent.parent
+    compatibility_library = environment_root / "cuda-compat"
+    if compatibility_library.is_dir():
+        existing = environment.get("LD_LIBRARY_PATH", "")
+        environment["LD_LIBRARY_PATH"] = (
+            f"{compatibility_library}:{existing}"
+            if existing
+            else str(compatibility_library)
+        )
     return command, environment
 
 

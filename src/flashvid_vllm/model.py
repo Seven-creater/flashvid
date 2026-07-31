@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 from typing import Any
@@ -18,10 +17,11 @@ from vllm.model_executor.models.qwen3_vl import (
     Qwen3VLDummyInputsBuilder,
     Qwen3VLMultiModalProcessor,
 )
+from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 def _ratio_from_environment() -> float:

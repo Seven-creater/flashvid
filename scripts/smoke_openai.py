@@ -9,19 +9,29 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="qwen3.5-4b-flashvid")
-    parser.add_argument("--video-url", required=True)
+    media = parser.add_mutually_exclusive_group()
+    media.add_argument("--video-url")
+    media.add_argument("--image-url")
     parser.add_argument("--prompt", default="Describe this video concisely.")
     args = parser.parse_args()
+
+    content = []
+    if args.video_url:
+        content.append(
+            {"type": "video_url", "video_url": {"url": args.video_url}}
+        )
+    elif args.image_url:
+        content.append(
+            {"type": "image_url", "image_url": {"url": args.image_url}}
+        )
+    content.append({"type": "text", "text": args.prompt})
 
     payload = {
         "model": args.model,
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "video_url", "video_url": {"url": args.video_url}},
-                    {"type": "text", "text": args.prompt},
-                ],
+                "content": content,
             }
         ],
         "temperature": 0,
@@ -39,4 +49,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

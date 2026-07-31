@@ -19,6 +19,12 @@ export TORCH_HOME="${CACHE_DIR}/torch"
 "${ENV_DIR}/bin/python" -m pip install "vllm==0.25.1"
 "${ENV_DIR}/bin/python" -m pip install -e "${PROJECT_DIR}[test,bench]"
 
+TORCH_CUDA_MAJOR="$("${ENV_DIR}/bin/python" -c 'import torch; print(torch.version.cuda.split(".")[0])')"
+if [[ "${TORCH_CUDA_MAJOR}" -ge 13 ]]; then
+  "${CONDA_BIN}" install -y -p "${ENV_DIR}" "anaconda::cuda-compat=13.0.2"
+  export LD_LIBRARY_PATH="${ENV_DIR}/cuda-compat:${LD_LIBRARY_PATH:-}"
+fi
+
 "${ENV_DIR}/bin/python" - <<'PY'
 import torch
 import vllm
@@ -29,4 +35,3 @@ print("cuda_available", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("gpu", torch.cuda.get_device_name(0))
 PY
-

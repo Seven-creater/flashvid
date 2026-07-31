@@ -11,6 +11,7 @@ export VLLM_CACHE_ROOT="${PROJECT_DIR}/.cache/vllm"
 export TORCH_HOME="${PROJECT_DIR}/.cache/torch"
 export VLLM_PLUGINS="flashvid_qwen3_5"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export LD_LIBRARY_PATH="${PROJECT_DIR}/.venv/cuda-compat:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "${PROJECT_DIR}/logs" "${PROJECT_DIR}/results"
 exec "${PROJECT_DIR}/.venv/bin/flashvid-serve" "${MODEL_DIR}" \
@@ -24,4 +25,3 @@ exec "${PROJECT_DIR}/.venv/bin/flashvid-serve" "${MODEL_DIR}" \
   --host 0.0.0.0 \
   --port "${PORT}" \
   2>&1 | tee "${PROJECT_DIR}/logs/server-dp8-r${RATIO}.log"
-

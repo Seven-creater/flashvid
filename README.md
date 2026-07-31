@@ -97,6 +97,10 @@ bash scripts/setup_server.sh
 bash scripts/download_model.sh
 ```
 
+`setup_server.sh` installs the CUDA 13 forward-compatibility userspace library
+inside `.venv` when required by the pinned vLLM wheel. It does not replace the
+host driver or require root.
+
 Start the recommended 8×A6000 throughput configuration:
 
 ```bash
@@ -145,4 +149,3 @@ The compression algorithm is adapted from
 [Fanziyang-v/FlashVID](https://github.com/Fanziyang-v/FlashVID), released under
 Apache-2.0. The vLLM integration reuses public extension points and the
 multimodal pruning/M-RoPE protocol from vLLM 0.25.1.
-

@@ -122,28 +122,36 @@ class FlashVIDQwen3_5ForConditionalGeneration(
         scale = head_dim**-0.5
         for temporal, height, width in grid_thw.tolist():
             patches_per_frame = height * width
-            video_attention: list[torch.Tensor] = []
-            for _ in range(temporal):
-                frame_query = query[offset : offset + patches_per_frame].transpose(
-                    0, 1
+            video_length = temporal * patches_per_frame
+            video_query = (
+                query[offset : offset + video_length]
+                .view(temporal, patches_per_frame, heads, head_dim)
+                .permute(0, 2, 1, 3)
+            )
+            video_key = (
+                key[offset : offset + video_length]
+                .view(temporal, patches_per_frame, heads, head_dim)
+                .permute(0, 2, 1, 3)
+            )
+            received = torch.zeros(
+                temporal,
+                patches_per_frame,
+                device=query.device,
+                dtype=torch.float32,
+            )
+            transposed_key = video_key.float().transpose(-1, -2)
+            for start in range(0, patches_per_frame, chunk):
+                logits = torch.matmul(
+                    video_query[:, :, start : start + chunk].float(),
+                    transposed_key,
                 )
-                frame_key = key[offset : offset + patches_per_frame].transpose(0, 1)
-                received = torch.zeros(
-                    patches_per_frame, device=query.device, dtype=torch.float32
-                )
-                for start in range(0, patches_per_frame, chunk):
-                    logits = torch.matmul(
-                        frame_query[:, start : start + chunk].float(),
-                        frame_key.float().transpose(-1, -2),
-                    )
-                    probabilities = torch.softmax(logits * scale, dim=-1)
-                    received += probabilities.sum(dim=(0, 1))
-                received /= heads * patches_per_frame
-                video_attention.append(
-                    received.view(-1, merge_unit).mean(dim=-1)
-                )
-                offset += patches_per_frame
-            outputs.append(torch.stack(video_attention))
+                probabilities = torch.softmax(logits * scale, dim=-1)
+                received += probabilities.sum(dim=(1, 2))
+            received /= heads * patches_per_frame
+            outputs.append(
+                received.view(temporal, -1, merge_unit).mean(dim=-1)
+            )
+            offset += video_length
         if offset != sequence:
             raise RuntimeError("QKV length does not match video grids")
         return tuple(outputs)

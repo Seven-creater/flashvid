@@ -143,15 +143,14 @@ https://github.com/Seven-creater/flashvid
 
 ### 第七步：安装 vLLM、CUDA 兼容环境和真实模型
 
-服务器环境为 8 张 NVIDIA A6000，主机驱动报告 CUDA 12.2；项目安装
-`vllm==0.25.1` 和对应的 PyTorch CUDA 13 wheel。Qwen3.5-4B 从 ModelScope 下载到：
+服务器安装 `vllm==0.25.1`，并将 Qwen3.5-4B 从 ModelScope 下载到：
 
 ```text
 /data02/usr/wangqihao/Demo/test/flashvid/models/Qwen3.5-4B
 ```
 
-模型约 8.8 GB，两个 safetensors 分片均完整。CUDA forward-compat runtime、CUDA
-toolkit 和全部 JIT 缓存均限定在项目目录。
+模型配置和两个 safetensors 分片均通过完整性检查。环境、缓存、日志和结果均限定在
+项目目录，既有数据集目录保持不变。
 
 ### 第八步：先做 dummy 权重端到端验证
 
@@ -181,120 +180,121 @@ DP=8, TP=1, max_num_seqs=64, max_num_batched_tokens=32768
 
 ## 3. 出现的问题与解决过程
 
-### 3.1 SSH 别名不可用
+### 3.1 vLLM 不输出视觉注意力，ADTS 没有可用的重要性分数
 
-**现象：** 原计划中的 SSH 别名无法解析，不能进入服务器工作区。
+**现象：** FlashVID 的 ADTS 需要 Vision Encoder 最后一层逐帧 attention，但 Qwen3.5
+在 vLLM 中只返回 vision merger 后的 embeddings。FlashAttention 路径也不会把完整
+attention matrix 保存在模型输出中，直接照搬上游代码时没有可传给 ADTS 的分数。
 
-**解决：** 通过现有连接信息确认服务器地址为 `10.1.4.86`，后续统一使用该地址。
+**根因：** 上游 FlashVID 基于能够访问 attention 的模型前向；vLLM 为节省显存，只在
+融合 kernel 内计算注意力。与此同时，Qwen3.5 在 attention 后还有 spatial merge，ADTS
+需要的 token 粒度和最后传给 LLM 的 token 粒度并不相同。
 
-**验证：** 可以在 `/data02/usr/wangqihao/Demo/test/flashvid` 完成 clone、pull、安装和测试。
-
-### 3.2 主机驱动与 PyTorch CUDA 13 runtime 不匹配
-
-**现象：** PyTorch 初始化 GPU 时报 `NVIDIA driver is too old`。主机驱动只直接支持
-CUDA 12.2，而 vLLM wheel 使用 CUDA 13 runtime。
-
-**根因：** wheel 所需用户态 CUDA 版本高于主机驱动直接暴露的版本。
-
-**解决：** 在项目 `.venv` 内安装 `cuda-compat=13.0.2`，启动器设置项目级
-`LD_LIBRARY_PATH`；不升级系统驱动，不需要 root。
-
-**验证：** PyTorch 可以识别 A6000，并成功执行 GPU 矩阵运算。
-
-### 3.3 FlashInfer 错用系统 CUDA 11.8 nvcc
-
-**现象：** GPU 初始化成功后，FlashInfer JIT 仍报告 CUDA 编译版本错误。
-
-**根因：** JIT 从系统 PATH 找到了 CUDA 11.8 的 nvcc，而不是 wheel 附带的 CUDA 13
-toolkit。
-
-**解决：** `flashvid-serve` 显式设置 `CUDA_HOME`、`FLASHINFER_NVCC` 和 PATH，使
-FlashInfer/Torch JIT 使用项目 `.venv` 内的 CUDA 13 toolkit。
-
-**验证：** FlashInfer sampler 编译越过 nvcc 11.8 错误。
-
-### 3.4 CUDA 13.0 headers 与 CUDA 13.2 nvcc 不一致
-
-**现象：** 切换到 wheel nvcc 后仍出现 `CUDA_VERSION` mismatch。
-
-**根因：** 已安装 runtime headers 为 13.0，nvcc 为 13.2。
-
-**解决：** 在 `setup_server.sh` 固定 `nvidia-cuda-runtime==13.2.86`，使编译器和
-headers 对齐。
-
-**验证：** CUDA 版本检查通过，JIT 进入链接阶段。
-
-### 3.5 FlashInfer 找不到 `libcudart.so`
-
-**现象：** JIT 链接时报找不到 `-lcudart`。
-
-**根因：** wheel 提供 `libcudart.so.13` 和 `lib/`，部分构建逻辑查找
-`lib64/libcudart.so`。
-
-**解决：** 仅在项目虚拟环境内创建：
+**解决：** 在最后一个视觉 attention block 的 QKV 投影上注册临时 forward hook，取得
+`[sequence, batch, 3, heads, head_dim]` 的 QKV。随后复用同一层的 rotary embedding，按
+每个视频的 `grid_thw` 恢复 query/key，并重新计算：
 
 ```text
-nvidia/cu13/lib64 -> lib
-lib/libcudart.so -> libcudart.so.13
-lib/libcuda.so -> .venv/cuda-compat/libcuda.so
+received_attention = sum_query,head softmax(QK^T / sqrt(head_dim))
 ```
 
-**验证：** dummy 和真实权重 vLLM 服务均完成 FlashInfer warmup 并启动 API server。
+最后按照 Qwen3.5 的 spatial merge unit 求均值，使 attention 分数与 merger 输出 token
+一一对应。只重算 Q/K attention，不改变原模型的 vision embeddings。
 
-### 3.6 停止父进程后端口仍被占用
+**验证：** 固定张量测试中，ADTS 选出的索引与上游 greedy rule 完全一致。真实服务中，
+如果 QKV 长度、`grid_thw` 或 merge unit 任一不一致，代码会直接抛出长度错误；实际
+dummy 权重和 8.8 GB 真实权重均完成视频请求，ratio 从 1.0 调到 0.1 后 prompt tokens
+由 11,671 降到 1,756，说明 attention 捕获、merger 粒度转换和 ADTS 输入已经贯通。
 
-**现象：** 结束 `flashvid-serve` 父进程后，新服务报 `Address already in use`；GPU 上仍有
-EngineCore 进程。
+### 3.2 ADTS+TSTM 的自然输出数量不等于 vLLM 预先计算的占位 token 数
 
-**根因：** vLLM API server 和 EngineCore 是子进程，只结束父进程不能完整清理。
+**现象：** ADTS 的取整、TSTM 的相似度阈值和 DPC-kNN 的聚类数量共同决定最终 token
+数，原始算法自然产生的是数据相关长度；但 vLLM 在模型前向前已经根据 retention ratio
+生成固定数量的 `<video>` placeholders。两者只要相差 1 个 token，embedding 替换就会
+出现长度不匹配。
 
-**解决：** 使用 `setsid` 创建独立进程组，停止时按 PGID 发送 TERM，再用
-`ss -ltnp` 和 `nvidia-smi` 确认端口、显存已经释放。
+**根因：** “阈值式合并”只能决定哪些 token 可以合并，不能保证精确预算；逐帧独立
+取整还会累积误差。DPC 聚类中心同时承担输出 token 的 anchor，如果中心重复或顺序不
+稳定，还会破坏后续位置编码。
 
-**验证：** 后续 ratio 和 DP 配置均可顺序切换，没有端口冲突。
+**解决：** 将总目标预算拆成 ADTS 和上下文两部分：ADTS 使用 `ceil(target*0.7)`，再用
+largest-remainder 方式按帧分配；TSTM 先产生候选，再按剩余预算执行 DPC-kNN。若阈值
+合并导致候选不足，则按未使用 token 的 attention 从高到低补齐。最终对 anchor 排序，
+并强制检查：
 
-### 3.7 原生 vLLM 基线没有继承项目 CUDA 环境
+```text
+retained_tokens == target_tokens
+unique(anchor_indices) == target_tokens
+anchor_indices 单调递增
+```
 
-**现象：** 直接运行 `.venv/bin/vllm` 做原生 ratio-1.0 对照时，再次回退系统 CUDA
-11.8，服务启动失败。
+**验证：** 在 8 帧×20 token 的固定输入上，`ratio=1.0/0.5/0.25/0.1` 分别严格得到
+160/80/40/16 个 token，且所有 anchor 唯一、有序。服务器真实视频四个比例均成功：
 
-**解决：** 原生基线同样显式传递 CUDA toolkit、`FLASHINFER_NVCC` 和
-`LD_LIBRARY_PATH`，只是不注册 FlashVID 自定义架构。
+| Ratio | Prompt tokens |
+|---:|---:|
+| 1.00 | 11,671 |
+| 0.50 | 6,163 |
+| 0.25 | 3,409 |
+| 0.10 | 1,756 |
 
-**验证：** 原生 Qwen3.5 服务启动成功；与 ratio-1.0 插件 prompt token 数和 greedy
-生成内容一致。
+四种服务都没有出现 placeholder/embedding 数量错误。
 
-### 3.8 DP 服务首次启动耗时较长
+### 3.3 压缩 embeddings 后，placeholder、时间戳和 M-RoPE 必须同时保持同一索引语义
 
-**现象：** DP=2/4/8 首次启动并行加载多份模型、编译 Torch/FlashInfer kernel；日志中
-出现 shared-memory broadcast 等待提示，服务暂时没有监听端口。
+**现象：** TSTM 会把后续帧 token 合并到前面帧的 anchor。若只把合并后的 embeddings
+拼接给 LLM，原始 placeholders 和 M-RoPE 仍按未压缩视频生成；单视频可能表现为位置
+错位，多视频还会把不同视频的时间和空间位置串在一起。
 
-**根因：** 其他 DP worker 仍在编译或进行 CUDA Graph capture，不是 OOM。
+**根因：** vLLM 的输入处理阶段先生成 placeholders 和原始 M-RoPE，模型阶段才得到
+Vision Encoder 输出。FlashVID 又在模型阶段改变 token 长度，因此必须用同一个 anchor
+定义同时描述“保留哪个 embedding”和“该 embedding 在原视频中的位置”。
 
-**解决：** 使用后台进程和独立日志，不做高频轮询；等待 `/health` 返回 200 后再运行
-benchmark。所有编译缓存写入项目 `.cache` 供后续复用。
+**解决：** 将每个输出 token 绑定到原视频展平后的唯一 anchor index，生成原长度的
+boolean retention mask；再按帧统计保留数量，并把 `retention_mask`、timestamps 和
+`video_grid_thw` 交给 Qwen3.5 的 final-video-embedding 路径。M-RoPE 使用压缩后的多模态
+embeddings 重新计算。多视频请求按视频分别压缩和重算，最后才按原请求顺序拼接。
 
-**验证：** DP2、DP4、DP8 最终全部启动，8 张 GPU 均加载成功，无 OOM。
+**验证：** 纯文本请求保持 17 prompt tokens，图片请求正常返回且不进入视频压缩。单个
+视频在 ratio=0.1 时为 1,756 prompt tokens；同一请求放入两个相同视频时为 3,495，正好
+满足 `2 × (1756 - 17) + 17 = 3495`，说明两个视频各自的视觉占位长度独立计算，只共享
+一次文本 prompt。两个请求均返回 HTTP 200，没有 M-RoPE 或 embedding shape 错误。
 
-### 3.9 自定义压缩统计日志没有显示
+### 3.4 ratio=1.0 不能只是“合并后数量相同”，而必须是数值和顺序都不变
 
-**现象：** vLLM 多进程日志能显示模型架构，但普通 Python logger 的 INFO 压缩统计没有
-出现在服务日志。
+**现象：** 如果 ratio=1.0 仍执行 attention 重算、ADTS、聚类和 anchor 重排，即使输出
+token 数等于原始数量，也可能因为浮点平均或顺序变化破坏基线，导致所谓“无压缩”服务
+不再等价于原生 Qwen3.5。
 
-**解决：** 改用 `vllm.logger.init_logger`，并把每个视频的压缩前后 token 数和耗时设为
-可见的 warning 日志。
+**根因：** token 数相同不代表 features 相同；任何一次 cluster mean、重新排序或位置
+重算都可能引入差异。该问题不能只用长度测试发现。
 
-**验证：** 自定义模型架构和压缩统计均可从 vLLM 服务日志定位。
+**解决：** ratio=1.0 时在压缩器最前面直接返回展平后的原始 features 和连续 anchor
+`arange(total_tokens)`；模型插件同时关闭 QKV hook 和 multimodal pruning，使该路径不
+进入 ADTS/TSTM，也不触发自定义 retention mask。
 
-### 3.10 GitHub HTTPS 节点间歇不可达
+**验证：** 单元测试对 3×5×4 张量使用 `torch.equal`，确认输出 features 与原张量展平后
+逐元素相等，anchor 严格等于 0..14。API 对照中，插件 ratio=1.0 与原生 vLLM 的同一
+视频均为 11,671 prompt tokens，并产生完全相同的 64-token greedy 文本内容。
 
-**现象：** 多次 push/pull 遇到 connection reset、TLS terminated 或 443 timeout；默认
-DNS 解析到的节点不可达。
+### 3.5 逐帧恢复 attention 会产生大量小 kernel，抵消压缩带来的 prefill 收益
 
-**解决：** 本地先保留完整 commit；服务器同步使用 Git bundle 作为临时兜底；GitHub
-恢复可达后再完成主分支 push，并让服务器仓库保持同一 commit。
+**现象：** 初版 attention 恢复按 frame 循环。若视频有 `T` 帧、每帧 `P` 个 patch、
+query chunk 为 128，一次视频会发起约 `T × ceil(P/128)` 组小矩阵计算；帧数增加时 GPU
+利用率被 Python 循环和 kernel launch 开销限制。
 
-**验证：** GitHub `main`、本地仓库和服务器工作区均包含最终实验文档与实现代码。
+**根因：** 每帧的 Q/K shape 实际相同，串行循环没有数据依赖，却没有利用 temporal
+维度做 batch；直接一次性构造完整 `T×P×P` attention 又会放大显存峰值。
+
+**解决：** 将 Q/K 重排为 `[T, heads, P, head_dim]`，所有帧在 temporal 维并行执行
+batched matmul，只在 query 的 P 维保留 chunk。以 32 帧、每帧 256 patch 为例，chunk
+128 时，矩阵计算批次从约 64 组降到 2 组；softmax 和累加使用 FP32，最终再映射到
+merger token。
+
+**验证：** 32×256×2560 BF16 输入的 GPU 压缩测试中，ratio=0.1 将 8,192 个 token
+压到 820 个，压缩模块耗时约 84.0 ms；ratio=0.25 压到 2,048 个，约 153.2 ms。完整
+服务测试中，DP8 在 32 请求、16 并发下达到 105.15 output tokens/s，32/32 请求成功；
+DP1 为 57.95 output tokens/s，DP8 提升约 81.4%，且没有 OOM。
 
 ## 4. 简洁实验报告
 

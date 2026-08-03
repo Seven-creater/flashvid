@@ -356,6 +356,7 @@ def main() -> None:
         "--backend",
         choices=(
             "direct",
+            "text_only",
             "agent",
             "hybrid",
             "hybrid_frozen",

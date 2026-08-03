@@ -28,6 +28,17 @@ def format_question(sample: Sample) -> str:
     )
 
 
+def format_text_only_question(sample: Sample) -> str:
+    choices = "\n".join(f"{letter}: {text}" for letter, text in sample.choices.items())
+    return (
+        "Answer the multiple-choice question using only the question and answer "
+        "choices below. No video, images, subtitles, timestamps, or other visual "
+        "evidence are provided. Choose the best option and return only one option "
+        "letter using the format `Answer: X`.\n\n"
+        f"Question: {sample.question}\n{choices}"
+    )
+
+
 def _content_with_video(video: Path, text: str) -> list[dict[str, Any]]:
     return [
         {"type": "video_url", "video_url": {"url": video.as_uri()}},
@@ -703,6 +714,32 @@ class Evaluator:
             "gate_reason": None,
             "question_type": sorted(_question_type_labels(sample.metadata)) or None,
             "question_route": _question_route(sample.question, sample.metadata),
+        }
+        record.update(_usage_fields(result.usage))
+        return record
+
+    def text_only(self, sample: Sample) -> dict[str, Any]:
+        result = self.client.chat(
+            self.model,
+            [{"role": "user", "content": format_text_only_question(sample)}],
+        )
+        prediction = extract_answer_letter(result.content, sample.option_letters)
+        record = {
+            "prediction": prediction,
+            "raw_response": result.content,
+            "correct": prediction == sample.answer,
+            "rounds": 1,
+            "turn_count": 1,
+            "visual_tokens": 0,
+            "usage": result.usage,
+            "latency_s": result.latency_s,
+            "fallback_used": False,
+            "tool_calls": [],
+            "gate_reason": None,
+            "prompt_id": "text_only_mcq_v1",
+            "media_items": 0,
+            "annotation_leak_check": "passed",
+            "annotation_leak_reason": "question_and_choices_only",
         }
         record.update(_usage_fields(result.usage))
         return record
@@ -1568,6 +1605,8 @@ def evaluate(
         try:
             if backend == "direct":
                 result = evaluator.direct(sample)
+            elif backend == "text_only":
+                result = evaluator.text_only(sample)
             elif backend == "agent":
                 result = evaluator.agent(sample)
             elif backend == "hybrid":

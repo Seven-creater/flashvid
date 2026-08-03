@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from flashvid_eval.answers import extract_answer_letter, extract_strict_answer_letter
+from flashvid_eval.client import ChatResult
 from flashvid_eval.datasets import VideoIndex, load_samples
 from flashvid_eval.media import estimate_visual_tokens
 from flashvid_eval.runner import (
@@ -24,6 +25,7 @@ from flashvid_eval.runner import (
     available_samples,
     evaluate,
     format_question,
+    format_text_only_question,
     parse_question_time_range,
     _requires_change_confirmation,
     _question_route,
@@ -118,6 +120,46 @@ def test_available_samples_filters_partial_download(tmp_path: Path) -> None:
         Sample("x", "2", "v2.mp4", "Q", {"A": "x", "B": "y"}, "B"),
     ]
     assert [sample.sample_id for sample in available_samples(samples, tmp_path)] == ["2"]
+
+
+def test_text_only_backend_sends_question_and_choices_without_media(tmp_path: Path) -> None:
+    class RecordingClient:
+        messages = None
+
+        def chat(self, model, messages, **kwargs):
+            self.messages = messages
+            return ChatResult(
+                content="Answer: B",
+                usage={"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24},
+                raw={},
+                latency_s=0.1,
+            )
+
+    sample = Sample(
+        "demo",
+        "one",
+        "missing.mp4",
+        "What happens?",
+        {"A": "opens", "B": "closes"},
+        "B",
+        metadata={"time_range": "SECRET", "clue_intervals": "SECRET"},
+    )
+    client = RecordingClient()
+    evaluator = Evaluator(client, "model", tmp_path, tmp_path / "frames")
+
+    record = evaluator.text_only(sample)
+
+    assert record["prediction"] == "B"
+    assert record["visual_tokens"] == 0
+    assert record["media_items"] == 0
+    assert record["annotation_leak_check"] == "passed"
+    assert client.messages == [
+        {"role": "user", "content": format_text_only_question(sample)}
+    ]
+    serialized = json.dumps(client.messages)
+    assert "video_url" not in serialized
+    assert "image_url" not in serialized
+    assert "SECRET" not in serialized
 
 
 def test_agent_time_parser_uses_question_only() -> None:

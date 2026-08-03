@@ -125,9 +125,11 @@ def test_available_samples_filters_partial_download(tmp_path: Path) -> None:
 def test_text_only_backend_sends_question_and_choices_without_media(tmp_path: Path) -> None:
     class RecordingClient:
         messages = None
+        kwargs = None
 
         def chat(self, model, messages, **kwargs):
             self.messages = messages
+            self.kwargs = kwargs
             return ChatResult(
                 content="Answer: B",
                 usage={"prompt_tokens": 20, "completion_tokens": 4, "total_tokens": 24},
@@ -156,6 +158,7 @@ def test_text_only_backend_sends_question_and_choices_without_media(tmp_path: Pa
     assert client.messages == [
         {"role": "user", "content": format_text_only_question(sample)}
     ]
+    assert client.kwargs == {"max_tokens": 128}
     serialized = json.dumps(client.messages)
     assert "video_url" not in serialized
     assert "image_url" not in serialized

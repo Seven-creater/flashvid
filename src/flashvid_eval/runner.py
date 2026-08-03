@@ -722,6 +722,7 @@ class Evaluator:
         result = self.client.chat(
             self.model,
             [{"role": "user", "content": format_text_only_question(sample)}],
+            max_tokens=128,
         )
         prediction = extract_answer_letter(result.content, sample.option_letters)
         record = {

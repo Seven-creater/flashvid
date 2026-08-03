@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "config_id": "a1_storyboard_zoom_default_v1",
+  "agent": {
+    "strategy": "a1_storyboard_zoom",
+    "overview_frames": 64,
+    "local_fps": 2.0,
+    "local_window_s": 120.0,
+    "max_intervals": 3,
+    "max_turns": 6,
+    "max_frames_per_call": 128,
+    "resize": 0.75,
+    "hierarchy_nodes": 8,
+    "hierarchy_depth": 3,
+    "evidence_strategy": "a3_hierarchical_search"
+  }
+}

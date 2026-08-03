@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "experiment_id": "qwen-only-long-video-agent-search-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/qwen_agent_search",
+  "source_workspace": "/data02/usr/wangqihao/Demo/test/qwen_agent_search",
+  "constraints": {
+    "semantic_models": ["Qwen3.5-4B", "Qwen3.5-9B"],
+    "forbidden_tools": ["clip", "ocr", "asr", "object_detection", "external_retriever"],
+    "allowed_frame_tools": ["ffmpeg", "ffprobe", "decord", "eva_frame_select"],
+    "final_test_is_fixed_engineering_set": true,
+    "final_test_tuning_forbidden": true
+  },
+  "datasets": {
+    "lvbench": {
+      "annotations": "/data02/usr/wangqihao/Demo/test/flashvid/data/LVBench_raw_full_root.jsonl",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/06_lvbench",
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_train.jsonl",
+        "sha256": "5e0ec526ba3645a0c230943fbed50e0c302a7a519dfb29371f54777875b29cc2"
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_dev.jsonl",
+        "sha256": "c1fb73c070dac5a99c1d1f66a7b50ccc3475b520c8595f451e30d755e5d357f1"
+      },
+      "final": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl",
+        "sha256": "2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb"
+      }
+    },
+    "lsdbench": {
+      "annotations": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/test.json",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/videos",
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_train.jsonl",
+        "sha256": "5bd1d9c6be5bdc44c7a9bd796e2110863b4df8e1b3435d84bcff51ca2d491cd1"
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_dev.jsonl",
+        "sha256": "c6e1840e055e53fe48fa831ab4b193267af87054155e1b87abcfb12260e31b39"
+      },
+      "final": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lsdbench_manifest_42_100.jsonl",
+        "sha256": "37dbd946d8abe870ac4eec7d8d1f787c99c148f43546a97371cb13a8856e68d2"
+      }
+    },
+    "cgbench": {
+      "annotations": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/cgbench.json",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/videos_partial",
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_train.jsonl",
+        "sha256": "1c7d631c17cfbd578056a2616539bd4e20d24acf1c22ead86ada69197dcaf6c8"
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_dev.jsonl",
+        "sha256": "fb9239f0243db7abd9b007bd53315abf2fa637540ddf8fee2cee5b9bdec23815"
+      },
+      "final": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/cgbench_manifest_42_100.jsonl",
+        "sha256": "4f60b2876d896741529733841e9497b123c75fee0f5a428c761ac689d8b1b0a6"
+      }
+    }
+  },
+  "models": {
+    "q9": {
+      "path": "/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B",
+      "artifact_sha256": "5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60",
+      "served_name": "Qwen3.5-9B",
+      "base_url": "http://127.0.0.1:8200/v1"
+    },
+    "q4": {
+      "path": "/data02/usr/wangqihao/Demo/test/flashvid/models/Qwen3.5-4B",
+      "artifact_sha256": "44e4633577eaa68be71bfa9d67cab9b92a47858f2bb63d6240f4260caba88ba2",
+      "served_name": "Qwen3.5-4B",
+      "base_url": "http://127.0.0.1:8200/v1"
+    }
+  },
+  "protocols": {
+    "no_think": {
+      "enable_thinking": false,
+      "max_tokens": 512,
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 1.5,
+      "repetition_penalty": 1.0
+    },
+    "think": {
+      "enable_thinking": true,
+      "max_tokens": 8192,
+      "length_retry_max_tokens": 32768,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 1.5,
+      "repetition_penalty": 1.0
+    }
+  },
+  "direct_sampling": [
+    {"id": "uniform32", "num_frames": 32},
+    {"id": "uniform64", "num_frames": 64},
+    {"id": "uniform128", "num_frames": 128},
+    {"id": "fps2", "fps": 2.0, "max_frames": 768}
+  ],
+  "diagnostics": {
+    "modes": ["question_choices", "choices_only", "permuted_choices", "mismatched_video"],
+    "seeds": [17, 42, 73],
+    "mismatched_video_duration_edges_s": [0, 300, 900, 1800, 3600, 7200, "inf"]
+  },
+  "agent_search": {
+    "framework_order": [
+      "a0_eva_clean",
+      "a1_storyboard_zoom",
+      "a2_multi_clue_memory",
+      "a3_hierarchical_search",
+      "a4_independent_arbitration",
+      "a5_specialist_composition"
+    ],
+    "overview_frames": [32, 64, 128],
+    "local_fps": [1.0, 2.0],
+    "max_intervals": [2, 4, 6],
+    "max_turns": [4, 6, 8],
+    "variants": [
+      {"id": "fast", "overview_frames": 32, "local_fps": 1.0, "max_intervals": 2, "max_turns": 4, "hierarchy_nodes": 4, "hierarchy_depth": 1, "local_window_s": 60.0},
+      {"id": "dense", "overview_frames": 32, "local_fps": 2.0, "max_intervals": 4, "max_turns": 6, "hierarchy_nodes": 4, "hierarchy_depth": 2, "local_window_s": 120.0},
+      {"id": "balanced_short", "overview_frames": 64, "local_fps": 1.0, "max_intervals": 4, "max_turns": 6, "hierarchy_nodes": 8, "hierarchy_depth": 2, "local_window_s": 60.0},
+      {"id": "balanced_long", "overview_frames": 64, "local_fps": 2.0, "max_intervals": 6, "max_turns": 8, "hierarchy_nodes": 8, "hierarchy_depth": 3, "local_window_s": 120.0},
+      {"id": "coverage", "overview_frames": 128, "local_fps": 1.0, "max_intervals": 6, "max_turns": 8, "hierarchy_nodes": 12, "hierarchy_depth": 3, "local_window_s": 60.0},
+      {"id": "wide_fast", "overview_frames": 128, "local_fps": 2.0, "max_intervals": 2, "max_turns": 4, "hierarchy_nodes": 12, "hierarchy_depth": 1, "local_window_s": 120.0}
+    ],
+    "seeds": [17, 42, 73],
+    "promotion_min_correct_gain": 2,
+    "promotion_min_seed_wins": 2,
+    "max_failure_rate": 0.01
+  },
+  "sft": {
+    "train600": {
+      "path": "/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/qwen_agent_search/frozen/train600.jsonl",
+      "sha256": "3995454d973aeb6efe6887e821cd5197e0f17a5b9cc32d7c719e6583b487e6c0"
+    },
+    "trajectories_per_sample": 12,
+    "judge_replicas": 3,
+    "frame_fractions": [1.0, 0.75, 0.5, 0.25],
+    "teacher_total_token_ratio_max": 0.7,
+    "teacher_visual_token_ratio_max": 0.7,
+    "epochs": 3
+  },
+  "execution": {
+    "cuda_devices": "4,5,6,7",
+    "data_parallel_size": 4,
+    "max_model_len": 131072,
+    "max_num_batched_tokens": 32768,
+    "concurrency": 24,
+    "sample_seed": 42,
+    "resume": true,
+    "recurring_monitor": false
+  }
+}

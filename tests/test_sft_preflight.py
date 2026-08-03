@@ -31,13 +31,13 @@ def _tool_message(ratio: float) -> str:
     return f"<tool_call>{json.dumps(payload, separators=(',', ':'))}</tool_call>"
 
 
-def _messages(ratio: float, answer: str = "A") -> list[dict[str, str]]:
+def _messages(ratio: float, answer: str = "A") -> list[dict[str, object]]:
     return [
         {"role": "system", "content": "Use observations only."},
         {"role": "user", "content": "Question and choices"},
-        {"role": "assistant", "content": _tool_message(ratio)},
+        {"role": "assistant", "content": _tool_message(ratio), "loss": True},
         {"role": "tool", "content": '{"observed_facts":["event"]}'},
-        {"role": "assistant", "content": f"Answer: {answer}"},
+        {"role": "assistant", "content": f"Answer: {answer}", "loss": True},
     ]
 
 
@@ -222,6 +222,8 @@ class _FakeTemplate:
                 masked = False
             if role == "assistant" and self.mask_assistant:
                 masked = True
+            if role == "assistant" and message.get("loss") is False:
+                masked = True
             input_ids.extend(token_ids)
             labels.extend([-100] * len(token_ids) if masked else token_ids)
             input_ids.append(10)
@@ -238,6 +240,18 @@ def test_real_template_probe_logic_accepts_expected_masks() -> None:
     encoded = verify_all_record_encodings(records, _FakeTemplate())
     assert encoded["encoded_records"] == 1
     assert encoded["maximum_encoded_tokens"] > 0
+
+
+def test_real_template_probe_honors_explicit_false_assistant_loss() -> None:
+    messages = _messages(0.25)
+    messages[2]["loss"] = False
+    report = verify_records_with_template(
+        [{"messages": messages}],
+        _FakeTemplate(),
+        sample_count=1,
+    )
+    assert report["assistant_loss_probes"] == 1
+    assert report["masked_role_probes"] == 4
 
 
 @pytest.mark.parametrize(

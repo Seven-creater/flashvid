@@ -23,7 +23,7 @@ from typing import Any, Mapping, Protocol, Sequence
 REQUIRED_SWIFT_VERSION = "4.4.2"
 MASKED_ROLES = {"system", "user", "tool"}
 TRAINED_ROLES = {"assistant"}
-TRAINING_MAX_LENGTH = 8192
+TRAINING_MAX_LENGTH = 16384
 
 
 class TemplateLike(Protocol):
@@ -108,16 +108,31 @@ def verify_records_with_template(
         if not isinstance(source_messages, list) or not source_messages:
             continue
         messages: list[dict[str, Any]] = []
-        for message in source_messages:
-            if not isinstance(message, Mapping):
+        for source_message in source_messages:
+            if not isinstance(source_message, Mapping):
                 raise RuntimeError(f"record {record_index} has a non-object message")
-            role = str(message.get("role") or "")
-            content = message.get("content")
+            role = str(source_message.get("role") or "")
+            content = source_message.get("content")
             if role not in MASKED_ROLES | TRAINED_ROLES or not isinstance(content, str):
                 raise RuntimeError(
                     f"record {record_index} has unsupported role/content for loss-mask verification"
                 )
-            messages.append({"role": role, "content": content})
+            if role == "assistant":
+                source_loss = source_message.get("loss")
+                if not isinstance(source_loss, bool):
+                    raise RuntimeError(
+                        f"record {record_index} assistant message lacks boolean loss"
+                    )
+                normalized = {
+                    "role": role,
+                    "content": content,
+                    "loss": source_loss,
+                }
+                messages.append(normalized)
+            else:
+                if "loss" in source_message:
+                    raise RuntimeError("loss is only valid on assistant messages")
+                messages.append({"role": role, "content": content})
 
         base_ids, _ = _encode(template, messages)
         record_masked = 0
@@ -133,7 +148,8 @@ def verify_records_with_template(
             probe_ids, probe_labels = _encode(template, probe_messages)
             start, end = _changed_span(base_ids, probe_ids)
             span_labels = probe_labels[start:end]
-            if role in MASKED_ROLES:
+            should_train = role == "assistant" and message.get("loss") is True
+            if not should_train:
                 if any(label != -100 for label in span_labels):
                     raise RuntimeError(
                         f"record {record_index} message {message_index} role={role} "
@@ -149,10 +165,10 @@ def verify_records_with_template(
                     )
                 assistant_probes += 1
                 record_assistant += 1
-        if record_masked == 0 or record_assistant < 2:
+        if record_masked == 0 or record_assistant < 1:
             raise RuntimeError(
                 f"record {record_index} did not exercise both masked roles and "
-                "assistant tool/final targets"
+                "at least one explicitly trainable assistant target"
             )
         probe_details.append(
             {

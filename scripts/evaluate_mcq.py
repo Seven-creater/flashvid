@@ -4,10 +4,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from flashvid_eval.client import OpenAICompatibleClient
+from flashvid_eval.baseline_diagnostics import DEFAULT_DURATION_BUCKET_EDGES_S
 from flashvid_eval.datasets import load_samples
 from flashvid_eval.flashvid_budget import BudgetEndpointPool
 from flashvid_eval.flashvid_hybrid import (
@@ -17,6 +19,19 @@ from flashvid_eval.flashvid_hybrid import (
 )
 from flashvid_eval.offline_budget import normalize_candidate
 from flashvid_eval.answers import extract_strict_answer_letter
+from flashvid_eval.qwen_evaluation import (
+    QwenBaselineConfig,
+    QwenBaselineRunner,
+    direct_sampling_spec,
+    evaluate_qwen_runner,
+)
+from flashvid_eval.qwen_protocol import QWEN_PROTOCOLS
+from flashvid_eval.qwen_agents import InferenceProtocol as AgentInferenceProtocol
+from flashvid_eval.qwen_agents import build_strategy as build_qwen_agent_strategy
+from flashvid_eval.qwen_trajectories import (
+    QwenTrajectoryRunner,
+    TrajectoryGenerationConfig,
+)
 from flashvid_eval.runner import Evaluator, available_samples, evaluate, select_manifest
 from flashvid_eval.schemas import Sample
 
@@ -58,6 +73,116 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_sha256(payload: object) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _validated_sha256(value: str | None, label: str) -> str:
+    if value is None or len(value) != 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in value
+    ):
+        raise ValueError(f"{label} must be 64 hexadecimal characters")
+    return value.lower()
+
+
+def _stable_model_slug(model: str) -> str:
+    readable = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "model"
+    identity = hashlib.sha256(model.encode("utf-8")).hexdigest()[:8]
+    return f"{readable[:48]}-{identity}"
+
+
+def _json_duration_bucket_edges() -> list[float | str]:
+    return [
+        "inf" if value == float("inf") else float(value)
+        for value in DEFAULT_DURATION_BUCKET_EDGES_S
+    ]
+
+
+def _load_validated_mismatch_map(
+    path: Path,
+    *,
+    samples: list[Sample],
+    manifest_hash: str,
+    video_root: Path,
+) -> tuple[dict[str, str], str, dict]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("mapping"), dict):
+        raise ValueError(
+            "mismatched-video-map must be a structured object with a mapping field"
+        )
+    if str(payload.get("manifest_sha256", "")).lower() != manifest_hash.lower():
+        raise ValueError("mismatched-video-map manifest SHA-256 does not match this run")
+    if payload.get("duration_bucket_edges_s") != _json_duration_bucket_edges():
+        raise ValueError("mismatched-video-map duration bucket edges do not match")
+    mapped_root = payload.get("video_root")
+    if mapped_root is not None and Path(str(mapped_root)).resolve() != video_root.resolve():
+        raise ValueError("mismatched-video-map video_root does not match this run")
+
+    sample_by_id = {sample.sample_id: sample for sample in samples}
+    raw_mapping = payload["mapping"]
+    mapping = {str(sample_id): str(video) for sample_id, video in raw_mapping.items()}
+    unknown = sorted(set(mapping) - set(sample_by_id))
+    if unknown:
+        raise ValueError(
+            "mismatched-video-map contains IDs outside the manifest: "
+            + ", ".join(unknown[:5])
+        )
+    if any(not video for video in mapping.values()):
+        raise ValueError("mismatched-video-map contains an empty target video")
+
+    assignments = payload.get("assignments")
+    if not isinstance(assignments, list):
+        raise ValueError("mismatched-video-map must include auditable assignments")
+    assignment_mapping: dict[str, str] = {}
+    assignment_rows: list[tuple[str, str, str, int]] = []
+    bucket_count = len(DEFAULT_DURATION_BUCKET_EDGES_S) - 1
+    for assignment in assignments:
+        if not isinstance(assignment, dict):
+            raise ValueError("mismatched-video-map assignment must be an object")
+        sample_id = str(assignment.get("sample_id", ""))
+        sample = sample_by_id.get(sample_id)
+        if sample is None:
+            raise ValueError(f"invalid mismatch assignment sample_id: {sample_id}")
+        if sample_id in assignment_mapping:
+            raise ValueError(f"duplicate mismatch assignment sample_id: {sample_id}")
+        source = str(assignment.get("source_video", ""))
+        target = str(assignment.get("target_video", ""))
+        bucket = assignment.get("duration_bucket")
+        if str(assignment.get("dataset", "")) != sample.dataset:
+            raise ValueError(f"mismatch assignment dataset differs for {sample_id}")
+        if source != sample.video:
+            raise ValueError(f"mismatch assignment source differs for {sample_id}")
+        if not target or target == source:
+            raise ValueError(f"mismatch assignment is not a wrong video for {sample_id}")
+        if isinstance(bucket, bool) or not isinstance(bucket, int) or not 0 <= bucket < bucket_count:
+            raise ValueError(f"invalid mismatch duration bucket for {sample_id}")
+        assignment_mapping[sample_id] = target
+        assignment_rows.append((sample.dataset, source, target, bucket))
+    if assignment_mapping != mapping:
+        raise ValueError("mismatched-video-map mapping and assignments disagree")
+    source_buckets = {
+        (dataset, source): bucket
+        for dataset, source, _target, bucket in assignment_rows
+    }
+    for dataset, _source, target, bucket in assignment_rows:
+        target_bucket = source_buckets.get((dataset, target))
+        if target_bucket is None:
+            raise ValueError(
+                "mismatch target is not an audited source video in the same dataset"
+            )
+        if target_bucket != bucket:
+            raise ValueError("mismatch target crosses an explicit duration bucket")
+    return mapping, _file_sha256(path), payload
 
 
 def _write_frozen_json(path: Path, payload: dict) -> None:
@@ -361,6 +486,8 @@ def main() -> None:
             "hybrid",
             "hybrid_frozen",
             "flashvid_hybrid",
+            "qwen_baseline",
+            "qwen_agent",
         ),
         required=True,
     )
@@ -401,6 +528,64 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-errors", action="store_true")
+    parser.add_argument(
+        "--qwen-protocol",
+        choices=tuple(QWEN_PROTOCOLS),
+        default="no_think",
+    )
+    parser.add_argument(
+        "--baseline-mode",
+        choices=(
+            "question_choices",
+            "choices_only",
+            "permuted_choices",
+            "direct",
+            "mismatched_video",
+        ),
+    )
+    parser.add_argument(
+        "--direct-sampling",
+        choices=("uniform32", "uniform64", "uniform128", "fps2"),
+    )
+    parser.add_argument(
+        "--option-permutation-seed",
+        type=int,
+        choices=(17, 42, 73),
+    )
+    parser.add_argument(
+        "--mismatched-video-map",
+        type=Path,
+        help="Frozen JSON object mapping sample_id to a wrong video in the same duration bucket.",
+    )
+    parser.add_argument(
+        "--agent-config",
+        type=Path,
+        help="Frozen Qwen-only Agent strategy configuration.",
+    )
+    parser.add_argument(
+        "--expected-agent-config-sha256",
+        help="Expected SHA-256 of --agent-config from the frozen run plan.",
+    )
+    parser.add_argument(
+        "--defer-scoring",
+        action="store_true",
+        help=(
+            "Do not join or serialize labels. Valid only for Qwen-only Train600 "
+            "trajectory generation."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-schedule-id",
+        help="Stable schedule identity for a label-free Qwen trajectory run.",
+    )
+    parser.add_argument(
+        "--train600-manifest-sha256",
+        help=(
+            "SHA-256 of the frozen merged Train600 artifact. Required with "
+            "--defer-scoring and recorded separately from the active Train200 hash."
+        ),
+    )
+    parser.add_argument("--trajectory-replica-id", type=int, default=0)
     parser.add_argument("--candidate-results", type=Path)
     parser.add_argument(
         "--candidate-normalization-cache",
@@ -472,6 +657,19 @@ def main() -> None:
     parser.add_argument(
         "--experiment-config-sha256",
         help="SHA-256 of the immutable outer sweep configuration.",
+    )
+    parser.add_argument(
+        "--model-artifact-sha256",
+        help=(
+            "SHA-256 identity of the served model artifact (for example the "
+            "frozen model index/checksum manifest). Required by qwen_baseline."
+        ),
+    )
+    parser.add_argument(
+        "--server-max-model-len",
+        type=int,
+        default=131072,
+        help="Served context limit used to cap a length-retry request.",
     )
     parser.add_argument(
         "--fixed-retention-ratio",
@@ -577,6 +775,297 @@ def main() -> None:
             f"got {manifest_hash}"
         )
     client = OpenAICompatibleClient(args.base_url, args.api_key, args.timeout)
+    if args.backend == "qwen_baseline":
+        if args.baseline_mode is None:
+            raise ValueError("qwen_baseline requires --baseline-mode")
+        experiment_config_sha256 = _validated_sha256(
+            args.experiment_config_sha256,
+            "experiment-config-sha256",
+        )
+        model_artifact_sha256 = _validated_sha256(
+            args.model_artifact_sha256,
+            "model-artifact-sha256",
+        )
+        if args.server_max_model_len <= 0:
+            raise ValueError("server-max-model-len must be positive")
+        if args.baseline_mode == "mismatched_video" and args.mismatched_video_map is None:
+            raise ValueError("mismatched_video requires --mismatched-video-map")
+        if args.baseline_mode != "mismatched_video" and args.mismatched_video_map is not None:
+            raise ValueError(
+                "--mismatched-video-map is only valid with mismatched_video mode"
+            )
+        sampling = (
+            direct_sampling_spec(args.direct_sampling)
+            if args.direct_sampling is not None
+            else None
+        )
+        mismatched_videos = None
+        mismatch_hash = None
+        mismatch_payload = None
+        if args.mismatched_video_map is not None:
+            mismatched_videos, mismatch_hash, mismatch_payload = (
+                _load_validated_mismatch_map(
+                    args.mismatched_video_map,
+                    samples=samples,
+                    manifest_hash=manifest_hash,
+                    video_root=args.video_root,
+                )
+            )
+        run_context = {
+            "manifest_sha256": manifest_hash,
+            "experiment_config_sha256": experiment_config_sha256,
+            "model_artifact_sha256": model_artifact_sha256,
+            "annotations_sha256": _file_sha256(args.annotations),
+        }
+        config = QwenBaselineConfig(
+            mode=args.baseline_mode,
+            protocol=QWEN_PROTOCOLS[args.qwen_protocol],
+            direct_sampling=sampling,
+            option_permutation_seed=args.option_permutation_seed,
+            mismatched_videos=mismatched_videos,
+            generation_seed=args.seed,
+            run_context=run_context,
+            max_model_len=args.server_max_model_len,
+        )
+        runner = QwenBaselineRunner(
+            client,
+            args.model,
+            args.video_root,
+            config,
+        )
+        method_parts = [
+            "qwen",
+            _stable_model_slug(args.model),
+            args.baseline_mode,
+            args.qwen_protocol,
+        ]
+        if args.direct_sampling:
+            method_parts.append(args.direct_sampling)
+        if args.option_permutation_seed is not None:
+            method_parts.append(f"seed{args.option_permutation_seed}")
+        method_id = "_".join(method_parts)
+        _write_frozen_json(
+            args.output_dir / f"frozen_inputs_{args.dataset}_{method_id}.json",
+            {
+                "dataset": args.dataset,
+                "manifest": {
+                    "path": str(manifest.resolve()),
+                    "sha256": manifest_hash,
+                },
+                "annotations": {
+                    "path": str(args.annotations.resolve()),
+                    "sha256": _file_sha256(args.annotations),
+                    "model_access": False,
+                },
+                "model": args.model,
+                "model_slug": _stable_model_slug(args.model),
+                "model_artifact_sha256": model_artifact_sha256,
+                "experiment_config_sha256": experiment_config_sha256,
+                "generation_seed": args.seed,
+                "server_max_model_len": args.server_max_model_len,
+                "baseline_mode": args.baseline_mode,
+                "qwen_protocol": args.qwen_protocol,
+                "direct_sampling": args.direct_sampling,
+                "option_permutation_seed": args.option_permutation_seed,
+                "mismatched_video_map": (
+                    {
+                        "path": str(args.mismatched_video_map.resolve()),
+                        "sha256": mismatch_hash,
+                        "mapped": len(mismatched_videos or {}),
+                        "control_unavailable": (
+                            len(samples) - len(mismatched_videos or {})
+                        ),
+                        "duration_bucket_edges_s": _json_duration_bucket_edges(),
+                        "schema_version": (
+                            mismatch_payload.get("schema_version")
+                            if mismatch_payload is not None
+                            else None
+                        ),
+                    }
+                    if args.mismatched_video_map is not None
+                    else None
+                ),
+                "run_fingerprint": runner.run_fingerprint(),
+            },
+        )
+        summary = evaluate_qwen_runner(
+            samples,
+            runner,
+            method_id,
+            args.output_dir,
+            concurrency=args.concurrency,
+            resume=args.resume,
+            retry_errors=args.retry_errors,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
+    if args.backend == "qwen_agent":
+        if args.agent_config is None or not args.agent_config.is_file():
+            raise ValueError("qwen_agent requires --agent-config JSON")
+        experiment_config_sha256 = _validated_sha256(
+            args.experiment_config_sha256,
+            "experiment-config-sha256",
+        )
+        model_artifact_sha256 = _validated_sha256(
+            args.model_artifact_sha256,
+            "model-artifact-sha256",
+        )
+        if args.server_max_model_len <= 0:
+            raise ValueError("server-max-model-len must be positive")
+        agent_payload = json.loads(args.agent_config.read_text(encoding="utf-8"))
+        if not isinstance(agent_payload, dict):
+            raise ValueError("agent-config must contain a JSON object")
+        agent_settings = agent_payload.get("agent", agent_payload)
+        if not isinstance(agent_settings, dict):
+            raise ValueError("agent-config agent field must be a JSON object")
+        agent_config_hash = _file_sha256(args.agent_config)
+        if args.expected_agent_config_sha256 is not None:
+            expected_agent_hash = _validated_sha256(
+                args.expected_agent_config_sha256,
+                "expected-agent-config-sha256",
+            )
+            if agent_config_hash != expected_agent_hash:
+                raise RuntimeError(
+                    "agent-config SHA-256 mismatch: "
+                    f"expected {expected_agent_hash}, got {agent_config_hash}"
+                )
+        if args.defer_scoring and args.trajectory_schedule_id is None:
+            raise ValueError("--defer-scoring requires --trajectory-schedule-id")
+        if not args.defer_scoring and args.trajectory_schedule_id is not None:
+            raise ValueError("--trajectory-schedule-id requires --defer-scoring")
+        if args.defer_scoring and args.trajectory_replica_id < 0:
+            raise ValueError("trajectory-replica-id must be non-negative")
+        if args.defer_scoring and args.expected_agent_config_sha256 is None:
+            raise ValueError("--defer-scoring requires --expected-agent-config-sha256")
+        if args.defer_scoring and args.train600_manifest_sha256 is None:
+            raise ValueError("--defer-scoring requires --train600-manifest-sha256")
+        if args.defer_scoring and args.model != "Qwen3.5-9B":
+            raise ValueError("deferred trajectory generation requires Qwen3.5-9B")
+        train600_manifest_sha256 = (
+            _validated_sha256(
+                args.train600_manifest_sha256,
+                "train600-manifest-sha256",
+            )
+            if args.defer_scoring
+            else None
+        )
+        qwen_protocol = QWEN_PROTOCOLS[args.qwen_protocol]
+        run_context = {
+            "manifest_sha256": manifest_hash,
+            "train600_manifest_sha256": train600_manifest_sha256,
+            "experiment_config_sha256": experiment_config_sha256,
+            "model_artifact_sha256": model_artifact_sha256,
+            "agent_config_sha256": agent_config_hash,
+            "annotations_sha256": _file_sha256(args.annotations),
+        }
+        agent_protocol = AgentInferenceProtocol(
+            enable_thinking=qwen_protocol.enable_thinking,
+            temperature=qwen_protocol.temperature,
+            top_p=qwen_protocol.top_p,
+            top_k=qwen_protocol.top_k,
+            min_p=qwen_protocol.min_p,
+            presence_penalty=qwen_protocol.presence_penalty,
+            repetition_penalty=qwen_protocol.repetition_penalty,
+            seed=args.seed,
+            planner_max_tokens=qwen_protocol.max_tokens,
+            observer_max_tokens=qwen_protocol.max_tokens,
+            judge_max_tokens=qwen_protocol.max_tokens,
+            direct_max_tokens=qwen_protocol.max_tokens,
+            length_retry_max_tokens=qwen_protocol.length_retry_max_tokens,
+            server_max_model_len=args.server_max_model_len,
+            run_context_sha256=_canonical_sha256(run_context),
+        )
+        base_runner = build_qwen_agent_strategy(
+            agent_settings,
+            client=client,
+            model=args.model,
+            video_root=args.video_root,
+            frame_root=frame_root,
+            protocol=agent_protocol,
+        )
+        runner = base_runner
+
+        def result_adapter(trace):
+            return trace.to_result_dict()
+
+        schedule_id = None
+        if args.defer_scoring:
+            schedule_id = str(args.trajectory_schedule_id)
+            runner = QwenTrajectoryRunner(
+                strategy=base_runner,
+                client=client,
+                model=args.model,
+                protocol=agent_protocol,
+                config=TrajectoryGenerationConfig(
+                    schedule_id=schedule_id,
+                    dataset_manifest_sha256=manifest_hash,
+                    train600_manifest_sha256=str(train600_manifest_sha256),
+                    experiment_config_sha256=experiment_config_sha256,
+                    agent_config_sha256=agent_config_hash,
+                    model_artifact_sha256=model_artifact_sha256,
+                    replica_id=args.trajectory_replica_id,
+                ),
+            )
+            result_adapter = None
+        method_parts = [
+            "qwen_agent",
+            _stable_model_slug(args.model),
+            base_runner.strategy_id,
+            args.qwen_protocol,
+            f"seed{args.seed}",
+        ]
+        if schedule_id is not None:
+            method_parts.extend(
+                [
+                    re.sub(r"[^A-Za-z0-9_.-]+", "-", schedule_id).strip("-")[:64],
+                    f"replica{args.trajectory_replica_id}",
+                ]
+            )
+        method_id = "_".join(method_parts)
+        _write_frozen_json(
+            args.output_dir / f"frozen_inputs_{args.dataset}_{method_id}.json",
+            {
+                "dataset": args.dataset,
+                "manifest": {
+                    "path": str(manifest.resolve()),
+                    "sha256": manifest_hash,
+                },
+                "annotations": {
+                    "path": str(args.annotations.resolve()),
+                    "sha256": _file_sha256(args.annotations),
+                    "model_access": False,
+                },
+                "model": args.model,
+                "model_slug": _stable_model_slug(args.model),
+                "model_artifact_sha256": model_artifact_sha256,
+                "experiment_config_sha256": experiment_config_sha256,
+                "qwen_protocol": args.qwen_protocol,
+                "seed": args.seed,
+                "server_max_model_len": args.server_max_model_len,
+                "scoring_deferred": args.defer_scoring,
+                "train600_manifest_sha256": train600_manifest_sha256,
+                "trajectory_schedule_id": schedule_id,
+                "trajectory_replica_id": args.trajectory_replica_id,
+                "agent_config": {
+                    "path": str(args.agent_config.resolve()),
+                    "sha256": agent_config_hash,
+                },
+                "run_fingerprint": runner.run_fingerprint(),
+            },
+        )
+        summary = evaluate_qwen_runner(
+            samples,
+            runner,
+            method_id,
+            args.output_dir,
+            concurrency=args.concurrency,
+            resume=args.resume,
+            retry_errors=args.retry_errors,
+            result_adapter=result_adapter,
+            defer_scoring=args.defer_scoring,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return
     candidate_answers: dict[str, str] | None = None
     candidate_sources: dict[str, str] | None = None
     if args.backend == "hybrid_frozen":

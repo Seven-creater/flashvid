@@ -7,8 +7,10 @@ serialization implementation; it does not load EVA weights.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,36 @@ def _tool_path() -> Path:
         / "EfficientVideoAgent"
         / "select_frame_fallback.py"
     )
+
+
+def frame_tool_identity() -> dict[str, str | None]:
+    """Return the exact official frame-tool artifact used by this process."""
+
+    path = _tool_path()
+    if not path.is_file():
+        raise FileNotFoundError(f"official EVA frame tool is missing: {path}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    commit: str | None = None
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path.parent), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        candidate = completed.stdout.strip().lower()
+        if completed.returncode == 0 and len(candidate) == 40 and all(
+            character in "0123456789abcdef" for character in candidate
+        ):
+            commit = candidate
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "git_commit": commit,
+    }
 
 
 def _load_tool() -> Any:

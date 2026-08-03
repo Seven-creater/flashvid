@@ -251,6 +251,8 @@ def test_server_configs_are_gated_by_frozen_summary_availability() -> None:
             str(final_path),
             "--stage",
             "final",
+            "--controller",
+            "q9",
             "--dry-run",
             "--allow-missing-inputs",
         ],

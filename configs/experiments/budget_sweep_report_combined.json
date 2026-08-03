@@ -12,7 +12,7 @@
   },
   "matched_random_from_summary": {
     "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/summary.json",
-    "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
+    "sha256": "fab787e37cded6f014edf8bfd1f0fd963b99ff21e5049ee73bb91d30f90d2ceb"
   },
   "methods": [
     {

@@ -170,7 +170,7 @@ start_controller() {
       --host "$SERVICE_HOST" \
       --port "$(service_port controller)" \
       --tensor-parallel-size 1 \
-      --data-parallel-size 4 \
+      --data-parallel-size "${CONTROLLER_DATA_PARALLEL_SIZE:-4}" \
       --dtype bfloat16 \
       --max-model-len "${CONTROLLER_MAX_MODEL_LEN:-32768}" \
       --max-num-seqs "${CONTROLLER_MAX_NUM_SEQS:-64}" \

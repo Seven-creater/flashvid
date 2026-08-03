@@ -221,7 +221,12 @@ Dev frontiers, never from the system-level Direct/v3c reference frontier.
 
 Service helpers are limited to the FlashVID budget bank and Qwen3.5-9B
 launchers. Large models, datasets, caches, raw results, and server environment
-files are intentionally ignored by Git.
+files are intentionally ignored by Git. The default bank layout remains GPUs
+0–3 for perception and 4–7 for the DP=4 controller. On a shared server it can
+be remapped without editing code through `BUDGET_GPU_R010`,
+`BUDGET_GPU_R025`, `BUDGET_GPU_R050`, `BUDGET_GPU_R100`,
+`BUDGET_GPU_CONTROLLER`, and `CONTROLLER_DATA_PARALLEL_SIZE`; ownership checks
+still refuse to overwrite unrelated PIDs or occupied ports.
 
 ## Attribution
 

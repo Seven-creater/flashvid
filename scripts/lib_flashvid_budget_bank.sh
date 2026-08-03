@@ -64,11 +64,11 @@ service_backend() {
 
 service_gpu() {
   case "$1" in
-    r010) echo "0" ;;
-    r025) echo "1" ;;
-    r050) echo "2" ;;
-    r100) echo "3" ;;
-    controller) echo "4,5,6,7" ;;
+    r010) echo "${BUDGET_GPU_R010:-0}" ;;
+    r025) echo "${BUDGET_GPU_R025:-1}" ;;
+    r050) echo "${BUDGET_GPU_R050:-2}" ;;
+    r100) echo "${BUDGET_GPU_R100:-3}" ;;
+    controller) echo "${BUDGET_GPU_CONTROLLER:-4,5,6,7}" ;;
     *) return 2 ;;
   esac
 }
@@ -109,7 +109,7 @@ owned_service_process() {
   if [[ "$id" == "controller" ]]; then
     [[ "$command_line" == *"vllm"*"serve"* ]] || return 1
     [[ "$command_line" == *"${QWEN_9B_MODEL}"* ]] || return 1
-    [[ "$command_line" == *"--data-parallel-size 4"* ]] || return 1
+    [[ "$command_line" == *"--data-parallel-size "* ]] || return 1
   elif [[ "$(service_backend "$id")" == "native_bypass" ]]; then
     [[ "$command_line" == *"vllm"*"serve"* ]] || return 1
     [[ "$command_line" != *"flashvid-serve"* ]] || return 1

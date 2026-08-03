@@ -230,6 +230,8 @@ still refuse to overwrite unrelated PIDs or occupied ports. If two perception
 services intentionally share one GPU, set `PERCEPTION_KV_CACHE_MEMORY_BYTES`
 to an explicit per-service allocation because vLLM's percentage-based cache
 autotuning assumes exclusive ownership of the device.
+The combined base/LoRA 4B controller can likewise be remapped with
+`SFT_CONTROLLER_GPUS` and `SFT_CONTROLLER_DATA_PARALLEL_SIZE`.
 
 ## Attribution
 

@@ -15,6 +15,7 @@ SELECTED_CHECKPOINT="${SELECTED_CHECKPOINT:-}"
 HOST="${SFT_CONTROLLER_HOST:-127.0.0.1}"
 PORT="${SFT_CONTROLLER_PORT:-8300}"
 GPUS="${SFT_CONTROLLER_GPUS:-4,5,6,7}"
+DATA_PARALLEL_SIZE="${SFT_CONTROLLER_DATA_PARALLEL_SIZE:-4}"
 BASE_NAME="${SFT_BASE_MODEL_NAME:-Qwen3.5-4B-Agent-SFT-base}"
 SFT_NAME="${SFT_MODEL_NAME:-Qwen3.5-4B-Agent-SFT}"
 STATE_DIR="${STATE_DIR:-${PROJECT_DIR}/.runtime/selected_sft_controller}"
@@ -103,7 +104,7 @@ owned_process() {
   if [[ -n "$SELECTED_CHECKPOINT" ]]; then
     [[ "$command_line" == *"${SFT_NAME}=${SELECTED_CHECKPOINT}"* ]] || return 1
   fi
-  [[ "$command_line" == *"--data-parallel-size 4"* ]] || return 1
+  [[ "$command_line" == *"--data-parallel-size "* ]] || return 1
 }
 
 model_health() {
@@ -273,7 +274,7 @@ case "$action" in
         --host "$HOST" \
         --port "$PORT" \
         --tensor-parallel-size 1 \
-        --data-parallel-size 4 \
+        --data-parallel-size "$DATA_PARALLEL_SIZE" \
         --dtype bfloat16 \
         --max-model-len "${CONTROLLER_MAX_MODEL_LEN:-8192}" \
         --max-num-seqs "${CONTROLLER_MAX_NUM_SEQS:-64}" \

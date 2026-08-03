@@ -221,7 +221,7 @@ def test_dry_run_writes_no_frozen_or_generated_artifacts(tmp_path: Path) -> None
     assert not Path(config["result_root"]).exists()
 
 
-def test_server_templates_load_but_placeholders_cannot_execute() -> None:
+def test_server_configs_are_gated_by_frozen_summary_availability() -> None:
     dev_path = Path(__file__).parents[1] / "configs" / "experiments" / "budget_sweep_dev.json"
     final_path = dev_path.with_name("budget_sweep_final.json")
     matched_path = dev_path.with_name("budget_sweep_matched.json")
@@ -233,11 +233,13 @@ def test_server_templates_load_but_placeholders_cannot_execute() -> None:
     sweep.validate_inputs(matched, check_files=False)
     assert final["experiment_id"].endswith("final-v1")
     # The production server may have every frozen Dev input, while a local
-    # checkout normally does not. Template safety must therefore be asserted
-    # from the explicit frozen-summary gates rather than filesystem absence.
+    # checkout normally does not. Frozen hashes must be present in either case;
+    # only file availability may differ between the two environments.
     final_pending = sweep.pending_frozen_summaries(final, "final")
     matched_pending = sweep.pending_frozen_summaries(matched, "dev")
-    assert any("sha256_not_frozen" in item["reasons"] for item in final_pending)
+    assert all("sha256_not_frozen" not in item["reasons"] for item in final_pending)
+    if final_pending:
+        assert any("file_missing" in item["reasons"] for item in final_pending)
     assert all("sha256_not_frozen" not in item["reasons"] for item in matched_pending)
     if matched_pending:
         assert any("file_missing" in item["reasons"] for item in matched_pending)
@@ -256,8 +258,11 @@ def test_server_templates_load_but_placeholders_cannot_execute() -> None:
         capture_output=True,
         check=True,
     )
-    assert "valid_template_waiting_for_frozen_dev_inputs" in completed.stdout
-    assert "final_selection.dev_summary" in completed.stdout
+    if final_pending:
+        assert "valid_template_waiting_for_frozen_dev_inputs" in completed.stdout
+        assert "final_selection.dev_summary" in completed.stdout
+    else:
+        assert '"runnable"' in completed.stdout
     matched_preview = subprocess.run(
         [
             sys.executable,

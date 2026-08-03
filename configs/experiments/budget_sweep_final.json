@@ -194,7 +194,7 @@
     "mode": "dev_non_dominated",
     "dev_summary": {
       "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/combined/summary.json",
-      "sha256": "REPLACE_WITH_FROZEN_COMBINED_DEV_SUMMARY_SHA256"
+      "sha256": "56160e8b4851409fd8f18c1450d1f4a91f472e40beddbc7dcc532dc8cccb3b1d"
     },
     "always_include": [
       "candidate_only",

@@ -343,6 +343,18 @@ def _row_failed(row: Mapping[str, Any]) -> bool:
     )
 
 
+def _row_had_length_truncation(row: Mapping[str, Any]) -> bool:
+    if bool(row.get("length_retry_used")):
+        return True
+    attempts = row.get("request_attempts")
+    if not isinstance(attempts, list):
+        return False
+    return any(
+        isinstance(attempt, Mapping) and attempt.get("finish_reason") == "length"
+        for attempt in attempts
+    )
+
+
 @dataclass
 class Point:
     point_id: str
@@ -519,6 +531,19 @@ def _select_protocols(
                 blocking.append(f"missing_protocol_audit:{model_key}:{protocol}")
                 continue
             points[protocol] = _make_point(f"{model_key}:{protocol}:uniform64", group)
+            length_truncations = sum(
+                _row_had_length_truncation(row)
+                for row in points[protocol].rows.values()
+            )
+            points[protocol].summary["initial_length_truncations"] = length_truncations
+            if protocol == "think" and length_truncations:
+                reason = "requires_uniform_32768_rerun"
+                points[protocol].summary["eligible"] = False
+                if reason not in points[protocol].summary["rejection_reasons"]:
+                    points[protocol].summary["rejection_reasons"].append(reason)
+                blocking.append(
+                    f"protocol_requires_uniform_32768_rerun:{model_key}"
+                )
             if points[protocol].summary["missing_datasets"]:
                 blocking.append(f"incomplete_protocol_audit:{model_key}:{protocol}")
         reference = points.get("no_think")

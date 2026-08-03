@@ -21,6 +21,7 @@ from flashvid_eval.qwen_agents import (
     parse_answer_json,
     parse_frame_tool_calls,
 )
+from flashvid_eval.qwen_agents.strategies import _parse_a2_local, _parse_a2_overview
 from flashvid_eval.schemas import ModelSample
 
 
@@ -43,6 +44,7 @@ class QueueClient:
         chat_template_kwargs: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> ChatResult:
         if not self.responses:
@@ -57,6 +59,7 @@ class QueueClient:
             "chat_template_kwargs": deepcopy(chat_template_kwargs),
             "sampling_params": deepcopy(sampling_params),
             "mm_processor_kwargs": deepcopy(mm_processor_kwargs),
+            "media_io_kwargs": deepcopy(media_io_kwargs),
             "extra_body": deepcopy(extra_body),
         }
         self.calls.append(call)
@@ -404,8 +407,8 @@ def test_a1_storyboard_zoom_records_overview_local_evidence_and_costs(tmp_path: 
 
 def test_a2_multi_clue_prompt_requests_structured_memory(tmp_path: Path) -> None:
     responses = [
-        '{"atomic_claims":["A opens door","B sits"],"intervals":[[20,30]]}',
-        '{"observed_facts":["door opens"],"supports":["A"],"contradicts":["B"]}',
+        '{"atomic_claims":["A opens door","B sits"],"unresolved":[],"intervals":[[20,30]]}',
+        '{"observed_facts":["door opens"],"supports":["A"],"contradicts":["B"],"unresolved":[]}',
         '{"answer":"A"}',
     ]
     agent, client, _ = _build(
@@ -423,10 +426,97 @@ def test_a2_multi_clue_prompt_requests_structured_memory(tmp_path: Path) -> None
     assert "multiple disjoint clues" in prompt
 
 
+def test_a2_schema_parsers_are_strict_and_canonical() -> None:
+    overview = _parse_a2_overview(
+        '{"atomic_claims":[" A "],"unresolved":[],"intervals":[[20,30],[0,10]]}',
+        40.0,
+        2,
+    )
+    assert overview == (
+        {
+            "atomic_claims": ["A"],
+            "unresolved": [],
+            "intervals": [[0.0, 10.0], [20.0, 30.0]],
+        },
+        [(0.0, 10.0), (20.0, 30.0)],
+    )
+    assert _parse_a2_overview(
+        'prefix {"atomic_claims":["A"],"unresolved":[],"intervals":[[0,10]]}',
+        40.0,
+        1,
+    ) is None
+    assert _parse_a2_overview(
+        '{"atomic_claims":["A"],"unresolved":[],"intervals":[[0,20],[10,30]]}',
+        40.0,
+        2,
+    ) is None
+
+    local = _parse_a2_local(
+        '{"observed_facts":["door opens"],"supports":["a"],"contradicts":["B"],"unresolved":[]}',
+        ("A", "B"),
+    )
+    assert local is not None
+    assert local["supports"] == ["A"]
+    assert _parse_a2_local(
+        '{"observed_facts":["door opens"],"supports":["A"],"contradicts":["A"],"unresolved":[]}',
+        ("A", "B"),
+    ) is None
+    assert _parse_a2_local(
+        '{"observed_facts":["door opens"],"supports":["A"],"contradicts":[],"unresolved":[],"answer":"A"}',
+        ("A", "B"),
+    ) is None
+
+
+def test_a2_invalid_overview_uses_deterministic_intervals_without_leaking_raw_text(
+    tmp_path: Path,
+) -> None:
+    responses = [
+        "not-json PRIVATE_INVALID_OVERVIEW",
+        '{"observed_facts":["door opens"],"supports":["A"],"contradicts":["B"],"unresolved":[]}',
+        '{"answer":"A"}',
+    ]
+    agent, client, calls = _build(
+        tmp_path,
+        "a2_multi_clue_memory",
+        responses,
+        overview_frames=4,
+        max_intervals=1,
+        local_fps=0.5,
+    )
+    trace = agent.run(_sample())
+    assert trace.final_prediction == "A"
+    assert trace.fallback_used is True
+    assert len(calls) == 2
+    assert [item.source for item in trace.evidence_memory] == ["local_zoom"]
+    judge_messages = json.dumps(client.calls[-1]["messages"], ensure_ascii=False)
+    assert "PRIVATE_INVALID_OVERVIEW" not in judge_messages
+
+
+def test_a2_all_invalid_local_evidence_stops_before_judge(tmp_path: Path) -> None:
+    responses = [
+        '{"atomic_claims":["A opens door"],"unresolved":[],"intervals":[[20,30]]}',
+        '{"observed_facts":[],"supports":["A"],"contradicts":[],"unresolved":[]}',
+    ]
+    agent, client, _ = _build(
+        tmp_path,
+        "a2_multi_clue_memory",
+        responses,
+        overview_frames=4,
+        max_intervals=1,
+        local_fps=0.5,
+    )
+    trace = agent.run(_sample())
+    assert trace.final_prediction is None
+    assert trace.error_type == "EvidenceValidationError"
+    assert trace.failure_class == "model_parse_failure"
+    assert len(client.calls) == 2
+    assert [item.source for item in trace.evidence_memory] == ["storyboard_overview"]
+
+
 def test_a3_hierarchical_search_narrows_interval_then_observes_leaf(tmp_path: Path) -> None:
     responses = [
         '{"selected_node":2,"node_summaries":["..."]}',
-        '{"selected_node":5,"node_summaries":["..."]}',
+        '{"selected_node":1,"node_summaries":["..."]}',
         '{"observed_facts":["person leaves"]}',
         '{"answer":"C"}',
     ]
@@ -434,8 +524,9 @@ def test_a3_hierarchical_search_narrows_interval_then_observes_leaf(tmp_path: Pa
         tmp_path,
         "a3_hierarchical_search",
         responses,
-        hierarchy_nodes=8,
-        hierarchy_depth=2,
+        hierarchy_nodes=12,
+        hierarchy_depth=9,
+        max_turns=4,
         local_window_s=1.0,
         local_fps=1.0,
         max_frames_per_call=16,
@@ -448,10 +539,12 @@ def test_a3_hierarchical_search_narrows_interval_then_observes_leaf(tmp_path: Pa
     second = result["tool_steps"][1]
     leaf = result["tool_steps"][2]
     assert (first["resolved_start_time"], first["resolved_end_time"]) == (0.0, 240.0)
-    assert first["resolved_start_time"] <= second["resolved_start_time"]
-    assert second["resolved_end_time"] <= first["resolved_end_time"]
-    assert second["resolved_start_time"] <= leaf["resolved_start_time"]
-    assert leaf["resolved_end_time"] <= second["resolved_end_time"]
+    assert first["request"]["nframes"] == 8
+    assert (second["resolved_start_time"], second["resolved_end_time"]) == (60.0, 90.0)
+    assert second["request"]["nframes"] == 2
+    assert (leaf["resolved_start_time"], leaf["resolved_end_time"]) == (75.0, 76.0)
+    assert len(result["request_trace"]) == 4
+    assert len(result["tool_steps"]) == 3
 
 
 def test_a4_keeps_branches_independent_and_accounts_confirmation(tmp_path: Path) -> None:
@@ -485,8 +578,15 @@ def test_a4_keeps_branches_independent_and_accounts_confirmation(tmp_path: Path)
     )
     assert result["branch_costs"]["direct"]["visual_tokens"] == 77
     assert client.calls[0]["mm_processor_kwargs"] == {
-        "do_sample_frames": True,
-        "num_frames": 64,
+        "do_sample_frames": False,
+    }
+    assert client.calls[0]["media_io_kwargs"] == {
+        "video": {
+            "num_frames": -1,
+            "fps": pytest.approx(64 / 240),
+            "min_frames": 64,
+            "max_frames": 64,
+        }
     }
     assert result["branch_costs"]["arbiter"]["tool_call_count"] == 1
     assert any(item["source"] == "arbitration_confirmation" for item in result["evidence_memory"])

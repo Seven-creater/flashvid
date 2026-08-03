@@ -167,15 +167,36 @@ class DirectSamplingSpec:
         if self.num_frames is not None and self.max_frames is not None:
             raise ValueError("max_frames is only valid for fps sampling")
 
-    def mm_processor_kwargs(self) -> dict[str, int | float | bool]:
-        values: dict[str, int | float | bool] = {"do_sample_frames": True}
+    def mm_processor_kwargs(self) -> dict[str, bool]:
+        # vLLM 0.25 decodes Qwen3.5 videos before calling the HF processor.
+        # Sampling a second time in the processor uses original-video indices
+        # against the already sampled array and can go out of bounds.
+        return {"do_sample_frames": False}
+
+    def media_io_kwargs(self, duration_s: float) -> dict[str, dict[str, int | float]]:
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("video duration must be positive and finite")
+        video: dict[str, int | float] = {"num_frames": -1}
         if self.num_frames is not None:
-            values["num_frames"] = self.num_frames
+            # Qwen3-VL's vLLM loader is FPS-driven. Pinning min/max to N and
+            # choosing N/duration yields an exact N-frame uniform decode (or
+            # every source frame for clips shorter than N frames).
+            video.update(
+                {
+                    "fps": self.num_frames / duration_s,
+                    "min_frames": self.num_frames,
+                    "max_frames": self.num_frames,
+                }
+            )
         else:
-            values["fps"] = float(self.fps)
-            if self.max_frames is not None:
-                values["max_frames"] = self.max_frames
-        return values
+            video.update(
+                {
+                    "fps": float(self.fps),
+                    "min_frames": 4,
+                    "max_frames": int(self.max_frames or 768),
+                }
+            )
+        return {"video": video}
 
 
 DIRECT_SAMPLING_SPECS = {

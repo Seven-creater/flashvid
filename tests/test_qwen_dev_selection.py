@@ -360,6 +360,46 @@ def test_complete_dev_matrix_selects_per_model_and_strictly_promotes(tmp_path: P
     assert loaded.selection_report.sha256 == summary_sha
 
 
+def test_protocol_selection_rejects_mixed_thinking_output_budgets(
+    tmp_path: Path,
+) -> None:
+    config, plans = _complete_matrix(tmp_path)
+    protocol_plan = json.loads(plans[0].read_text(encoding="utf-8"))
+    task = next(
+        item
+        for item in protocol_plan["tasks"]
+        if item["dataset"] == "lvbench"
+        and item["model_key"] == "q9"
+        and item["command"][item["command"].index("--qwen-protocol") + 1]
+        == "think"
+    )
+    result_path = next(Path(task["output_dir"]).glob("lvbench_*.jsonl"))
+    rows = [
+        json.loads(line)
+        for line in result_path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[0]["length_retry_used"] = True
+    rows[0]["request_attempts"] = [
+        {"max_tokens": 8192, "finish_reason": "length"},
+        {"max_tokens": 32768, "finish_reason": "stop"},
+    ]
+    result_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    report = build_dev_selection_report(
+        config, load_dev_runs(plans, canonical_sha256(config))
+    )
+    assert report["status"] == "blocked"
+    assert "protocol_requires_uniform_32768_rerun:q9" in report["blocking_errors"]
+    points = report["protocol_selection"]["q9"]["points"]
+    think = next(point for point in points if ":think:" in point["point_id"])
+    assert think["initial_length_truncations"] == 1
+    assert think["eligible"] is False
+    assert "requires_uniform_32768_rerun" in think["rejection_reasons"]
+
+
 def test_leaking_candidate_is_rejected_without_corrupting_incumbent(tmp_path: Path) -> None:
     config, plans = _complete_matrix(tmp_path, leak_stage="a2_multi_clue_memory")
     report = build_dev_selection_report(

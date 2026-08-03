@@ -235,7 +235,7 @@ class QwenBaselineRunner:
         )
         return _canonical_hash(
             {
-                "runner": "qwen_baseline_v2",
+                "runner": "qwen_baseline_v3",
                 "model": self.model,
                 "mode": self.config.mode,
                 "protocol": asdict(self.config.protocol),
@@ -267,6 +267,7 @@ class QwenBaselineRunner:
         *,
         generation_seed: int,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, Any] | None = None,
     ) -> tuple[ChatResult, list[dict[str, Any]], float]:
         requested = self.config.protocol.max_tokens
         attempts: list[dict[str, Any]] = []
@@ -277,6 +278,7 @@ class QwenBaselineRunner:
                 {
                     "messages": messages,
                     "mm_processor_kwargs": mm_processor_kwargs,
+                    "media_io_kwargs": media_io_kwargs,
                     "request_kwargs": kwargs,
                 },
                 secret_sentinels=self.config.annotation_leak_sentinels,
@@ -286,6 +288,7 @@ class QwenBaselineRunner:
                 messages,
                 seed=generation_seed,
                 mm_processor_kwargs=mm_processor_kwargs,
+                media_io_kwargs=media_io_kwargs,
                 **kwargs,
             )
             latency += result.latency_s
@@ -337,7 +340,8 @@ class QwenBaselineRunner:
         video: Path | None = None
         metadata: dict[str, float | int] | None = None
         sampled_frames: int | None = None
-        sampling_kwargs: dict[str, Any] | None = None
+        mm_processor_kwargs: dict[str, Any] | None = None
+        media_io_kwargs: dict[str, Any] | None = None
         if self.config.mode in {"direct", "mismatched_video"}:
             video_name = sample.video
             if self.config.mode == "mismatched_video":
@@ -358,11 +362,13 @@ class QwenBaselineRunner:
             spec = self.config.direct_sampling
             if spec is None:
                 raise AssertionError("validated video mode lost sampling spec")
-            sampling_kwargs = spec.mm_processor_kwargs()
+            duration = float(metadata["duration"])
+            mm_processor_kwargs = spec.mm_processor_kwargs()
+            media_io_kwargs = spec.media_io_kwargs(duration)
             if spec.num_frames is not None:
                 sampled_frames = spec.num_frames
             else:
-                sampled_frames = max(4, math.ceil(float(metadata["duration"]) * float(spec.fps)))
+                sampled_frames = max(4, int(duration * float(spec.fps)))
                 if spec.max_frames is not None:
                     sampled_frames = min(sampled_frames, spec.max_frames)
 
@@ -375,7 +381,8 @@ class QwenBaselineRunner:
         result, attempts, latency = self._chat(
             messages,
             generation_seed=generation_seed,
-            mm_processor_kwargs=sampling_kwargs,
+            mm_processor_kwargs=mm_processor_kwargs,
+            media_io_kwargs=media_io_kwargs,
         )
         displayed_prediction = parse_strict_json_mcq_answer(
             result.content,
@@ -488,7 +495,14 @@ class QwenBaselineRunner:
                 else None
             ),
             "baseline_mode": self.config.mode,
-            "sampling_kwargs": sampling_kwargs,
+            "sampling_kwargs": {
+                "mm_processor_kwargs": mm_processor_kwargs,
+                "media_io_kwargs": media_io_kwargs,
+            }
+            if video is not None
+            else None,
+            "mm_processor_kwargs": mm_processor_kwargs,
+            "media_io_kwargs": media_io_kwargs,
             "sampled_frames_estimated": sampled_frames,
             "sampled_frames_actual": None,
             "sampled_frames_source": (

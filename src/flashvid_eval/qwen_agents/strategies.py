@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +36,9 @@ _ANSWER_INSTRUCTION = (
     'When ready, return exactly one JSON object and nothing else: {"answer":"X"}. '
     "X must be one of the supplied option letters."
 )
+
+_A3_ROOT_NODES = 8
+_A3_BRANCH_NODES = 2
 
 
 def _tool_instruction(max_calls: int = 1) -> str:
@@ -98,6 +102,99 @@ def _parse_intervals(text: str, duration: float, limit: int) -> list[tuple[float
     return []
 
 
+def _strict_string_list(value: Any, *, allow_empty: bool) -> list[str] | None:
+    if not isinstance(value, list) or (not allow_empty and not value):
+        return None
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        normalized.append(item.strip())
+    return normalized
+
+
+def _parse_a2_overview(
+    text: str,
+    duration: float,
+    limit: int,
+) -> tuple[dict[str, Any], list[tuple[float, float]]] | None:
+    try:
+        payload = json.loads((text or "").strip())
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+        "atomic_claims",
+        "unresolved",
+        "intervals",
+    }:
+        return None
+    claims = _strict_string_list(payload["atomic_claims"], allow_empty=False)
+    unresolved = _strict_string_list(payload["unresolved"], allow_empty=True)
+    raw_intervals = payload["intervals"]
+    if claims is None or unresolved is None:
+        return None
+    if not isinstance(raw_intervals, list) or not 1 <= len(raw_intervals) <= limit:
+        return None
+    intervals: list[tuple[float, float]] = []
+    for item in raw_intervals:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        if any(isinstance(value, bool) for value in item):
+            return None
+        try:
+            start, end = float(item[0]), float(item[1])
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (start, end)):
+            return None
+        if start < 0 or end > duration or start >= end:
+            return None
+        intervals.append((start, end))
+    intervals.sort()
+    if any(right[0] < left[1] for left, right in zip(intervals, intervals[1:])):
+        return None
+    normalized = {
+        "atomic_claims": claims,
+        "unresolved": unresolved,
+        "intervals": [[start, end] for start, end in intervals],
+    }
+    return normalized, intervals
+
+
+def _parse_a2_local(
+    text: str,
+    option_letters: tuple[str, ...],
+) -> dict[str, Any] | None:
+    try:
+        payload = json.loads((text or "").strip())
+    except (TypeError, json.JSONDecodeError):
+        return None
+    keys = {"observed_facts", "supports", "contradicts", "unresolved"}
+    if not isinstance(payload, dict) or set(payload) != keys:
+        return None
+    facts = _strict_string_list(payload["observed_facts"], allow_empty=False)
+    unresolved = _strict_string_list(payload["unresolved"], allow_empty=True)
+    supports = _strict_string_list(payload["supports"], allow_empty=True)
+    contradicts = _strict_string_list(payload["contradicts"], allow_empty=True)
+    if None in (facts, unresolved, supports, contradicts):
+        return None
+    valid = {letter.upper() for letter in option_letters}
+    normalized_supports = [letter.upper() for letter in supports or []]
+    normalized_contradicts = [letter.upper() for letter in contradicts or []]
+    if not normalized_supports and not normalized_contradicts:
+        return None
+    if not set(normalized_supports + normalized_contradicts) <= valid:
+        return None
+    if set(normalized_supports) & set(normalized_contradicts):
+        return None
+    return {
+        "observed_facts": facts,
+        "supports": normalized_supports,
+        "contradicts": normalized_contradicts,
+        "unresolved": unresolved,
+    }
+
+
 def _parse_selected_node(text: str, node_count: int) -> int | None:
     for payload in reversed(json_objects(text)):
         value = payload.get("selected_node")
@@ -126,6 +223,7 @@ class EvidenceAgentBase(BaseQwenAgent):
         branch: str,
         source: str,
         seed_offset: int = 0,
+        record: bool = True,
     ) -> tuple[FrameObservation, str]:
         observation = session.select(request)
         messages = [
@@ -151,7 +249,10 @@ class EvidenceAgentBase(BaseQwenAgent):
             request_kind="observer",
             seed_offset=seed_offset,
         )
-        self._record_observation(trace, branch, observation, result.content, source)
+        if record:
+            self._record_observation(trace, branch, observation, result.content, source)
+        else:
+            trace.tool_steps.append(ToolStep.from_observation(branch, observation))
         return observation, result.content
 
     def _judge(
@@ -379,6 +480,117 @@ class MultiClueMemoryStrategy(StoryboardZoomStrategy):
         "Refer to option letters and include temporal order only when directly visible."
     )
 
+    @staticmethod
+    def _canonical_evidence(payload: Mapping[str, Any]) -> str:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _append_validated_evidence(
+        trace: AgentTrace,
+        observation: FrameObservation,
+        payload: Mapping[str, Any],
+        source: str,
+    ) -> None:
+        trace.evidence_memory.append(
+            EvidenceEntry(
+                source=source,
+                interval=(
+                    observation.resolved_start_time,
+                    observation.resolved_end_time,
+                ),
+                timestamps=observation.timestamps,
+                content=MultiClueMemoryStrategy._canonical_evidence(payload),
+            )
+        )
+
+    def _run(self, sample: ModelSample, trace: AgentTrace) -> None:
+        video = self._resolve_video(sample)
+        session = self.frame_tool.open_session(
+            video, safe_session_id(sample, self.strategy_id)
+        )
+        duration = float(session.metadata["duration"])
+        local_limit = min(
+            self.config.max_intervals, max(1, self.config.max_turns - 2)
+        )
+        overview, overview_text = self._observe(
+            sample,
+            trace,
+            session,
+            FrameRequest(
+                0.0,
+                duration,
+                nframes=self.config.overview_frames,
+                resize=self.config.resize,
+                evidence_request="Find multiple disjoint clues across the full timeline.",
+            ),
+            f"{self.overview_instruction} Select at most {local_limit} intervals.",
+            branch="evidence",
+            source="storyboard_overview",
+            record=False,
+        )
+        parsed_overview = _parse_a2_overview(
+            overview_text, duration, local_limit
+        )
+        if parsed_overview is None:
+            intervals = _fallback_intervals(
+                duration,
+                local_limit,
+                min(duration, self.config.local_window_s),
+            )
+            trace.fallback_used = True
+        else:
+            overview_payload, intervals = parsed_overview
+            self._append_validated_evidence(
+                trace, overview, overview_payload, "storyboard_overview"
+            )
+
+        valid_local_evidence = 0
+        for index, (start, end) in enumerate(intervals):
+            observation, local_text = self._observe(
+                sample,
+                trace,
+                session,
+                FrameRequest(
+                    start,
+                    end,
+                    fps=self.config.local_fps,
+                    resize=self.config.resize,
+                    evidence_request="Verify option claims using directly visible facts.",
+                ),
+                self.local_instruction,
+                branch="evidence",
+                source="local_zoom",
+                seed_offset=index + 1,
+                record=False,
+            )
+            local_payload = _parse_a2_local(
+                local_text, sample.option_letters
+            )
+            if local_payload is None:
+                continue
+            self._append_validated_evidence(
+                trace, observation, local_payload, "local_zoom"
+            )
+            valid_local_evidence += 1
+
+        if valid_local_evidence == 0:
+            trace.error = "A2 produced no schema-valid local visual evidence"
+            trace.error_type = "EvidenceValidationError"
+            trace.failure_class = "model_parse_failure"
+            return
+        answer = self._judge(sample, trace, branch="judge")
+        if answer is None:
+            trace.error = "judge returned invalid answer JSON"
+            trace.error_type = "AnswerParseError"
+            return
+        trace.prediction = trace.final_prediction = answer
+
+
 
 class HierarchicalSearchStrategy(EvidenceAgentBase):
     strategy_id = "a3_hierarchical_search"
@@ -391,7 +603,9 @@ class HierarchicalSearchStrategy(EvidenceAgentBase):
         for depth in range(search_depth):
             if current[1] - current[0] <= self.config.local_window_s:
                 break
-            nodes = _split_interval(current[0], current[1], self.config.hierarchy_nodes)
+            node_count = _A3_ROOT_NODES if depth == 0 else _A3_BRANCH_NODES
+            search_stage = "eight-way coarse overview" if depth == 0 else "binary refinement"
+            nodes = _split_interval(current[0], current[1], node_count)
             node_text = "\n".join(
                 f"Node {index}: [{start:.3f}, {end:.3f}] seconds"
                 for index, (start, end) in enumerate(nodes)
@@ -403,12 +617,13 @@ class HierarchicalSearchStrategy(EvidenceAgentBase):
                 FrameRequest(
                     current[0],
                     current[1],
-                    nframes=self.config.hierarchy_nodes,
+                    nframes=node_count,
                     resize=self.config.resize,
-                    evidence_request=f"Compare these temporal nodes at hierarchy depth {depth}.",
+                    evidence_request=f"Compare nodes during {search_stage} at depth {depth}.",
                 ),
                 (
                     f"The frames represent these ordered nodes:\n{node_text}\n"
+                    f"This is a {search_stage}. "
                     "Return JSON with `selected_node` (zero-based integer) and concise "
                     "`node_summaries`. Select the single node most likely to contain evidence "
                     "that distinguishes the options."
@@ -481,14 +696,15 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
             },
             {"role": "user", "content": video_content(video, sample_question(sample))},
         ]
+        direct_sampling = DIRECT_SAMPLING_SPECS[self.config.direct_sampling]
+        direct_duration = float(self.frame_tool.probe(video)["duration"])
         direct_result = self._chat(
             trace,
             direct_messages,
             branch="direct",
             request_kind="direct",
-            mm_processor_kwargs=DIRECT_SAMPLING_SPECS[
-                self.config.direct_sampling
-            ].mm_processor_kwargs(),
+            mm_processor_kwargs=direct_sampling.mm_processor_kwargs(),
+            media_io_kwargs=direct_sampling.media_io_kwargs(direct_duration),
         )
         direct_answer = parse_answer_json(direct_result.content, sample.option_letters)
 

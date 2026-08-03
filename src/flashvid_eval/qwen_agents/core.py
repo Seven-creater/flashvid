@@ -41,6 +41,7 @@ class ChatClient(Protocol):
         chat_template_kwargs: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> ChatResult: ...
 
@@ -223,6 +224,7 @@ class RequestTrace:
     enable_thinking: bool
     sampling_params: dict[str, float | int]
     mm_processor_kwargs: dict[str, Any] | None
+    media_io_kwargs: dict[str, Any] | None
     attempt_index: int
     retry_of_length: bool
     prompt_hash: str
@@ -460,12 +462,17 @@ class FrameTool:
 
     def open_session(self, video: Path, session_id: str) -> FrameSession:
         resolved = video.resolve()
+        metadata = self.probe(resolved)
+        return FrameSession(self, resolved, metadata, session_id)
+
+    def probe(self, video: Path) -> dict[str, float | int]:
+        resolved = video.resolve()
         if not resolved.is_file():
             raise FileNotFoundError(resolved)
         metadata = self._probe(resolved)
         if float(metadata.get("duration", 0.0)) <= 0:
             raise ValueError(f"video has invalid duration: {resolved}")
-        return FrameSession(self, resolved, dict(metadata), session_id)
+        return dict(metadata)
 
     def _normalize_request(
         self,
@@ -649,6 +656,7 @@ class BaseQwenAgent:
         request_kind: str,
         seed_offset: int = 0,
         mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, Any] | None = None,
     ) -> ChatResult:
         max_tokens = self.protocol.max_tokens_for(request_kind)
         seed = self.protocol.seed + seed_offset
@@ -657,7 +665,13 @@ class BaseQwenAgent:
         attempt_index = 0
         retry_of_length = False
         while True:
-            assert_annotation_free_request(messages)
+            assert_annotation_free_request(
+                {
+                    "messages": messages,
+                    "mm_processor_kwargs": mm_processor_kwargs,
+                    "media_io_kwargs": media_io_kwargs,
+                }
+            )
             result = self.client.chat(
                 self.model,
                 messages,
@@ -667,6 +681,7 @@ class BaseQwenAgent:
                 chat_template_kwargs={"enable_thinking": self.protocol.enable_thinking},
                 sampling_params=self.protocol.sampling_params(),
                 mm_processor_kwargs=mm_processor_kwargs,
+                media_io_kwargs=media_io_kwargs,
             )
             raw_choice = ((result.raw.get("choices") or [{}])[0]) if result.raw else {}
             raw_message = raw_choice.get("message") or {}
@@ -696,6 +711,7 @@ class BaseQwenAgent:
                     enable_thinking=self.protocol.enable_thinking,
                     sampling_params=self.protocol.sampling_params(),
                     mm_processor_kwargs=deepcopy(mm_processor_kwargs),
+                    media_io_kwargs=deepcopy(media_io_kwargs),
                     attempt_index=attempt_index,
                     retry_of_length=retry_of_length,
                     prompt_hash=prompt_hash,

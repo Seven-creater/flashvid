@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping
 
 PHASES = {
     "protocol_audit",
+    "protocol_smoke",
     "blind_diagnostics",
     "direct_dev",
     "agent_smoke",
@@ -310,7 +311,8 @@ def effective_schedule(
         hierarchy_depth = int(settings.get("hierarchy_depth", 3))
         return {
             "strategy": strategy,
-            "hierarchy_nodes": int(settings.get("hierarchy_nodes", 8)),
+            "root_nodes": 8,
+            "branch_nodes": 2,
             "hierarchy_depth": min(hierarchy_depth, max(0, max_turns - 2)),
             "local_fps": float(settings.get("local_fps", 1.0)),
             "local_window_s": float(settings.get("local_window_s", 120.0)),
@@ -865,6 +867,13 @@ def materialize_agent_variant(
     settings = _base_agent_settings(base_config, strategy)
     if settings.get("strategy") != strategy:
         raise RuntimeError(f"base agent config strategy mismatch: {base_config.path}")
+    uses_a3 = strategy == "a3_hierarchical_search" or (
+        strategy == "a4_independent_arbitration"
+        and settings.get("evidence_strategy", "a3_hierarchical_search")
+        == "a3_hierarchical_search"
+    )
+    if uses_a3:
+        settings["hierarchy_nodes"] = 8
     settings = _variant_settings(settings, variant)
     schedule = effective_schedule(strategy, settings)
     effective_fingerprint = canonical_sha256(schedule)
@@ -909,19 +918,19 @@ def trajectory_variants(
         raw_catalog = [
             SearchVariant(
                 variant_id=(
-                    f"nodes{nodes:02d}_depth{depth}_fps{str(float(fps)).replace('.', 'p')}"
+                    f"root08_branch02_depth{depth}_fps{str(float(fps)).replace('.', 'p')}"
                     f"_window{int(window):03d}"
                 ),
                 overview_frames=64,
                 local_fps=float(fps),
                 max_intervals=4,
                 max_turns=max(4, int(depth) + 2),
-                hierarchy_nodes=int(nodes),
+                hierarchy_nodes=8,
                 hierarchy_depth=int(depth),
                 local_window_s=float(window),
             )
-            for nodes, depth, fps, window in product(
-                (4, 8, 12), (1, 2, 3), search["local_fps"], (60.0, 120.0)
+            for depth, fps, window in product(
+                (1, 2, 3), search["local_fps"], (60.0, 120.0)
             )
         ]
     else:
@@ -981,7 +990,7 @@ def _smoke_manifest(
     source = _manifest(config, dataset, "dev")
     if not source.path.is_file():
         raise FileNotFoundError(
-            f"agent_smoke requires the real Dev manifest, even in dry-run: {source.path}"
+            f"smoke phases require the real Dev manifest, even in dry-run: {source.path}"
         )
     if file_sha256(source.path) != source.sha256:
         raise RuntimeError(f"{dataset} Dev manifest changed before smoke derivation")
@@ -1119,7 +1128,7 @@ def build_tasks(
         if framework_filter in DISABLED_AGENTS:
             raise ValueError("A5 is disabled")
         raise ValueError(f"unknown framework filter: {framework_filter}")
-    if phase != "protocol_audit" and phase not in {
+    if phase not in {"protocol_smoke", "protocol_audit"} and phase not in {
         "final_test",
         "trajectory",
         "teacher_dev",
@@ -1161,8 +1170,10 @@ def build_tasks(
         sampling: str | None = None,
         permutation_seed: int | None = None,
         mismatch_seed: int | None = None,
+        split: str = "dev",
+        manifest_override: Artifact | None = None,
     ) -> None:
-        manifest = _manifest(config, dataset, "dev")
+        manifest = manifest_override or _manifest(config, dataset, "dev")
         extra = ["--baseline-mode", mode, "--qwen-protocol", protocol]
         if sampling:
             extra.extend(["--direct-sampling", sampling])
@@ -1188,7 +1199,7 @@ def build_tasks(
                 phase=phase,
                 task_id=task_id,
                 dataset=dataset,
-                split="dev",
+                split=split,
                 model_key=model_key,
                 manifest=manifest,
                 backend="qwen_baseline",
@@ -1198,7 +1209,12 @@ def build_tasks(
             )
         )
 
-    if phase == "protocol_audit":
+    if phase in {"protocol_smoke", "protocol_audit"}:
+        split = "smoke" if phase == "protocol_smoke" else "dev"
+        smoke_manifests = (
+            {dataset: _smoke_manifest(config, dataset, write=write_smoke) for dataset in DATASETS}
+            if phase == "protocol_smoke" else {}
+        )
         for dataset in DATASETS:
             for model_key in model_keys:
                 for protocol in protocols:
@@ -1209,6 +1225,8 @@ def build_tasks(
                         "direct",
                         task_suffix="uniform64",
                         sampling="uniform64",
+                        split=split,
+                        manifest_override=smoke_manifests.get(dataset),
                     )
     elif phase == "blind_diagnostics":
         modes = list(config["diagnostics"]["modes"])
@@ -1764,6 +1782,117 @@ def execute_tasks(
         subprocess.run(list(task.command), cwd=source_workspace, check=True)
 
 
+def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    length_truncations: list[dict[str, str]] = []
+    row_count = 0
+    for task in tasks:
+        result_files = sorted(
+            Path(task.output_dir).glob(f"{task.dataset}_*.jsonl")
+        )
+        if len(result_files) != 1:
+            issues.append(
+                {
+                    "task_id": task.task_id,
+                    "sample_id": "",
+                    "reason": f"expected_one_result_jsonl_found_{len(result_files)}",
+                }
+            )
+            continue
+        rows = [
+            json.loads(line)
+            for line in result_files[0].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if len(rows) != 10:
+            issues.append(
+                {
+                    "task_id": task.task_id,
+                    "sample_id": "",
+                    "reason": f"expected_10_rows_found_{len(rows)}",
+                }
+            )
+        seen: set[str] = set()
+        protocol_index = task.command.index("--qwen-protocol") + 1
+        protocol = task.command[protocol_index]
+        for row in rows:
+            row_count += 1
+            sample_id = str(row.get("sample_id") or "")
+            if not sample_id or sample_id in seen:
+                issues.append(
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "reason": "missing_or_duplicate_sample_id",
+                    }
+                )
+            seen.add(sample_id)
+            attempts = row.get("request_attempts")
+            had_length = bool(row.get("length_retry_used")) or (
+                isinstance(attempts, list)
+                and any(
+                    isinstance(attempt, Mapping)
+                    and attempt.get("finish_reason") == "length"
+                    for attempt in attempts
+                )
+            )
+            if protocol == "think" and had_length:
+                length_truncations.append(
+                    {"task_id": task.task_id, "sample_id": sample_id}
+                )
+            failure = next(
+                (
+                    key
+                    for key in (
+                        "error",
+                        "error_type",
+                        "parse_error",
+                        "model_parse_failure",
+                        "data_unavailable",
+                        "control_unavailable",
+                    )
+                    if row.get(key)
+                ),
+                None,
+            )
+            if failure is None and row.get("prediction") is None:
+                failure = "prediction_missing"
+            if failure is None and row.get("annotation_leak_check") != "passed":
+                failure = "annotation_leak_check_not_passed"
+            if failure is None and int(row.get("candidate_rerun") or 0) != 0:
+                failure = "candidate_rerun_nonzero"
+            if failure is None and row.get("media_items") != 1:
+                failure = "direct_video_missing"
+            if failure is None and row.get("sampling_id") != "uniform64":
+                failure = "sampling_id_mismatch"
+            if failure is None and row.get("sampled_frames_estimated") != 64:
+                failure = "sampled_frame_request_mismatch"
+            if failure is None and row.get("visual_usage_complete") is not True:
+                failure = "visual_token_accounting_incomplete"
+            if failure is not None:
+                issues.append(
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "reason": str(failure),
+                    }
+                )
+    status = "passed" if not issues and not length_truncations else "blocked"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "task_count": len(tasks),
+        "row_count": row_count,
+        "engineering_issues": issues,
+        "thinking_length_truncations": length_truncations,
+        "required_action": (
+            "set the frozen think protocol max_tokens to 32768 and rerun the entire protocol smoke"
+            if length_truncations
+            else None
+        ),
+    }
+
+
 def shell_line(command: Iterable[str]) -> str:
     return shlex.join(list(command))
 
@@ -1796,7 +1925,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-missing-inputs",
         action="store_true",
-        help="Preview server paths locally; only valid with --dry-run and not agent_smoke.",
+        help="Preview server paths locally; smoke phases still require real Dev manifests.",
     )
     args = parser.parse_args()
     if args.allow_missing_inputs and not args.dry_run:
@@ -1931,6 +2060,13 @@ def main() -> None:
     plan_path = Path(config["result_root"]) / "run_plans" / f"{args.phase}{suffix}.json"
     freeze_run_plan(plan_path, plan, resume=effective_resume)
     execute_tasks(tasks, Path(config["source_workspace"]))
+    if args.phase == "protocol_smoke":
+        audit = audit_protocol_smoke(tasks)
+        print(json.dumps(audit, ensure_ascii=False, indent=2))
+        if audit["status"] != "passed":
+            raise RuntimeError(
+                "protocol smoke failed; inspect engineering_issues and thinking_length_truncations"
+            )
 
 
 if __name__ == "__main__":

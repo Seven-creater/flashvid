@@ -608,6 +608,7 @@ def _request_trace(
         enable_thinking=True,
         sampling_params={},
         mm_processor_kwargs=None,
+        media_io_kwargs=None,
         attempt_index=attempt_index,
         retry_of_length=attempt_index > 0,
         prompt_hash=prompt_hash,

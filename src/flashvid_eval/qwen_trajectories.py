@@ -32,6 +32,8 @@ class TrajectoryChatClient(Protocol):
         seed: int | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+        media_io_kwargs: dict[str, Any] | None = None,
     ) -> ChatResult: ...
 
 

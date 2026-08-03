@@ -56,6 +56,42 @@ def test_text_baseline_is_annotation_free_and_strict_json(tmp_path: Path) -> Non
     assert result["annotation_leak_check"] == "passed"
 
 
+def test_choices_only_runner_sends_no_question_or_video(tmp_path: Path) -> None:
+    client = FakeClient([ChatResult('{"answer":"A"}', {}, {}, 0.0)])
+    runner = QwenBaselineRunner(
+        client,
+        "Qwen",
+        tmp_path,
+        QwenBaselineConfig("choices_only", NO_THINK_PROTOCOL),
+    )
+    result = runner.run(ModelSample.from_sample(_sample(), None))
+    serialized = json.dumps(client.calls[0], ensure_ascii=False)
+    assert "What happens?" not in serialized
+    assert "video_url" not in serialized
+    assert result["prediction"] == "A"
+    assert result["visual_tokens"] == 0
+
+
+def test_permuted_choices_runner_maps_displayed_answer_back(tmp_path: Path) -> None:
+    client = FakeClient([ChatResult('{"answer":"C"}', {}, {}, 0.0)])
+    runner = QwenBaselineRunner(
+        client,
+        "Qwen",
+        tmp_path,
+        QwenBaselineConfig(
+            "permuted_choices",
+            NO_THINK_PROTOCOL,
+            option_permutation_seed=17,
+        ),
+    )
+    result = runner.run(ModelSample.from_sample(_sample(), None))
+    prompt = client.calls[0]["messages"][0]["content"]
+    assert "B. gamma" in prompt
+    assert "C. beta" in prompt
+    assert result["displayed_prediction"] == "C"
+    assert result["prediction"] == "B"
+
+
 def test_thinking_length_retry_records_both_attempts(tmp_path: Path) -> None:
     client = FakeClient(
         [
@@ -129,6 +165,15 @@ def test_retry_usage_is_cumulative_and_nested_multimodal_tokens_are_parsed(
     assert result["final_total_tokens"] == 102
     assert result["sampled_frames_source"] == "estimated_from_request"
     assert result["sampled_frames_actual"] is None
+    assert client.calls[0]["mm_processor_kwargs"] == {"do_sample_frames": False}
+    assert client.calls[0]["media_io_kwargs"] == {
+        "video": {
+            "num_frames": -1,
+            "fps": 3.2,
+            "min_frames": 32,
+            "max_frames": 32,
+        }
+    }
     assert _visual_tokens(first_usage) == 500
 
 
@@ -223,6 +268,27 @@ def test_generation_seed_is_stable_per_sample_and_in_fingerprint(tmp_path: Path)
     assert runner.run_fingerprint() != changed_artifact.run_fingerprint()
     assert first["run_context"] == {"manifest_sha256": "a" * 64}
     assert first["content"] == '{"answer":"B"}'
+
+
+def test_baseline_fingerprint_uses_v3_sampling_schema(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    def capture(payload):
+        captured.update(payload)
+        return "fingerprint"
+
+    monkeypatch.setattr("flashvid_eval.qwen_evaluation._canonical_hash", capture)
+    runner = QwenBaselineRunner(
+        FakeClient([]),
+        "Qwen",
+        tmp_path,
+        QwenBaselineConfig("question_choices", NO_THINK_PROTOCOL),
+    )
+    assert runner.run_fingerprint() == "fingerprint"
+    assert captured["runner"] == "qwen_baseline_v3"
 
 
 def test_evaluation_joins_private_answer_only_after_runner_returns(tmp_path: Path) -> None:

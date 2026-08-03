@@ -283,6 +283,81 @@ def test_protocol_audit_enumerates_models_protocols_and_datasets(tmp_path: Path)
     assert all("--model-artifact-sha256" in task.command for task in tasks)
 
 
+def test_protocol_smoke_uses_frozen_dev10_for_both_models_and_protocols(
+    tmp_path: Path,
+) -> None:
+    config = runner.load_config(_config_file(tmp_path, _config(tmp_path)))
+    tasks = runner.build_tasks(
+        config,
+        "protocol_smoke",
+        check_files=True,
+        write_smoke=True,
+    )
+    assert len(tasks) == 12
+    assert {task.split for task in tasks} == {"smoke"}
+    assert all(task.command[task.command.index("--sample") + 1] == "10" for task in tasks)
+    manifests = {Path(task.manifest) for task in tasks}
+    assert len(manifests) == 3
+    assert all(
+        len(path.read_text(encoding="utf-8").splitlines()) == 10
+        for path in manifests
+    )
+
+
+def test_protocol_smoke_audit_blocks_any_thinking_length_retry(tmp_path: Path) -> None:
+    config = runner.load_config(_config_file(tmp_path, _config(tmp_path)))
+    tasks = runner.build_tasks(
+        config,
+        "protocol_smoke",
+        model_filter="q9",
+        protocol_filter="think",
+        check_files=True,
+        write_smoke=True,
+    )
+    for task in tasks:
+        output = Path(task.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "sample_id": f"{task.dataset}-{index}",
+                "prediction": "A",
+                "annotation_leak_check": "passed",
+                "candidate_rerun": 0,
+                "media_items": 1,
+                "sampling_id": "uniform64",
+                "sampled_frames_estimated": 64,
+                "visual_usage_complete": True,
+                "request_attempts": [
+                    {"max_tokens": 8192, "finish_reason": "stop"}
+                ],
+                "length_retry_used": False,
+            }
+            for index in range(10)
+        ]
+        (output / f"{task.dataset}_result.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+    assert runner.audit_protocol_smoke(tasks)["status"] == "passed"
+
+    first = tasks[0]
+    result = next(Path(first.output_dir).glob(f"{first.dataset}_*.jsonl"))
+    rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    rows[0]["length_retry_used"] = True
+    rows[0]["request_attempts"] = [
+        {"max_tokens": 8192, "finish_reason": "length"},
+        {"max_tokens": 32768, "finish_reason": "stop"},
+    ]
+    result.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    audit = runner.audit_protocol_smoke(tasks)
+    assert audit["status"] == "blocked"
+    assert len(audit["thinking_length_truncations"]) == 1
+    assert "32768" in audit["required_action"]
+
+
 def test_post_audit_dev_phases_require_one_explicit_protocol(tmp_path: Path) -> None:
     config = runner.load_config(_config_file(tmp_path, _config(tmp_path)))
     for phase in ("blind_diagnostics", "direct_dev", "agent_smoke", "agent_dev"):
@@ -478,12 +553,36 @@ def test_trajectory_uses_train_and_twelve_deterministic_runs(tmp_path: Path) -> 
     payloads = [json.loads(Path(path).read_text(encoding="utf-8")) for path in config_paths]
     settings = [item["agent"] for item in payloads]
     assert len({item["local_fps"] for item in settings}) > 1
-    assert len({item["hierarchy_nodes"] for item in settings}) > 1
+    assert {item["hierarchy_nodes"] for item in settings} == {8}
     assert len({item["hierarchy_depth"] for item in settings}) > 1
     assert len({item["local_window_s"] for item in settings}) > 1
+    schedules = [item["effective_schedule"] for item in payloads]
+    assert all(item["root_nodes"] == 8 for item in schedules)
+    assert all(item["branch_nodes"] == 2 for item in schedules)
+
     assert len(
         {item["search_variant"]["effective_schedule_fingerprint"] for item in payloads}
     ) == 12
+
+
+def test_a3_effective_schedule_ignores_legacy_node_count() -> None:
+    common = {
+        "max_turns": 6,
+        "hierarchy_depth": 3,
+        "local_fps": 1.0,
+        "local_window_s": 120.0,
+        "resize": 0.75,
+        "max_frames_per_call": 128,
+    }
+    low = runner.effective_schedule(
+        "a3_hierarchical_search", {**common, "hierarchy_nodes": 4}
+    )
+    high = runner.effective_schedule(
+        "a3_hierarchical_search", {**common, "hierarchy_nodes": 12}
+    )
+    assert low == high
+    assert low["root_nodes"] == 8
+    assert low["branch_nodes"] == 2
 
 
 def test_trajectory_rejects_a_frozen_q4_winner(tmp_path: Path) -> None:

@@ -77,16 +77,29 @@ def test_mismatched_videos_stay_in_dataset_and_duration_bucket() -> None:
 
 def test_direct_sampling_specs_are_mutually_exclusive() -> None:
     assert DIRECT_SAMPLING_SPECS["uniform32"].mm_processor_kwargs() == {
-        "do_sample_frames": True,
-        "num_frames": 32,
+        "do_sample_frames": False,
     }
-    assert DIRECT_SAMPLING_SPECS["uniform64"].mm_processor_kwargs()["num_frames"] == 64
-    assert DIRECT_SAMPLING_SPECS["uniform128"].mm_processor_kwargs()["num_frames"] == 128
-    assert DIRECT_SAMPLING_SPECS["fps2"].mm_processor_kwargs() == {
-        "do_sample_frames": True,
-        "fps": 2.0,
-        "max_frames": 768,
+    assert DIRECT_SAMPLING_SPECS["uniform64"].media_io_kwargs(100.0) == {
+        "video": {
+            "num_frames": -1,
+            "fps": 0.64,
+            "min_frames": 64,
+            "max_frames": 64,
+        }
     }
+    assert DIRECT_SAMPLING_SPECS["uniform128"].media_io_kwargs(64.0)["video"][
+        "fps"
+    ] == 2.0
+    assert DIRECT_SAMPLING_SPECS["fps2"].media_io_kwargs(100.0) == {
+        "video": {
+            "num_frames": -1,
+            "fps": 2.0,
+            "min_frames": 4,
+            "max_frames": 768,
+        }
+    }
+    with pytest.raises(ValueError, match="duration"):
+        DIRECT_SAMPLING_SPECS["uniform32"].media_io_kwargs(0)
     with pytest.raises(ValueError, match="exactly one"):
         DirectSamplingSpec("invalid")
     with pytest.raises(ValueError, match="exactly one"):

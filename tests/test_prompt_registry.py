@@ -45,6 +45,8 @@ def test_new_prompts_keep_symmetric_eva_format_and_candidate_gate(
     assert "Change it only after visible evidence contradicts it" in text
     assert "Answer: X" in text
     assert re.search(r'"retention_ratio":0\.5(?=[,}])', text) is None
+    assert "On the first turn, request visual evidence" in text
+    assert "until at least one <tool_response> has been received" in text
 
 
 def test_rubric_requires_lowest_sufficient_budget_without_midpoint_anchor() -> None:

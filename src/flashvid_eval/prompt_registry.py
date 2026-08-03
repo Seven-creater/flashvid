@@ -40,6 +40,8 @@ must contain one of the following four equally valid JSON forms:
 <tool_call>{"tool":"frame_select","arguments":{"start_time":0.0,"end_time":30.0,"nframes":12,"resize":0.45,"retention_ratio":0.50,"evidence_request":"Describe the visible evidence needed to distinguish the options."}}</tool_call>
 <tool_call>{"tool":"frame_select","arguments":{"start_time":0.0,"end_time":30.0,"nframes":12,"resize":0.45,"retention_ratio":1.00,"evidence_request":"Describe the visible evidence needed to distinguish the options."}}</tool_call>
 Do not add markdown, prose, or a second wrapper around a tool request.
+On the first turn, request visual evidence with at least one tool call. Do not output
+Answer: X until at least one <tool_response> has been received.
 """
 
 _CANDIDATE_GATE = """\

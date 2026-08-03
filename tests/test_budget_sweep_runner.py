@@ -354,3 +354,18 @@ def test_random_matched_distribution_can_only_come_from_hashed_dev_summary(tmp_p
     dev_summary_path.write_text("{}", encoding="utf-8")
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         sweep.validate_inputs(loaded)
+
+
+def test_frozen_sweep_uses_format_compliant_q4_fixed_baselines() -> None:
+    root = Path(__file__).parents[1]
+    config = sweep.load_config(root / "configs" / "experiments" / "budget_sweep_dev.json")
+    fixed = [
+        policy
+        for policy in config["policies"]
+        if policy["id"].startswith("q4_fixed_")
+    ]
+
+    assert len(fixed) == 4
+    assert {policy["prompt_id"] for policy in fixed} == {"budget_rubric_v1"}
+    assert all(policy["id"].endswith("_rubric") for policy in fixed)
+    assert Path(config["result_root"]).name == "flashvid_budget_sweep_dev_frozen"

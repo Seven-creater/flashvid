@@ -103,37 +103,37 @@
       ]
     },
     {
-      "id": "q4_fixed_r010_legacy",
+      "id": "q4_fixed_r010_rubric",
       "controller": "q4base",
       "strategy": "fixed_r010",
-      "prompt_id": "legacy_v1",
+      "prompt_id": "budget_rubric_v1",
       "stages": [
         "final"
       ]
     },
     {
-      "id": "q4_fixed_r025_legacy",
+      "id": "q4_fixed_r025_rubric",
       "controller": "q4base",
       "strategy": "fixed_r025",
-      "prompt_id": "legacy_v1",
+      "prompt_id": "budget_rubric_v1",
       "stages": [
         "final"
       ]
     },
     {
-      "id": "q4_fixed_r050_legacy",
+      "id": "q4_fixed_r050_rubric",
       "controller": "q4base",
       "strategy": "fixed_r050",
-      "prompt_id": "legacy_v1",
+      "prompt_id": "budget_rubric_v1",
       "stages": [
         "final"
       ]
     },
     {
-      "id": "q4_fixed_r100_legacy",
+      "id": "q4_fixed_r100_rubric",
       "controller": "q4base",
       "strategy": "fixed_r100",
-      "prompt_id": "legacy_v1",
+      "prompt_id": "budget_rubric_v1",
       "stages": [
         "final"
       ]
@@ -184,7 +184,7 @@
       ],
       "budget_distribution_from_dev": {
         "summary": {
-          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/summary.json",
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/summary.json",
           "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
         }
       }
@@ -193,13 +193,13 @@
   "final_selection": {
     "mode": "dev_non_dominated",
     "dev_summary": {
-      "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/combined/summary.json",
+      "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/combined/summary.json",
       "sha256": "REPLACE_WITH_FROZEN_COMBINED_DEV_SUMMARY_SHA256"
     },
     "always_include": [
       "candidate_only",
-      "q4_fixed_r010_legacy",
-      "q4_fixed_r100_legacy",
+      "q4_fixed_r010_rubric",
+      "q4_fixed_r100_rubric",
       "q4_model_legacy",
       "ck39_existing"
     ],

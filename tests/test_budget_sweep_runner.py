@@ -255,6 +255,7 @@ def test_server_configs_are_gated_by_frozen_summary_availability() -> None:
             "q9",
             "--dry-run",
             "--allow-missing-inputs",
+            "--resume",
         ],
         text=True,
         capture_output=True,

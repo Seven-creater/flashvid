@@ -1,0 +1,208 @@
+{
+  "extends": "budget_sweep_dev.json",
+  "schema_version": 1,
+  "experiment_id": "flashvid-training-free-budget-sweep-final-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_final",
+  "_instructions": "Run only after the Dev report is frozen. The report must expose policy IDs under non_dominated, non_dominated_methods, or pareto_frontier. No test result may change this selection.",
+  "policies": [
+    {
+      "id": "candidate_only",
+      "execution": "candidate_only",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_fixed_r010_legacy",
+      "controller": "q9",
+      "strategy": "fixed_r010",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_fixed_r025_legacy",
+      "controller": "q9",
+      "strategy": "fixed_r025",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_fixed_r050_legacy",
+      "controller": "q9",
+      "strategy": "fixed_r050",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_fixed_r100_legacy",
+      "controller": "q9",
+      "strategy": "fixed_r100",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_random_legacy",
+      "controller": "q9",
+      "strategy": "random_uniform",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_route_legacy",
+      "controller": "q9",
+      "strategy": "route_rule",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_uncertainty_legacy",
+      "controller": "q9",
+      "strategy": "uncertainty_escalation",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_model_legacy",
+      "controller": "q9",
+      "strategy": "model_requested",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_model_rubric",
+      "controller": "q9",
+      "strategy": "model_requested",
+      "prompt_id": "budget_rubric_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_model_escalation",
+      "controller": "q9",
+      "strategy": "model_requested",
+      "prompt_id": "budget_escalation_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_fixed_r010_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r010",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_fixed_r025_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r025",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_fixed_r050_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r050",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_fixed_r100_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r100",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_model_legacy",
+      "controller": "q4base",
+      "strategy": "model_requested",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_model_rubric",
+      "controller": "q4base",
+      "strategy": "model_requested",
+      "prompt_id": "budget_rubric_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q4_model_escalation",
+      "controller": "q4base",
+      "strategy": "model_requested",
+      "prompt_id": "budget_escalation_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "ck39_existing",
+      "controller": "ck39",
+      "strategy": "model_requested",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ]
+    },
+    {
+      "id": "q9_random_matched",
+      "controller": "q9",
+      "strategy": "random_matched",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "final"
+      ],
+      "budget_distribution_from_dev": {
+        "summary": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/summary.json",
+          "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
+        }
+      }
+    }
+  ],
+  "final_selection": {
+    "mode": "dev_non_dominated",
+    "dev_summary": {
+      "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/combined/summary.json",
+      "sha256": "REPLACE_WITH_FROZEN_COMBINED_DEV_SUMMARY_SHA256"
+    },
+    "always_include": [
+      "candidate_only",
+      "q4_fixed_r010_legacy",
+      "q4_fixed_r100_legacy",
+      "q4_model_legacy",
+      "ck39_existing"
+    ],
+    "include_cost_matched_random": true
+  }
+}

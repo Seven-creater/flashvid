@@ -1,0 +1,29 @@
+{
+  "extends": "budget_sweep_dev.json",
+  "schema_version": 1,
+  "experiment_id": "flashvid-training-free-budget-sweep-matched-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched",
+  "_instructions": "Fill the frozen base Dev summary SHA after base Dev reporting; then run smoke and dev. The distribution comes only from that Dev summary.",
+  "policies": [
+    {
+      "id": "q9_random_matched",
+      "controller": "q9",
+      "strategy": "random_matched",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "budget_distribution_from_dev": {
+        "summary": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/summary.json",
+          "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
+        }
+      }
+    }
+  ],
+  "final_selection": {
+    "mode": "explicit",
+    "policy_ids": []
+  }
+}

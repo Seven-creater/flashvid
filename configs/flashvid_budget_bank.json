@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "allowed_media_root": "/dev/shm/flashvid_perception",
+  "controller": {
+    "base_url": "http://127.0.0.1:8200/v1",
+    "model": "Qwen3.5-9B",
+    "max_concurrency": 32
+  },
+  "perception": [
+    {
+      "retention_ratio": 0.1,
+      "base_url": "http://127.0.0.1:8101/v1",
+      "model": "Qwen3.5-4B-FlashVID-r010",
+      "backend_revision": "flashvid_arch_v1",
+      "max_concurrency": 8
+    },
+    {
+      "retention_ratio": 0.25,
+      "base_url": "http://127.0.0.1:8102/v1",
+      "model": "Qwen3.5-4B-FlashVID-r025",
+      "backend_revision": "flashvid_arch_v1",
+      "max_concurrency": 8
+    },
+    {
+      "retention_ratio": 0.5,
+      "base_url": "http://127.0.0.1:8103/v1",
+      "model": "Qwen3.5-4B-FlashVID-r050",
+      "backend_revision": "flashvid_arch_v1",
+      "max_concurrency": 8
+    },
+    {
+      "retention_ratio": 1.0,
+      "base_url": "http://127.0.0.1:8104/v1",
+      "model": "Qwen3.5-4B-FlashVID-r100",
+      "backend_revision": "native_bypass_v1",
+      "max_concurrency": 8
+    }
+  ]
+}

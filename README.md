@@ -145,6 +145,84 @@ highest-throughput result to `results/best_config.json`.
 The plugin deliberately targets the vLLM 0.25.1 Qwen3.5 implementation. Pinning
 is intentional because the integration uses model-internal multimodal hooks.
 
+## Unified long-video evaluation
+
+The evaluator normalizes CG-Bench, LVBench, and LSDBench, freezes deterministic
+manifests, and writes resumable JSONL results. Direct, EVA-style Agent,
+frozen-candidate Hybrid v3c, and FlashVID Hybrid share one entry point. Model
+requests never receive benchmark answers, clue intervals, annotated time
+ranges, or human question types.
+
+```bash
+python -m pip install -e ".[test]"
+python scripts/evaluate_mcq.py \
+  --dataset lsdbench \
+  --backend direct \
+  --annotations /path/to/LSDBench/test.json \
+  --video-root /data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/videos \
+  --model Qwen3.5-9B \
+  --base-url http://127.0.0.1:8001/v1 \
+  --concurrency 32 \
+  --sample 100 --seed 42 --resume \
+  --output-dir results/eval
+```
+
+The official EVA frame selector is pinned as a Git submodule. The dependency
+lock records that the archived local snapshot `1774939` and fetchable upstream
+commit `758ad8d` have the identical Git tree. Hybrid v3c can
+reuse a frozen Direct candidate without rerunning Direct:
+
+```bash
+python scripts/evaluate_mcq.py \
+  --dataset lsdbench \
+  --backend hybrid_frozen \
+  --agent-version hybrid_v3c \
+  --candidate-results results/eval/lsdbench_direct.jsonl \
+  --manifest results/eval/lsdbench_manifest_42_100.jsonl \
+  --annotations /path/to/LSDBench/test.json \
+  --video-root /path/to/LSDBench/videos \
+  --resume --output-dir results/eval/hybrid_v3c
+```
+
+## Training-free budget sweep
+
+`flashvid_hybrid` keeps the 9B controller text-only and sends selected clips to
+the FlashVID-4B perception bank. The sweep compares fixed 10/25/50/100%, seeded
+random, question-route rules, evidence-driven escalation, and a frozen
+cost-matched random baseline. It also freezes three prompt IDs: `legacy_v1`,
+`budget_rubric_v1`, and `budget_escalation_v1`.
+
+```bash
+python scripts/run_budget_sweep.py \
+  --config configs/experiments/budget_sweep_dev.json \
+  --stage smoke --controller q9 --resume
+```
+
+The launcher validates file and configuration hashes, creates the 10-sample
+smoke manifests, and uses `setsid + nohup` on Linux. It never starts training or
+model services. Runs containing more than one controller must be launched in
+separate `--controller q9`, `--controller q4base`, and `--controller ck39`
+phases so a stopped or mismatched service cannot silently corrupt a sweep.
+Summaries include candidate-only at zero incremental FlashVID
+visual cost and compute separate system, 9B-controller, and 4B-controller
+Pareto frontiers:
+
+```bash
+python scripts/summarize_budget_sweep.py \
+  --config configs/experiments/budget_sweep_report.json
+```
+
+The frozen execution order is base smoke/dev, base summary, three
+cost-matched-random smoke/dev runs, combined summary, and finally the original
+300-sample test. The matched and final templates intentionally contain SHA
+placeholders and refuse to run until the preceding Dev summaries are frozen;
+the test runner selects executable policies only from the separate 9B and 4B
+Dev frontiers, never from the system-level Direct/v3c reference frontier.
+
+Service helpers are limited to the FlashVID budget bank and Qwen3.5-9B
+launchers. Large models, datasets, caches, raw results, and server environment
+files are intentionally ignored by Git.
+
 ## Attribution
 
 The compression algorithm is adapted from

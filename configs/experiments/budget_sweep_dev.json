@@ -1,0 +1,413 @@
+{
+  "schema_version": 1,
+  "experiment_id": "flashvid-training-free-budget-sweep-dev-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev",
+  "_instructions": "Frozen server paths point to read-only v1 inputs in the original workspace; new outputs are isolated in the clean branch clone.",
+  "datasets": {
+    "lvbench": {
+      "annotations": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/data/LVBench_raw_full_root.jsonl",
+        "sha256": "0dd91bcc51135e5c289464c0f01853c8a98176e2676e7cf08ee055e2992458a7"
+      },
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/06_lvbench",
+      "manifests": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_dev.jsonl",
+          "sha256": "c1fb73c070dac5a99c1d1f66a7b50ccc3475b520c8595f451e30d755e5d357f1"
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl",
+          "sha256": "2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb"
+        }
+      },
+      "candidates": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/lvbench/dev/lvbench_direct.jsonl",
+          "sha256": "816def53a5cf8a71a1191ff49c748131c71114e78d5c0961011a3ad896f11d2b",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/normalized/lvbench_816def53a5cf8a71a1191ff49c748131c71114e78d5c0961011a3ad896f11d2b.jsonl",
+            "sha256": "abe33cf3265d53e212f5a112730b6066cbb3034cf4b4b867c75cf2709d219389"
+          }
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/qwen9b_direct/lvbench_direct.jsonl",
+          "sha256": "b09799ce7c29e3a87e57d8e13b0b258b86fbf2605fdbc714affdc55757cc305b",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen/lvbench/lvbench_normalized_candidates.jsonl",
+            "sha256": "0a2eba1d5b29b52bc7546523d5b6f1c08e1070d2d54475f1a7f0d8240a382dc0"
+          }
+        }
+      }
+    },
+    "lsdbench": {
+      "annotations": {
+        "path": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/test.json",
+        "sha256": "2e07bd50aa2606a7b393d0f30db423aeab3f79853537e222e31fc48d7662c283"
+      },
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/videos",
+      "manifests": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_dev.jsonl",
+          "sha256": "c6e1840e055e53fe48fa831ab4b193267af87054155e1b87abcfb12260e31b39"
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lsdbench_manifest_42_100.jsonl",
+          "sha256": "37dbd946d8abe870ac4eec7d8d1f787c99c148f43546a97371cb13a8856e68d2"
+        }
+      },
+      "candidates": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/lsdbench/dev/lsdbench_direct.jsonl",
+          "sha256": "7f8bb156f49e92d706c0ee24a5901f0ef6b432ba9106bcd03d88dddc5b7e6e81",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/normalized/lsdbench_7f8bb156f49e92d706c0ee24a5901f0ef6b432ba9106bcd03d88dddc5b7e6e81.jsonl",
+            "sha256": "7c6966c82eea866f168dd6c5c1693ba2c354bcd26f9bdbbb4e6d7409b00823d0"
+          }
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/qwen9b_direct/lsdbench_direct.jsonl",
+          "sha256": "0c0663fc18333244f2f45ce7009b89689f0f579079d5ec6c536bef378da7d9fa",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen/lsdbench/lsdbench_normalized_candidates.jsonl",
+            "sha256": "f4720a67bd225e7c5a9f9cb9a7e77421b4711269f44035419bb5cf8c31defa18"
+          }
+        }
+      }
+    },
+    "cgbench": {
+      "annotations": {
+        "path": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/cgbench.json",
+        "sha256": "f2db9d2e8144e30806c3eab3ea50e7e1681bf9dd31d0dd6ce2871f960559de12"
+      },
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/videos_partial",
+      "manifests": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_dev.jsonl",
+          "sha256": "fb9239f0243db7abd9b007bd53315abf2fa637540ddf8fee2cee5b9bdec23815"
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/cgbench_manifest_42_100.jsonl",
+          "sha256": "4f60b2876d896741529733841e9497b123c75fee0f5a428c761ac689d8b1b0a6"
+        }
+      },
+      "candidates": {
+        "dev": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/cgbench/dev/cgbench_direct.jsonl",
+          "sha256": "79da697cfafe3df45be1d9d0ca2124064326f756ae882d9c3f6db0775c7b03e6",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/normalized/cgbench_79da697cfafe3df45be1d9d0ca2124064326f756ae882d9c3f6db0775c7b03e6.jsonl",
+            "sha256": "19871f7e975f3122c70c718b770a7a9bc0bb76aec5e499783ac89985606864ec"
+          }
+        },
+        "final": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/qwen9b_direct/cgbench_direct.jsonl",
+          "sha256": "0a9e012dedf7130f7fbdb9fcb7937ff626738ae1b631766c88b115edf50ed50a",
+          "normalization_cache": {
+            "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen/cgbench/cgbench_normalized_candidates.jsonl",
+            "sha256": "0c62f3bb759dd5bb05c04d7bd15363acc388ffd94dd9b4f5432e28c139c307ef"
+          }
+        }
+      }
+    }
+  },
+  "controllers": {
+    "q9": {
+      "base_url": "http://127.0.0.1:8200/v1",
+      "model": "Qwen3.5-9B"
+    },
+    "q4base": {
+      "base_url": "http://127.0.0.1:8300/v1",
+      "model": "Qwen3.5-4B-Agent-SFT-base",
+      "config_override": "training-free-sweep-q4base"
+    },
+    "ck39": {
+      "base_url": "http://127.0.0.1:8300/v1",
+      "model": "Qwen3.5-4B-Agent-SFT",
+      "config_override": "read-only-checkpoint-39-reference"
+    }
+  },
+  "endpoint_config": {
+    "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/configs/flashvid_budget_bank.json",
+    "sha256": "f15a57859074a07f1a272d0c378f7b04bac12988575225c0e032a76a78bc6d0e"
+  },
+  "prompt_ids": [
+    "legacy_v1",
+    "budget_rubric_v1",
+    "budget_escalation_v1"
+  ],
+  "concurrency": 24,
+  "seeds": {
+    "sample": 42,
+    "random_uniform": [
+      17,
+      42,
+      73
+    ]
+  },
+  "policies": [
+    {
+      "id": "candidate_only",
+      "execution": "candidate_only",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_fixed_r010_legacy",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "54200908d9502e8b2a847242a4af7bd2c69990d3011e4767988cfb2414d0ccb0"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "c3d76a8c0c6dba027a2bde777d7687eca086e72c05047c3c47bbbfe65e4876ec"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "91dd4ca3d7561a9cfb9559d402634db440c8579f30f96c0632aa905eac121542"
+        }
+      }
+    },
+    {
+      "id": "q9_fixed_r025_legacy",
+      "controller": "q9",
+      "strategy": "fixed_r025",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_fixed_r050_legacy",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "7c123aeb8667a5ce393cdeb5cbd3cf714ac5e4e73657f2ab7f0c0d22f103dc96"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "be852c4be8e0278304ed2a908a7a747e16077127c5d5bff71e0ca4b8f824335f"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "f2fac260ed9461460d50b8f807dcd37dc072250b6a905684caaa21d4ba3955a3"
+        }
+      }
+    },
+    {
+      "id": "q9_fixed_r100_legacy",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "9245411d543425ed97d9f1e70b1e355a7c626b82e4d221d6fb7dd2e71a017779"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "86db5d15be429f264b66b9b67891629e07215e31bc1cdcaa27a14fc5bc80547f"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "57c9ede76b58e6a65c81e79c9a87e91d0b3138aa36e77cf11d55b7c116ac30ab"
+        }
+      }
+    },
+    {
+      "id": "q9_random_legacy",
+      "controller": "q9",
+      "strategy": "random_uniform",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_route_legacy",
+      "controller": "q9",
+      "strategy": "route_rule",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_uncertainty_legacy",
+      "controller": "q9",
+      "strategy": "uncertainty_escalation",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_model_legacy",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "b016dad77a6e1b8848cf688d624bb986db9fa0f73a44a4e1cc8f5f581302302d"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "4ccda6c1cd732ffa24bcd276020ccbb2e9fc0d21e8efc089d7ee0541a8c2b48c"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "8fb393c7e93146b6cabec5ac5dcc37058eca6cb728132f6d070d68532cdd0a0d"
+        }
+      }
+    },
+    {
+      "id": "q9_model_rubric",
+      "controller": "q9",
+      "strategy": "model_requested",
+      "prompt_id": "budget_rubric_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q9_model_escalation",
+      "controller": "q9",
+      "strategy": "model_requested",
+      "prompt_id": "budget_escalation_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_fixed_r010_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r010",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_fixed_r025_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r025",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_fixed_r050_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r050",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_fixed_r100_legacy",
+      "controller": "q4base",
+      "strategy": "fixed_r100",
+      "prompt_id": "legacy_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_model_legacy",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "48939c355e54cabf6da92bc96637e5fe6101ea9d7f64577baaf33c2ccb4b5c6a"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "cadf71cc29e3387f2d0715bb8d12081544ae213561388ec34b4b755e9e1e225e"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "7117ee03ac2c094a8ce4df491524c801657db82eeaf05f0e36c56ebd9c27719f"
+        }
+      }
+    },
+    {
+      "id": "q4_model_rubric",
+      "controller": "q4base",
+      "strategy": "model_requested",
+      "prompt_id": "budget_rubric_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "q4_model_escalation",
+      "controller": "q4base",
+      "strategy": "model_requested",
+      "prompt_id": "budget_escalation_v1",
+      "stages": [
+        "smoke",
+        "dev"
+      ]
+    },
+    {
+      "id": "ck39_existing",
+      "execution": "reuse",
+      "stages": [
+        "smoke",
+        "dev"
+      ],
+      "result_by_dataset": {
+        "lvbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/lvbench/lvbench_flashvid_hybrid.jsonl",
+          "sha256": "d81a144041b1de2ddc2ca767d174096fa2e32fc0641dbb7a9d23900de6ec856d"
+        },
+        "lsdbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+          "sha256": "8e79a25e7b00483b8d6ca0dcab68c45200d76182b2fda6bb35cba18afd1c60e5"
+        },
+        "cgbench": {
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/cgbench/cgbench_flashvid_hybrid.jsonl",
+          "sha256": "b84de6741276169f6edd051f7ef1afbca8480ef32bc54518456720fc99ccdea0"
+        }
+      }
+    }
+  ],
+  "final_selection": {
+    "mode": "explicit",
+    "policy_ids": []
+  }
+}

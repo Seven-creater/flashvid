@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/wangruohui/EfficientVideoAgent.git",
+  "upstream_commit": "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a",
+  "upstream_tree": "7f2849dabd7a539bde85037a074f7d8fccd39bb2",
+  "archived_local_snapshot_commit": "177493911ca05dfe979dc63c009ffe675258b1de",
+  "archived_local_snapshot_tree": "7f2849dabd7a539bde85037a074f7d8fccd39bb2",
+  "tree_equivalent": true,
+  "select_frame_fallback_sha256": "ba9616ac1a563f6b94043036e97f7d03d0d160307385a4b81d1630569cd8e741"
+}

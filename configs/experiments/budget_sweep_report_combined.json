@@ -1,0 +1,285 @@
+{
+  "output_dir": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/combined",
+  "expected_count": {
+    "lvbench": 50,
+    "lsdbench": 50,
+    "cgbench": 50
+  },
+  "bootstrap": {
+    "seed": 42,
+    "samples": 10000,
+    "confidence": 0.95
+  },
+  "matched_random_from_summary": {
+    "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/summary.json",
+    "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
+  },
+  "methods": [
+    {
+      "name": "candidate_only",
+      "kind": "candidate_only",
+      "controller_model": "frozen-qwen3.5-9b-direct-candidate",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_direct",
+      "controller_model": "Qwen3.5-9B Direct",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/lvbench/dev/lvbench_direct.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/lsdbench/dev/lsdbench_direct.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/candidates/qwen9b/cgbench/dev/cgbench_direct.jsonl"
+      }
+    },
+    {
+      "name": "q9_v3c_frozen",
+      "controller_model": "Qwen3.5-9B Hybrid-v3c",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen_dev/lvbench/lvbench_hybrid_frozen.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen_dev/lsdbench/lsdbench_hybrid_frozen.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/native_baselines/qwen9b_v3c_frozen_dev/cgbench/cgbench_hybrid_frozen.jsonl"
+      }
+    },
+    {
+      "name": "q9_fixed_r010_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r010/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_fixed_r025_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_fixed_r025_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_fixed_r025_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_fixed_r025_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_fixed_r050_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r050/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_fixed_r100_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/fixed_budget/r100/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_legacy_seed17",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed17/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed17/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed17/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_legacy_seed42",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed42/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed42/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed42/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_legacy_seed73",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed73/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed73/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_random_legacy_seed73/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_route_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_route_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_route_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_route_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_uncertainty_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_uncertainty_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_uncertainty_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_uncertainty_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_model_legacy",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/validation/q9p4_model_untrained/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_model_rubric",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_model_escalation",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q9_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_fixed_r010_legacy",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r010_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r010_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r010_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_fixed_r025_legacy",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r025_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r025_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r025_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_fixed_r050_legacy",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r050_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r050_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r050_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_fixed_r100_legacy",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r100_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r100_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_fixed_r100_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_model_legacy",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/q4p4_model_untrained/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_model_rubric",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q4_model_escalation",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev/dev/q4_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "ck39_existing",
+      "controller_group": "q4_controller",
+      "controller_model": "Qwen3.5-4B checkpoint-39",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/checkpoints/validation/checkpoint-39/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_matched_seed17",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed17/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed17/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed17/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_matched_seed42",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed42/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed42/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed42/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    },
+    {
+      "name": "q9_random_matched_seed73",
+      "controller_group": "q9_controller",
+      "controller_model": "Qwen3.5-9B",
+      "paths": {
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed73/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed73/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_matched/dev/q9_random_matched_seed73/cgbench/cgbench_flashvid_hybrid.jsonl"
+      }
+    }
+  ],
+  "cost_match": {
+    "target_from_matched_random": true,
+    "candidate_methods": [
+      "q9_random_matched_seed17",
+      "q9_random_matched_seed42",
+      "q9_random_matched_seed73"
+    ]
+  }
+}

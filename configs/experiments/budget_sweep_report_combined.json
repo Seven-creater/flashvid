@@ -1,5 +1,5 @@
 {
-  "output_dir": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/combined",
+  "output_dir": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/combined",
   "expected_count": {
     "lvbench": 50,
     "lsdbench": 50,
@@ -11,7 +11,7 @@
     "confidence": 0.95
   },
   "matched_random_from_summary": {
-    "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/summary.json",
+    "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/summary.json",
     "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
   },
   "methods": [
@@ -58,9 +58,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_fixed_r025_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_fixed_r025_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_fixed_r025_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_fixed_r025_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_fixed_r025_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_fixed_r025_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -88,9 +88,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed17/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed17/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed17/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed17/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed17/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed17/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -98,9 +98,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed42/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed42/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed42/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed42/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed42/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed42/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -108,9 +108,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed73/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed73/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_random_legacy_seed73/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed73/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed73/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_random_legacy_seed73/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -118,9 +118,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_route_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_route_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_route_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_route_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_route_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_route_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -128,9 +128,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_uncertainty_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_uncertainty_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_uncertainty_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_uncertainty_legacy/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_uncertainty_legacy/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_uncertainty_legacy/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -148,9 +148,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -158,9 +158,9 @@
       "controller_group": "q9_controller",
       "controller_model": "Qwen3.5-9B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q9_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q9_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -168,9 +168,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r010_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r010_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r010_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r010_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r010_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r010_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -178,9 +178,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r025_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r025_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r025_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r025_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r025_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r025_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -188,9 +188,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r050_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r050_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r050_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r050_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r050_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r050_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -198,9 +198,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r100_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r100_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_fixed_r100_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r100_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r100_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_fixed_r100_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -218,9 +218,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_rubric/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_rubric/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_rubric/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {
@@ -228,9 +228,9 @@
       "controller_group": "q4_controller",
       "controller_model": "Qwen3.5-4B",
       "paths": {
-        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
-        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
-        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/dev/q4_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
+        "lvbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_escalation/lvbench/lvbench_flashvid_hybrid.jsonl",
+        "lsdbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_escalation/lsdbench/lsdbench_flashvid_hybrid.jsonl",
+        "cgbench": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/dev/q4_model_escalation/cgbench/cgbench_flashvid_hybrid.jsonl"
       }
     },
     {

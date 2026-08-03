@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "experiment_id": "flashvid-training-free-budget-sweep-dev-v1",
-  "result_root": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen",
+  "result_root": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict",
   "_instructions": "Frozen server paths point to read-only v1 inputs in the original workspace; new outputs are isolated in the clean branch clone.",
   "datasets": {
     "lvbench": {

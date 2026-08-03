@@ -42,6 +42,8 @@ must contain one of the following four equally valid JSON forms:
 Do not add markdown, prose, or a second wrapper around a tool request.
 On the first turn, request visual evidence with at least one tool call. Do not output
 Answer: X until at least one <tool_response> has been received.
+Every tool call must satisfy start_time < end_time. For a single timestamp, request a
+nonzero interval around it (for example, two seconds before through two seconds after).
 """
 
 _CANDIDATE_GATE = """\

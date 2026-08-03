@@ -368,4 +368,4 @@ def test_frozen_sweep_uses_format_compliant_q4_fixed_baselines() -> None:
     assert len(fixed) == 4
     assert {policy["prompt_id"] for policy in fixed} == {"budget_rubric_v1"}
     assert all(policy["id"].endswith("_rubric") for policy in fixed)
-    assert Path(config["result_root"]).name == "flashvid_budget_sweep_dev_frozen"
+    assert Path(config["result_root"]).name == "flashvid_budget_sweep_dev_strict"

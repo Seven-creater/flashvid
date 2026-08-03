@@ -16,7 +16,7 @@
       ],
       "budget_distribution_from_dev": {
         "summary": {
-          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/summary.json",
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/summary.json",
           "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
         }
       }

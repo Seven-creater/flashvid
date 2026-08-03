@@ -184,7 +184,7 @@
       ],
       "budget_distribution_from_dev": {
         "summary": {
-          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/summary.json",
+          "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/summary.json",
           "sha256": "REPLACE_WITH_FROZEN_BASE_DEV_SUMMARY_SHA256"
         }
       }
@@ -193,7 +193,7 @@
   "final_selection": {
     "mode": "dev_non_dominated",
     "dev_summary": {
-      "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_frozen/combined/summary.json",
+      "path": "/data02/usr/wangqihao/Demo/test/flashvid_budget_sweep/results/eval/flashvid_budget_sweep_dev_strict/combined/summary.json",
       "sha256": "REPLACE_WITH_FROZEN_COMBINED_DEV_SUMMARY_SHA256"
     },
     "always_include": [

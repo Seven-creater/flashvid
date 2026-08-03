@@ -47,6 +47,8 @@ def test_new_prompts_keep_symmetric_eva_format_and_candidate_gate(
     assert re.search(r'"retention_ratio":0\.5(?=[,}])', text) is None
     assert "On the first turn, request visual evidence" in text
     assert "until at least one <tool_response> has been received" in text
+    assert "Every tool call must satisfy start_time < end_time" in text
+    assert "request a\nnonzero interval around it" in text
 
 
 def test_rubric_requires_lowest_sufficient_budget_without_midpoint_anchor() -> None:

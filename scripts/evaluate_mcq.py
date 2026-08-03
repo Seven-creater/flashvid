@@ -117,6 +117,7 @@ def _normalize_frozen_candidates_unlocked(
         )
 
     cached: dict[str, dict] = {}
+    legacy_cached_ids: set[str] = set()
     normalizer_prompt_hash = hashlib.sha256(
         _CANDIDATE_NORMALIZER_INSTRUCTION.encode("utf-8")
     ).hexdigest()
@@ -129,15 +130,38 @@ def _normalize_frozen_candidates_unlocked(
                 raise RuntimeError(
                     f"candidate normalization cache source changed: {cache_path}"
                 )
-            if not read_only and record.get("normalizer_model") != model:
+            sample_id = str(record.get("sample_id"))
+            if sample_id in cached:
+                raise RuntimeError(
+                    f"duplicate candidate normalization cache sample_id: {sample_id}"
+                )
+            legacy_record = all(
+                record.get(field) is None
+                for field in (
+                    "choices_sha256",
+                    "normalizer_model",
+                    "normalizer_prompt_sha256",
+                )
+            )
+            if legacy_record:
+                if not read_only or int(record.get("direct_rerun", -1)) != 0:
+                    raise RuntimeError(
+                        f"legacy candidate normalization cache is not safe for reuse: "
+                        f"{cache_path}"
+                    )
+                legacy_cached_ids.add(sample_id)
+            elif not read_only and record.get("normalizer_model") != model:
                 raise RuntimeError(
                     f"candidate normalization model changed: {cache_path}"
                 )
-            if record.get("normalizer_prompt_sha256") != normalizer_prompt_hash:
+            if (
+                not legacy_record
+                and record.get("normalizer_prompt_sha256") != normalizer_prompt_hash
+            ):
                 raise RuntimeError(
                     f"candidate normalization prompt changed: {cache_path}"
                 )
-            cached[str(record.get("sample_id"))] = record
+            cached[sample_id] = record
 
     answers: dict[str, str] = {}
     sources: dict[str, str] = {}
@@ -169,10 +193,17 @@ def _normalize_frozen_candidates_unlocked(
             ).encode("utf-8")
         ).hexdigest()
         cached_record = cached.get(sample.sample_id)
-        if (
-            cached_record is not None
-            and cached_record.get("choices_sha256") == choices_hash
-        ):
+        cache_matches = cached_record is not None and (
+            cached_record.get("choices_sha256") == choices_hash
+            or sample.sample_id in legacy_cached_ids
+        )
+        if cache_matches:
+            cached_dataset = cached_record.get("dataset")
+            if cached_dataset is not None and str(cached_dataset) != sample.dataset:
+                raise RuntimeError(
+                    f"candidate normalization cache dataset changed for "
+                    f"{sample.sample_id}: {cache_path}"
+                )
             answer = cached_record.get("candidate_answer")
             source = str(cached_record.get("candidate_source") or "none")
             reason = str(cached_record.get("normalization_reason") or "")
@@ -282,6 +313,15 @@ def _normalize_frozen_candidates(
     *,
     read_only: bool = False,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str], int, str]:
+    if read_only:
+        return _normalize_frozen_candidates_unlocked(
+            path,
+            samples,
+            client,
+            model,
+            cache_path,
+            read_only=True,
+        )
     lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:

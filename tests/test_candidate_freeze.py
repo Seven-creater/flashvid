@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -134,6 +135,55 @@ def test_candidate_normalization_read_only_rejects_missing_rows(
             "Qwen3.5-4B",
             cache,
             read_only=True,
+        )
+
+
+def test_legacy_candidate_cache_is_reused_only_read_only_without_lock(
+    tmp_path: Path,
+) -> None:
+    candidates = tmp_path / "direct.jsonl"
+    cache = tmp_path / "legacy_normalized.jsonl"
+    sample = _sample("one")
+    _write_candidates(
+        candidates,
+        [{"sample_id": "one", "video": "one.mp4", "prediction": "A"}],
+    )
+    source_hash = hashlib.sha256(candidates.read_bytes()).hexdigest()
+    _write_candidates(
+        cache,
+        [
+            {
+                "dataset": "demo",
+                "sample_id": "one",
+                "candidate_answer": "A",
+                "candidate_source": "parsed",
+                "normalization_reason": "prediction_letter",
+                "candidate_results_sha256": source_hash,
+                "direct_rerun": 0,
+            }
+        ],
+    )
+    client = _NormalizerClient("B")
+
+    reused = _normalize_frozen_candidates(
+        candidates,
+        [sample],
+        client,
+        "Qwen3.5-9B",
+        cache,
+        read_only=True,
+    )
+
+    assert reused[0] == {"one": "A"}
+    assert client.calls == 0
+    assert not cache.with_suffix(cache.suffix + ".lock").exists()
+    with pytest.raises(RuntimeError, match="legacy candidate normalization cache"):
+        _normalize_frozen_candidates(
+            candidates,
+            [sample],
+            client,
+            "Qwen3.5-9B",
+            cache,
         )
 
 

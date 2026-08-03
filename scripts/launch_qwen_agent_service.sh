@@ -34,7 +34,7 @@ if [[ -f "$LAUNCH_PID_FILE" ]]; then
 fi
 
 cd "$PROJECT_DIR"
-setsid nohup "$PROJECT_DIR/scripts/serve_qwen_agent.sh" \
+setsid nohup bash "$PROJECT_DIR/scripts/serve_qwen_agent.sh" \
   "$MODEL_PATH" "$SERVED_NAME" "$PORT" "$DP" \
   >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!

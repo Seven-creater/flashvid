@@ -15,11 +15,19 @@ from flashvid_eval.qwen_dev_selection import write_frozen_json
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "run_qwen_agent_search.py"
+SERVICE_LAUNCHER = (
+    Path(__file__).parents[1] / "scripts" / "launch_qwen_agent_service.sh"
+)
 SPEC = importlib.util.spec_from_file_location("run_qwen_agent_search", SCRIPT)
 assert SPEC and SPEC.loader
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
+
+
+def test_service_launcher_does_not_depend_on_a_git_executable_bit() -> None:
+    content = SERVICE_LAUNCHER.read_text(encoding="utf-8")
+    assert 'setsid nohup bash "$PROJECT_DIR/scripts/serve_qwen_agent.sh"' in content
 
 
 def _write(path: Path, content: str) -> dict[str, str]:

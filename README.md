@@ -226,7 +226,10 @@ files are intentionally ignored by Git. The default bank layout remains GPUs
 be remapped without editing code through `BUDGET_GPU_R010`,
 `BUDGET_GPU_R025`, `BUDGET_GPU_R050`, `BUDGET_GPU_R100`,
 `BUDGET_GPU_CONTROLLER`, and `CONTROLLER_DATA_PARALLEL_SIZE`; ownership checks
-still refuse to overwrite unrelated PIDs or occupied ports.
+still refuse to overwrite unrelated PIDs or occupied ports. If two perception
+services intentionally share one GPU, set `PERCEPTION_KV_CACHE_MEMORY_BYTES`
+to an explicit per-service allocation because vLLM's percentage-based cache
+autotuning assumes exclusive ownership of the device.
 
 ## Attribution
 

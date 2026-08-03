@@ -94,6 +94,7 @@ start_perception() {
   local logfile
   local pidfile
   local backend
+  local -a kv_cache_args=()
   gpu="$(service_gpu "$id")"
   model_name="$(service_model "$id")"
   port="$(service_port "$id")"
@@ -101,6 +102,10 @@ start_perception() {
   backend="$(service_backend "$id")"
   logfile="$(service_logfile "$id")"
   pidfile="$(service_pidfile "$id")"
+
+  if [[ -n "${PERCEPTION_KV_CACHE_MEMORY_BYTES:-}" ]]; then
+    kv_cache_args=(--kv-cache-memory-bytes "$PERCEPTION_KV_CACHE_MEMORY_BYTES")
+  fi
 
   if [[ "$backend" == "native_bypass" ]]; then
     nohup setsid env -u VLLM_PLUGINS \
@@ -120,6 +125,7 @@ start_perception() {
         --max-num-seqs "${PERCEPTION_MAX_NUM_SEQS:-8}" \
         --max-num-batched-tokens "${PERCEPTION_MAX_BATCHED_TOKENS:-32768}" \
         --gpu-memory-utilization "${PERCEPTION_GPU_MEMORY_UTILIZATION:-0.90}" \
+        "${kv_cache_args[@]}" \
         --enable-prompt-tokens-details \
         --limit-mm-per-prompt '{"image":0,"video":1}' \
         --allowed-local-media-path "$FLASHVID_MEDIA_ROOT" \
@@ -144,6 +150,7 @@ start_perception() {
         --max-num-seqs "${PERCEPTION_MAX_NUM_SEQS:-8}" \
         --max-num-batched-tokens "${PERCEPTION_MAX_BATCHED_TOKENS:-32768}" \
         --gpu-memory-utilization "${PERCEPTION_GPU_MEMORY_UTILIZATION:-0.90}" \
+        "${kv_cache_args[@]}" \
         --enable-prompt-tokens-details \
         --limit-mm-per-prompt '{"image":0,"video":1}' \
         --allowed-local-media-path "$FLASHVID_MEDIA_ROOT" \

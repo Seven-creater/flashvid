@@ -232,8 +232,13 @@ def test_server_templates_load_but_placeholders_cannot_execute() -> None:
     sweep.validate_inputs(final, check_files=False)
     sweep.validate_inputs(matched, check_files=False)
     assert final["experiment_id"].endswith("final-v1")
-    with pytest.raises((ValueError, FileNotFoundError)):
-        sweep.validate_inputs(dev, check_files=True)
+    # The production server may have every frozen Dev input, while a local
+    # checkout normally does not. Template safety must therefore be asserted
+    # from the explicit frozen-summary gates rather than filesystem absence.
+    final_pending = sweep.pending_frozen_summaries(final, "final")
+    matched_pending = sweep.pending_frozen_summaries(matched, "dev")
+    assert any("sha256_not_frozen" in item["reasons"] for item in final_pending)
+    assert any("sha256_not_frozen" in item["reasons"] for item in matched_pending)
     completed = subprocess.run(
         [
             sys.executable,

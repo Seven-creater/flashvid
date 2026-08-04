@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import json
+from types import MethodType
+
+from flashvid_eval.fast_hybrid_eva import (
+    OFFICIAL_EVA_COMMIT,
+    FastHybridEvaEvaluator,
+    _load_official_module,
+)
+from flashvid_eval.qwen_protocol import QWEN_PROTOCOLS
+from flashvid_eval.schemas import Sample
+
+
+def _run_record(prediction: str | None, *, tool: bool = True) -> dict:
+    return {
+        "prediction": prediction,
+        "raw_response": f"Answer: {prediction}" if prediction else "",
+        "finish_reason": "stop",
+        "rounds": 2,
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 10,
+            "total_tokens": 110,
+        },
+        "latency_s": 0.5,
+        "visual_tokens": 1000 if tool else 0,
+        "tool_calls": (
+            [
+                {
+                    "stage": "verification",
+                    "start_time": 0.0,
+                    "end_time": 10.0,
+                    "nframes": 8,
+                    "resize": 1.0,
+                    "timestamps": [0, 2, 4, 6, 8],
+                    "estimated_visual_tokens": 1000,
+                    "backend": "official_eva_select_frame_fallback",
+                }
+            ]
+            if tool
+            else []
+        ),
+        "call_records": [],
+        "stop_reason": "answer_found",
+        "error": None,
+    }
+
+
+def _evaluator(records: list[dict]) -> tuple[FastHybridEvaEvaluator, list[str]]:
+    evaluator = FastHybridEvaEvaluator.__new__(FastHybridEvaEvaluator)
+    evaluator.version = "fast_hybrid_v1"
+    evaluator.max_total_visual_tokens = 24000
+    evaluator.candidate_results_sha256 = "a" * 64
+    prompts: list[str] = []
+
+    def fake_run(self, sample, system_prompt, visual_budget, stage):
+        del self, sample, visual_budget, stage
+        prompts.append(system_prompt)
+        return records.pop(0)
+
+    evaluator._official_run = MethodType(fake_run, evaluator)
+    return evaluator, prompts
+
+
+def test_fast_hybrid_uses_pinned_official_eva_single() -> None:
+    module = _load_official_module()
+    assert module.single.__module__ == "flashvid_official_eva_eval"
+    assert OFFICIAL_EVA_COMMIT == "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a"
+
+
+def test_clean_direct_protocol_is_greedy_no_think() -> None:
+    protocol = QWEN_PROTOCOLS["no_think_greedy"]
+    assert protocol.enable_thinking is False
+    assert protocol.max_tokens == 512
+    assert protocol.temperature == 0.0
+
+
+def test_fast_hybrid_allows_only_confirmed_visual_change() -> None:
+    evaluator, prompts = _evaluator([_run_record("C"), _run_record("C")])
+    sample = Sample(
+        "lsdbench",
+        "one",
+        "one.mp4",
+        "What happens?",
+        {"A": "first", "B": "second", "C": "third"},
+        "C",
+        metadata={"time_range": "SECRET_TIME", "clue_intervals": "SECRET_CLUE"},
+    )
+
+    result = evaluator.fast_hybrid_eva(sample, "B")
+
+    assert result["prediction"] == "C"
+    assert result["candidate_rerun"] == 0
+    assert result["candidate_changed"] is True
+    assert result["final_decision_source"] == "confirmed_visual_change"
+    assert result["visual_tokens"] == 2000
+    assert result["total_tokens"] == 220
+    assert len(prompts) == 2
+    assert "Direct candidate: B" in prompts[0]
+    assert "neither is privileged" in prompts[1]
+    assert "SECRET" not in json.dumps(prompts)
+
+
+def test_fast_hybrid_rejects_unconfirmed_change() -> None:
+    evaluator, _ = _evaluator([_run_record("C"), _run_record("A")])
+    sample = Sample(
+        "cgbench",
+        "two",
+        "two.mp4",
+        "What happens?",
+        {"A": "first", "B": "second", "C": "third"},
+        "B",
+    )
+
+    result = evaluator.fast_hybrid_eva(sample, "B")
+
+    assert result["prediction"] == "B"
+    assert result["candidate_changed"] is False
+    assert result["change_gate_triggered"] is True
+    assert result["change_rejection_reason"] == "independent_confirmation_failed"
+
+
+def test_fast_hybrid_falls_back_when_verifier_has_no_answer() -> None:
+    evaluator, _ = _evaluator([_run_record(None, tool=False)])
+    sample = Sample(
+        "lvbench",
+        "three",
+        "three.mp4",
+        "What happens?",
+        {"A": "first", "B": "second"},
+        "A",
+    )
+
+    result = evaluator.fast_hybrid_eva(sample, "A")
+
+    assert result["prediction"] == "A"
+    assert result["fallback_to_candidate"] is True
+    assert result["candidate_rerun"] == 0
+    assert result["annotation_leak_check"] == "passed"

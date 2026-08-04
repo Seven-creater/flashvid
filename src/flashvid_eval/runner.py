@@ -1614,6 +1614,8 @@ def evaluate(
                 result = evaluator.hybrid(sample)
             elif backend == "hybrid_frozen":
                 result = evaluator.hybrid_frozen(sample, candidate)
+            elif backend == "fast_hybrid_eva":
+                result = evaluator.fast_hybrid_eva(sample, candidate)
             elif backend == "flashvid_hybrid":
                 model_sample = ModelSample.from_sample(sample, candidate)
                 result = evaluator.flashvid_hybrid(model_sample)
@@ -1665,7 +1667,7 @@ def evaluate(
             }
         )
         result.setdefault("turn_count", result.get("rounds", 0))
-        if backend in {"hybrid_frozen", "flashvid_hybrid"}:
+        if backend in {"hybrid_frozen", "fast_hybrid_eva", "flashvid_hybrid"}:
             result.setdefault(
                 "candidate_source",
                 (candidate_sources or {}).get(

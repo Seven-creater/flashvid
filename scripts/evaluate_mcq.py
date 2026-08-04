@@ -17,6 +17,7 @@ from flashvid_eval.flashvid_hybrid import (
     FlashVIDHybridEvaluator,
     evaluate_flashvid_trajectories,
 )
+from flashvid_eval.fast_hybrid_eva import FastHybridEvaEvaluator, OFFICIAL_EVA_COMMIT
 from flashvid_eval.offline_budget import normalize_candidate
 from flashvid_eval.answers import extract_strict_answer_letter
 from flashvid_eval.qwen_evaluation import (
@@ -485,6 +486,7 @@ def main() -> None:
             "agent",
             "hybrid",
             "hybrid_frozen",
+            "fast_hybrid_eva",
             "flashvid_hybrid",
             "qwen_baseline",
             "qwen_agent",
@@ -521,6 +523,8 @@ def main() -> None:
             "hybrid_v3e",
             "hybrid_v3f",
             "hybrid_v3g",
+            "fast_hybrid_v1",
+            "fast_hybrid_v2",
             "flashvid_budget_v1",
         ),
         default="v2a",
@@ -1159,6 +1163,97 @@ def main() -> None:
                         "text_normalizer_calls": normalizer_calls,
                         "reasons": normalization_reasons,
                     },
+            },
+        )
+    elif args.backend == "fast_hybrid_eva":
+        if args.agent_version not in {"fast_hybrid_v1", "fast_hybrid_v2"}:
+            raise ValueError(
+                "fast_hybrid_eva requires --agent-version fast_hybrid_v1 or fast_hybrid_v2"
+            )
+        if args.candidate_results is None or not args.candidate_results.is_file():
+            raise ValueError(
+                "fast_hybrid_eva requires --candidate-results with frozen clean Direct output"
+            )
+        candidate_answers = {}
+        protocol_violations: list[str] = []
+        for line_number, line in enumerate(
+            args.candidate_results.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            sample_id = str(record.get("sample_id"))
+            if sample_id in candidate_answers:
+                raise ValueError(f"duplicate frozen candidate sample_id: {sample_id}")
+            protocol_request = record.get("protocol_request") or {}
+            if (
+                record.get("baseline_mode") != "direct"
+                or record.get("sampling_id") != "uniform32"
+                or record.get("enable_thinking") is not False
+                or protocol_request.get("max_tokens") != 512
+                or float(protocol_request.get("temperature", -1.0)) != 0.0
+            ):
+                protocol_violations.append(f"line {line_number} ({sample_id})")
+            prediction = str(record.get("prediction") or "").strip().upper()
+            if prediction:
+                candidate_answers[sample_id] = prediction
+        if protocol_violations:
+            raise ValueError(
+                "candidate file is not clean no_think/uniform32/max_tokens=512 Direct: "
+                + ", ".join(protocol_violations[:10])
+            )
+        sample_by_id = {sample.sample_id: sample for sample in samples}
+        missing = sorted(set(sample_by_id).difference(candidate_answers))
+        if missing:
+            raise ValueError(
+                "frozen clean Direct is incomplete for the active manifest: "
+                + ", ".join(missing[:10])
+            )
+        invalid = sorted(
+            sample_id
+            for sample_id, prediction in candidate_answers.items()
+            if sample_id in sample_by_id
+            and prediction not in sample_by_id[sample_id].option_letters
+        )
+        if invalid:
+            raise ValueError(
+                "frozen clean Direct contains invalid predictions: "
+                + ", ".join(invalid[:10])
+            )
+        candidate_answers = {
+            sample_id: candidate_answers[sample_id] for sample_id in sample_by_id
+        }
+        candidate_sources = {sample_id: "parsed" for sample_id in candidate_answers}
+        candidate_hash = _file_sha256(args.candidate_results)
+        evaluator = FastHybridEvaEvaluator(
+            client,
+            args.model,
+            args.video_root,
+            frame_root,
+            version=args.agent_version,
+            max_turns=args.max_turns or 6,
+            max_call_visual_tokens=args.max_call_visual_tokens,
+            max_total_visual_tokens=args.max_total_visual_tokens,
+            candidate_results_sha256=candidate_hash,
+        )
+        _write_frozen_json(
+            args.output_dir / f"frozen_inputs_{args.dataset}.json",
+            {
+                "dataset": args.dataset,
+                "manifest": {
+                    "path": str(manifest.resolve()),
+                    "sha256": manifest_hash,
+                },
+                "candidate_results": {
+                    "path": str(args.candidate_results.resolve()),
+                    "sha256": candidate_hash,
+                    "direct_rerun": 0,
+                    "parsed": len(candidate_answers),
+                },
+                "agent_version": args.agent_version,
+                "official_eva_commit": OFFICIAL_EVA_COMMIT,
+                "run_fingerprint": evaluator.run_fingerprint(),
             },
         )
     elif args.backend == "flashvid_hybrid":

@@ -66,6 +66,16 @@ NO_THINK_PROTOCOL = QwenInferenceProtocol(
     repetition_penalty=1.0,
 )
 
+# Frozen protocol for the accuracy-first Direct/Hybrid comparison.  Keep it
+# separate from the earlier Qwen-recommended sampling baseline so old results
+# and fingerprints remain unchanged.
+NO_THINK_GREEDY_PROTOCOL = QwenInferenceProtocol(
+    protocol_id="no_think_greedy_v1",
+    enable_thinking=False,
+    max_tokens=512,
+    temperature=0.0,
+)
+
 THINK_PROTOCOL = QwenInferenceProtocol(
     protocol_id="think_v3_32768_strict_final",
     enable_thinking=True,
@@ -81,6 +91,7 @@ THINK_PROTOCOL = QwenInferenceProtocol(
 
 QWEN_PROTOCOLS = {
     "no_think": NO_THINK_PROTOCOL,
+    "no_think_greedy": NO_THINK_GREEDY_PROTOCOL,
     "think": THINK_PROTOCOL,
 }
 

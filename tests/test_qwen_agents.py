@@ -330,6 +330,29 @@ def test_a0_eva_clean_uses_official_tools_and_never_leaks_candidate(tmp_path: Pa
         assert forbidden not in serialized
 
 
+def test_agent_emits_internal_api_and_frame_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "flashvid_eval.qwen_agents.core.emit_progress",
+        lambda event, **details: events.append(event) or True,
+    )
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":4,"resize":0.5}}</tool_call>'
+    )
+    agent, _, _ = _build(tmp_path, "a0_eva_clean", [tool_call, '{"answer":"B"}'])
+
+    assert agent.run(_sample()).final_prediction == "B"
+    assert events[0] == "agent_sample_started"
+    assert events.count("api_request_started") == 2
+    assert events.count("api_response") == 2
+    assert "frame_select_started" in events
+    assert "frame_select_complete" in events
+    assert events[-1] == "agent_sample_complete"
+
+
 def test_base_agent_classifies_annotation_leak_before_api_call(tmp_path: Path) -> None:
     agent, client, _ = _build(tmp_path, "a0_eva_clean", ['{"answer":"A"}'])
     sample = ModelSample(

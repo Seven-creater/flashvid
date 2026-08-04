@@ -44,6 +44,7 @@ done
 mkdir -p "$PROJECT_DIR/logs" "$(dirname "$output")"
 PID_FILE="$PROJECT_DIR/logs/qwen_counterfactual_${dataset}.pid"
 LOG_FILE="$PROJECT_DIR/logs/qwen_counterfactual_${dataset}.log"
+HEARTBEAT_FILE="$PROJECT_DIR/logs/qwen_counterfactual_${dataset}.heartbeat.json"
 if [[ -f "$PID_FILE" ]]; then
   pid=$(cat "$PID_FILE")
   if kill -0 "$pid" 2>/dev/null; then
@@ -60,10 +61,13 @@ fi
 
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+rm -f "$HEARTBEAT_FILE"
+export QWEN_PROGRESS_HEARTBEAT="$HEARTBEAT_FILE"
 setsid nohup "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_with_progress_watchdog.py" \
-  --watch-root "$(dirname "$output")" --stall-seconds "$STALL_TIMEOUT_S" -- \
+  --watch-root "$(dirname "$output")" --heartbeat-file "$HEARTBEAT_FILE" \
+  --stall-seconds "$STALL_TIMEOUT_S" -- \
   "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_qwen_counterfactuals.py" "${args[@]}" \
   >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
-echo "started dataset=$dataset pid=$pid request_timeout_s=$REQUEST_TIMEOUT_S stall_timeout_s=$STALL_TIMEOUT_S log=$LOG_FILE"
+echo "started dataset=$dataset pid=$pid request_timeout_s=$REQUEST_TIMEOUT_S stall_timeout_s=$STALL_TIMEOUT_S heartbeat=$HEARTBEAT_FILE log=$LOG_FILE"

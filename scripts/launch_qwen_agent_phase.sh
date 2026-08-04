@@ -32,6 +32,7 @@ safe_phase=${PHASE//[^A-Za-z0-9_.-]/_}
 safe_model=${MODEL_KEY//[^A-Za-z0-9_.-]/_}
 PID_FILE="$PROJECT_DIR/logs/qwen_${safe_phase}_${safe_model}.pid"
 LOG_FILE="$PROJECT_DIR/logs/qwen_${safe_phase}_${safe_model}.log"
+HEARTBEAT_FILE="$PROJECT_DIR/logs/qwen_${safe_phase}_${safe_model}.heartbeat.json"
 if [[ -f "$PID_FILE" ]]; then
   pid=$(cat "$PID_FILE")
   if kill -0 "$pid" 2>/dev/null; then
@@ -65,6 +66,7 @@ if [[ "$QWEN_STALL_TIMEOUT_S" != "0" ]]; then
   launch_args=(
     "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_with_progress_watchdog.py"
     --watch-root "$QWEN_WATCH_ROOT"
+    --heartbeat-file "$HEARTBEAT_FILE"
     --stall-seconds "$QWEN_STALL_TIMEOUT_S"
     --
     "${args[@]}"
@@ -73,7 +75,9 @@ fi
 
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+rm -f "$HEARTBEAT_FILE"
+export QWEN_PROGRESS_HEARTBEAT="$HEARTBEAT_FILE"
 setsid nohup "${launch_args[@]}" >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
-echo "started phase=$PHASE model=$MODEL_KEY pid=$pid request_timeout_s=$QWEN_REQUEST_TIMEOUT_S stall_timeout_s=$QWEN_STALL_TIMEOUT_S log=$LOG_FILE"
+echo "started phase=$PHASE model=$MODEL_KEY pid=$pid request_timeout_s=$QWEN_REQUEST_TIMEOUT_S stall_timeout_s=$QWEN_STALL_TIMEOUT_S heartbeat=$HEARTBEAT_FILE log=$LOG_FILE"

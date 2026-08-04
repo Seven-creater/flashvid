@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run one experiment command and stop it after a bounded progress stall.
 
-Progress is defined as a new or changed result file under ``--watch-root``.
+Progress is defined as a new or changed result file under ``--watch-root`` or
+an atomic update to the optional ``--heartbeat-file``.
 The wrapper is intentionally generic and never retries a stalled command: the
 phase launcher can be invoked again with ``--resume`` after the cause is
 inspected or the protocol is changed.
@@ -35,6 +36,13 @@ def progress_snapshot(root: Path, pattern: str) -> tuple[tuple[str, int, int], .
     return tuple(sorted(rows))
 
 
+def heartbeat_snapshot(path: Path | None) -> tuple[int, int, int] | None:
+    if path is None or not path.is_file():
+        return None
+    stat = path.stat()
+    return (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+
+
 def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: float) -> None:
     if process.poll() is not None:
         return
@@ -62,21 +70,26 @@ def run_with_watchdog(
     stall_seconds: float,
     poll_seconds: float,
     terminate_grace_seconds: float,
+    heartbeat_file: Path | None = None,
 ) -> int:
     if not command:
         raise ValueError("command cannot be empty")
     if stall_seconds <= 0 or poll_seconds <= 0 or terminate_grace_seconds <= 0:
         raise ValueError("watchdog durations must be positive")
     before = progress_snapshot(watch_root, pattern)
+    heartbeat_before = heartbeat_snapshot(heartbeat_file)
     process = subprocess.Popen(list(command), start_new_session=(os.name == "posix"))
     last_snapshot = before
+    last_heartbeat = heartbeat_before
     last_progress = time.monotonic()
     try:
         while process.poll() is None:
             time.sleep(poll_seconds)
             current = progress_snapshot(watch_root, pattern)
-            if current != last_snapshot:
+            current_heartbeat = heartbeat_snapshot(heartbeat_file)
+            if current != last_snapshot or current_heartbeat != last_heartbeat:
                 last_snapshot = current
+                last_heartbeat = current_heartbeat
                 last_progress = time.monotonic()
                 continue
             stalled_for = time.monotonic() - last_progress
@@ -89,6 +102,11 @@ def run_with_watchdog(
                         "stall_seconds": round(stalled_for, 3),
                         "watch_root": str(watch_root.resolve()),
                         "pattern": pattern,
+                        "heartbeat_file": (
+                            str(heartbeat_file.resolve())
+                            if heartbeat_file is not None
+                            else None
+                        ),
                         "child_pid": process.pid,
                     },
                     ensure_ascii=False,
@@ -109,6 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--watch-root", type=Path, required=True)
     parser.add_argument("--pattern", default="*.jsonl")
+    parser.add_argument("--heartbeat-file", type=Path)
     parser.add_argument("--stall-seconds", type=float, default=90.0)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     parser.add_argument("--terminate-grace-seconds", type=float, default=15.0)
@@ -125,6 +144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stall_seconds=args.stall_seconds,
             poll_seconds=args.poll_seconds,
             terminate_grace_seconds=args.terminate_grace_seconds,
+            heartbeat_file=args.heartbeat_file,
         )
     except (OSError, ValueError) as error:
         print(json.dumps({"event": "watchdog_error", "error": str(error)}), file=sys.stderr)

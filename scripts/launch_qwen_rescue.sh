@@ -12,6 +12,7 @@ RESCUE_INDEX=$1
 mkdir -p "$PROJECT_DIR/logs"
 PID_FILE="$PROJECT_DIR/logs/qwen_trajectory_rescue.pid"
 LOG_FILE="$PROJECT_DIR/logs/qwen_trajectory_rescue.log"
+HEARTBEAT_FILE="$PROJECT_DIR/logs/qwen_trajectory_rescue.heartbeat.json"
 if [[ -f "$PID_FILE" ]]; then
   pid=$(cat "$PID_FILE")
   if kill -0 "$pid" 2>/dev/null; then
@@ -28,12 +29,15 @@ fi
 
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+rm -f "$HEARTBEAT_FILE"
+export QWEN_PROGRESS_HEARTBEAT="$HEARTBEAT_FILE"
 setsid nohup "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_with_progress_watchdog.py" \
   --watch-root "$PROJECT_DIR/results/eval/qwen_agent_search/trajectories/rescue" \
+  --heartbeat-file "$HEARTBEAT_FILE" \
   --stall-seconds "$STALL_TIMEOUT_S" -- \
   "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_qwen_rescue_trajectories.py" \
   --rescue-index "$RESCUE_INDEX" --resume \
   >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
-echo "started qwen trajectory rescue pid=$pid stall_timeout_s=$STALL_TIMEOUT_S log=$LOG_FILE"
+echo "started qwen trajectory rescue pid=$pid stall_timeout_s=$STALL_TIMEOUT_S heartbeat=$HEARTBEAT_FILE log=$LOG_FILE"

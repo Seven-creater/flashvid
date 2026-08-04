@@ -32,6 +32,7 @@ from .qwen_protocol import (
     next_length_retry_max_tokens,
     parse_strict_json_mcq_answer,
 )
+from .qwen_progress import emit_progress
 from .qwen_token_accounting import enrich_usage_with_qwen_prompt_tokens
 from .schemas import ModelSample, Sample, ScoringRecord
 
@@ -294,6 +295,11 @@ class QwenBaselineRunner:
                 },
                 secret_sentinels=self.config.annotation_leak_sentinels,
             )
+            emit_progress(
+                "api_request_started",
+                runner="qwen_baseline",
+                mode=self.config.mode,
+            )
             result = self.client.chat(
                 self.model,
                 messages,
@@ -301,6 +307,11 @@ class QwenBaselineRunner:
                 mm_processor_kwargs=mm_processor_kwargs,
                 media_io_kwargs=media_io_kwargs,
                 **kwargs,
+            )
+            emit_progress(
+                "api_response",
+                runner="qwen_baseline",
+                mode=self.config.mode,
             )
             if isinstance(result.raw.get("prompt_token_ids"), list):
                 result = replace(
@@ -684,6 +695,12 @@ def evaluate_qwen_runner(
 
     def run_one(sample: Sample) -> dict[str, Any]:
         started = time.perf_counter()
+        emit_progress(
+            "evaluation_sample_started",
+            dataset=sample.dataset,
+            sample_id=sample.sample_id,
+            method_id=method_id,
+        )
         try:
             raw = runner.run(ModelSample.from_sample(sample, None))
             result = dict(result_adapter(raw) if result_adapter else raw)
@@ -747,6 +764,12 @@ def evaluate_qwen_runner(
         result.update(public_fields)
         if defer_scoring:
             assert_deferred_result_public(result)
+        emit_progress(
+            "evaluation_sample_complete",
+            dataset=sample.dataset,
+            sample_id=sample.sample_id,
+            method_id=method_id,
+        )
         return result
 
     mode = "a" if resume else "w"
@@ -759,6 +782,12 @@ def evaluate_qwen_runner(
                 output.write(json.dumps(row, ensure_ascii=False) + "\n")
                 output.flush()
                 os.fsync(output.fileno())
+                emit_progress(
+                    "result_committed",
+                    dataset=row["dataset"],
+                    sample_id=row["sample_id"],
+                    method_id=method_id,
+                )
     ordered = [cached[sample.sample_id] for sample in samples if sample.sample_id in cached]
     temporary = output_path.with_suffix(output_path.suffix + ".partial")
     temporary.write_text(

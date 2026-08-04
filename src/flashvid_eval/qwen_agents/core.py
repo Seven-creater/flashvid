@@ -18,6 +18,7 @@ from flashvid_eval.eva_official import frame_tool_identity
 from flashvid_eval.eva_official import select_frames as official_select_frames
 from flashvid_eval.media import estimate_visual_tokens, probe_video
 from flashvid_eval.privacy import AnnotationLeakError, assert_annotation_free_request
+from flashvid_eval.qwen_progress import emit_progress
 from flashvid_eval.qwen_protocol import mcq_answer_response_format
 from flashvid_eval.qwen_token_accounting import enrich_usage_with_qwen_prompt_tokens
 from flashvid_eval.schemas import ModelSample
@@ -434,6 +435,12 @@ class FrameSession:
         self._seen: set[tuple[float, float, int, float]] = set()
 
     def select(self, request: FrameRequest) -> FrameObservation:
+        emit_progress(
+            "frame_select_started",
+            session_id=self.session_id,
+            start_time=request.start_time,
+            end_time=request.end_time,
+        )
         normalized, nframes = self._tool._normalize_request(request, self.metadata)
         signature = (
             round(normalized.start_time, 3),
@@ -450,6 +457,12 @@ class FrameSession:
             request=request,
         )
         self._seen.add(signature)
+        emit_progress(
+            "frame_select_complete",
+            session_id=self.session_id,
+            nframes=observation.resolved_nframes,
+            cache_hit=observation.cache_hit,
+        )
         return observation
 
 
@@ -612,6 +625,12 @@ class BaseQwenAgent:
         self.protocol = protocol or InferenceProtocol()
 
     def run(self, sample: ModelSample) -> AgentTrace:
+        emit_progress(
+            "agent_sample_started",
+            dataset=sample.dataset,
+            sample_id=sample.sample_id,
+            strategy=self.strategy_id,
+        )
         trace = AgentTrace(
             strategy=self.strategy_id,
             model=self.model,
@@ -631,6 +650,13 @@ class BaseQwenAgent:
             trace.error = str(exc)
             trace.error_type = type(exc).__name__
         trace.finalize_costs()
+        emit_progress(
+            "agent_sample_complete",
+            dataset=sample.dataset,
+            sample_id=sample.sample_id,
+            strategy=self.strategy_id,
+            error_type=trace.error_type,
+        )
         return trace
 
     def run_fingerprint(self) -> str:
@@ -688,6 +714,15 @@ class BaseQwenAgent:
                     "request_kwargs": {"response_format": response_format},
                 }
             )
+            emit_progress(
+                "api_request_started",
+                dataset=trace.dataset,
+                sample_id=trace.sample_id,
+                strategy=self.strategy_id,
+                branch=branch,
+                request_kind=request_kind,
+                attempt_index=attempt_index,
+            )
             result = self.client.chat(
                 self.model,
                 messages,
@@ -700,6 +735,15 @@ class BaseQwenAgent:
                 mm_processor_kwargs=mm_processor_kwargs,
                 media_io_kwargs=media_io_kwargs,
                 extra_body={"return_token_ids": True},
+            )
+            emit_progress(
+                "api_response",
+                dataset=trace.dataset,
+                sample_id=trace.sample_id,
+                strategy=self.strategy_id,
+                branch=branch,
+                request_kind=request_kind,
+                attempt_index=attempt_index,
             )
             if isinstance(result.raw.get("prompt_token_ids"), list):
                 result = replace(

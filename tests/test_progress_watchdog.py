@@ -28,6 +28,17 @@ def test_progress_snapshot_changes_only_for_matching_result_files(tmp_path: Path
     assert module.progress_snapshot(tmp_path, "*.jsonl") != first
 
 
+def test_heartbeat_snapshot_changes_after_atomic_replace(tmp_path: Path) -> None:
+    heartbeat = tmp_path / "phase.heartbeat.json"
+    assert module.heartbeat_snapshot(heartbeat) is None
+    heartbeat.write_text('{"sequence":1}\n', encoding="utf-8")
+    first = module.heartbeat_snapshot(heartbeat)
+    replacement = heartbeat.with_suffix(".partial")
+    replacement.write_text('{"sequence":2}\n', encoding="utf-8")
+    replacement.replace(heartbeat)
+    assert module.heartbeat_snapshot(heartbeat) != first
+
+
 @pytest.mark.skipif(os.name != "posix", reason="production watchdog uses POSIX process groups")
 def test_watchdog_terminates_a_stalled_child(tmp_path: Path) -> None:
     completed = subprocess.run(
@@ -54,3 +65,40 @@ def test_watchdog_terminates_a_stalled_child(tmp_path: Path) -> None:
     )
     assert completed.returncode == module.STALL_EXIT_CODE
     assert '"event": "progress_stall"' in completed.stdout
+
+
+@pytest.mark.skipif(os.name != "posix", reason="production watchdog uses POSIX process groups")
+def test_heartbeat_keeps_a_multi_step_child_alive(tmp_path: Path) -> None:
+    heartbeat = tmp_path / "phase.heartbeat.json"
+    child = (
+        "import pathlib,time\n"
+        f"p=pathlib.Path({str(heartbeat)!r})\n"
+        "for i in range(8):\n"
+        " p.write_text(str(i), encoding='utf-8')\n"
+        " time.sleep(0.04)\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--watch-root",
+            str(tmp_path / "results"),
+            "--heartbeat-file",
+            str(heartbeat),
+            "--stall-seconds",
+            "0.12",
+            "--poll-seconds",
+            "0.02",
+            "--terminate-grace-seconds",
+            "0.1",
+            "--",
+            sys.executable,
+            "-c",
+            child,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

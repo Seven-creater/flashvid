@@ -8,6 +8,7 @@ from typing import Any, Mapping, Protocol
 
 from .client import ChatResult
 from .privacy import AnnotationLeakError, assert_annotation_free_request
+from .qwen_progress import emit_progress
 from .qwen_protocol import mcq_answer_response_format
 from .qwen_agents import (
     AgentStrategy,
@@ -211,6 +212,13 @@ class QwenTrajectoryRunner:
                 }
             )
             while True:
+                emit_progress(
+                    "api_request_started",
+                    dataset=sample.dataset,
+                    sample_id=sample.sample_id,
+                    runner="qwen_trajectory_confirmation",
+                    judge_seed=judge_seed,
+                )
                 result = self.client.chat(
                     self.model,
                     messages,
@@ -222,6 +230,13 @@ class QwenTrajectoryRunner:
                         "enable_thinking": self.protocol.enable_thinking
                     },
                     sampling_params=self.protocol.sampling_params(),
+                )
+                emit_progress(
+                    "api_response",
+                    dataset=sample.dataset,
+                    sample_id=sample.sample_id,
+                    runner="qwen_trajectory_confirmation",
+                    judge_seed=judge_seed,
                 )
                 attempts.append(
                     {

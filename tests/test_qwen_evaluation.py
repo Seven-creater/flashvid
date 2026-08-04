@@ -74,6 +74,26 @@ def test_text_baseline_is_annotation_free_and_strict_json(tmp_path: Path) -> Non
     assert client.calls[0]["extra_body"] == {"return_token_ids": True}
 
 
+def test_baseline_emits_progress_around_api_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "flashvid_eval.qwen_evaluation.emit_progress",
+        lambda event, **details: events.append(event) or True,
+    )
+    runner = QwenBaselineRunner(
+        FakeClient([ChatResult('{"answer":"B"}', {}, {}, 0.0)]),
+        "Qwen",
+        tmp_path,
+        QwenBaselineConfig("question_choices", NO_THINK_PROTOCOL),
+    )
+
+    runner.run(ModelSample.from_sample(_sample(), None))
+
+    assert events == ["api_request_started", "api_response"]
+
+
 def test_choices_only_runner_sends_no_question_or_video(tmp_path: Path) -> None:
     client = FakeClient([ChatResult('{"answer":"A"}', {}, {}, 0.0)])
     runner = QwenBaselineRunner(

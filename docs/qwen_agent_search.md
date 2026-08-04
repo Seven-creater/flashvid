@@ -56,6 +56,9 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
   configs/experiments/qwen_agent_search.json protocol_audit q9
 ```
 
+若 smoke 被单条瞬时 API/网络错误拦下，先检查该行和服务日志，再用同一命令追加
+`--retry-errors`。恢复标志只补跑错误行，不改变冻结 run plan，也不会重复已完成样本。
+
 任务结束后用 `bash scripts/stop_qwen_agent.sh 8200` 停止本项目服务，启动 4B，
 依次以 `q4` 运行 `protocol_smoke` 和 `protocol_audit`。两者完成后冻结协议：
 

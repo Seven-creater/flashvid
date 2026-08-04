@@ -1811,6 +1811,7 @@ def execute_tasks(
     source_workspace: Path,
     *,
     endpoint_preflight: bool = True,
+    retry_errors: bool = False,
 ) -> None:
     assert_safe_execution(tasks)
     if endpoint_preflight:
@@ -1818,7 +1819,10 @@ def execute_tasks(
     if not source_workspace.is_dir():
         raise FileNotFoundError(source_workspace)
     for task in tasks:
-        subprocess.run(list(task.command), cwd=source_workspace, check=True)
+        command = list(task.command)
+        if retry_errors and "--retry-errors" not in command:
+            command.append("--retry-errors")
+        subprocess.run(command, cwd=source_workspace, check=True)
 
 
 def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
@@ -1976,6 +1980,14 @@ def main() -> None:
     parser.add_argument("--phase", choices=sorted(PHASES), required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help=(
+            "Recovery mode: retry existing evaluator rows classified as errors without "
+            "changing the frozen semantic run plan."
+        ),
+    )
     parser.add_argument("--model-key", choices=("q9", "q4"))
     parser.add_argument(
         "--protocol",
@@ -2115,6 +2127,7 @@ def main() -> None:
                 "plan_sha256": plan["plan_sha256"],
                 "task_count": len(tasks),
                 "dry_run": args.dry_run,
+                "retry_errors": args.retry_errors,
             },
             ensure_ascii=False,
             indent=2,
@@ -2141,7 +2154,11 @@ def main() -> None:
     suffix = f"_{'_'.join(_safe_id(item) for item in suffix_parts)}" if suffix_parts else ""
     plan_path = Path(config["result_root"]) / "run_plans" / f"{args.phase}{suffix}.json"
     freeze_run_plan(plan_path, plan, resume=effective_resume)
-    execute_tasks(tasks, Path(config["source_workspace"]))
+    execute_tasks(
+        tasks,
+        Path(config["source_workspace"]),
+        retry_errors=args.retry_errors,
+    )
     if args.phase == "protocol_smoke":
         audit = audit_protocol_smoke(tasks)
         print(json.dumps(audit, ensure_ascii=False, indent=2))

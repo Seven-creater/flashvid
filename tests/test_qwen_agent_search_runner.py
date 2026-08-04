@@ -820,6 +820,18 @@ def test_execution_is_sequential_and_rejects_shared_endpoint_models(
     assert [item[0] for item in seen] == [list(task.command) for task in tasks]
     assert all(Path(command[1]).name == "evaluate_mcq.py" for command, _ in seen)
 
+    seen.clear()
+    runner.execute_tasks(
+        tasks,
+        Path(shared["source_workspace"]),
+        endpoint_preflight=False,
+        retry_errors=True,
+    )
+    assert [item[0] for item in seen] == [
+        [*task.command, "--retry-errors"] for task in tasks
+    ]
+    assert all("--retry-errors" not in task.command for task in tasks)
+
 
 def test_endpoint_preflight_requires_exact_served_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

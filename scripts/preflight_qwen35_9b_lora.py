@@ -91,10 +91,13 @@ def _check_cuda(expected_gpu_count: int) -> tuple[Any, dict[str, Any]]:
     import torch
 
     torch_version = str(torch.__version__)
-    if not torch_version.startswith("2.5.1+cu121"):
-        raise RuntimeError(f"expected torch 2.5.1+cu121, found {torch_version}")
-    if torch.version.cuda != "12.1":
-        raise RuntimeError(f"expected CUDA 12.1 torch runtime, found {torch.version.cuda}")
+    if not torch_version.startswith("2.6.0+cu124"):
+        raise RuntimeError(f"expected torch 2.6.0+cu124, found {torch_version}")
+    if torch.version.cuda != "12.4":
+        raise RuntimeError(f"expected CUDA 12.4 torch runtime, found {torch.version.cuda}")
+    triton_version = importlib.metadata.version("triton")
+    if triton_version != "3.2.0":
+        raise RuntimeError(f"expected triton 3.2.0, found {triton_version}")
     if not torch.cuda.is_available():
         raise RuntimeError("torch.cuda.is_available() is false")
     count = torch.cuda.device_count()
@@ -121,6 +124,7 @@ def _check_cuda(expected_gpu_count: int) -> tuple[Any, dict[str, Any]]:
     return torch, {
         "torch": torch_version,
         "torch_cuda": torch.version.cuda,
+        "triton": triton_version,
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
         "device_count": count,
         "devices": devices,

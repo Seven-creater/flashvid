@@ -14,20 +14,20 @@ elif [[ $# -ne 0 ]]; then
   exit 2
 fi
 PYTHON312="${PYTHON312:-python3.12}"
-SWIFT_ENV_DIR="${SFT_ENV_DIR:-${PROJECT_DIR}/.venv-qwen35-sft-cu121}"
+SWIFT_ENV_DIR="${SFT_ENV_DIR:-${PROJECT_DIR}/.venv-qwen35-sft-cu124}"
 SWIFT_PYTHON="${SWIFT_ENV_DIR}/bin/python"
-LOCK_FILE="${LOCK_FILE:-${PROJECT_DIR}/configs/training/qwen35_9b_sft_cuda121.lock.txt}"
+LOCK_FILE="${LOCK_FILE:-${PROJECT_DIR}/configs/training/qwen35_9b_sft_cuda124.lock.txt}"
 STATE_DIR="${STATE_DIR:-${PROJECT_DIR}/.runtime/ms_swift_442}"
 REPORT="${REPORT:-${STATE_DIR}/installed.json}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 PYPI_INDEX_URL="${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-TORCH_WHEEL_BASE="${TORCH_WHEEL_BASE:-https://mirrors.aliyun.com/pytorch-wheels/cu121}"
-TORCH_WHEEL_URL="${TORCH_WHEEL_BASE}/torch-2.5.1%2Bcu121-cp312-cp312-linux_x86_64.whl"
-TORCHVISION_WHEEL_URL="${TORCH_WHEEL_BASE}/torchvision-0.20.1%2Bcu121-cp312-cp312-linux_x86_64.whl"
-TORCHAUDIO_WHEEL_URL="${TORCH_WHEEL_BASE}/torchaudio-2.5.1%2Bcu121-cp312-cp312-linux_x86_64.whl"
-TORCH_WHEEL_SHA256="222be02548c2e74a21a8fbc8e5b8d2eef9f9faee865d70385d2eb1b9aabcbc76"
-TORCHVISION_WHEEL_SHA256="48cf3a716f70370ed5dcb656e7497415ef37860b07e67ea4b1ef8598efe28445"
-TORCHAUDIO_WHEEL_SHA256="5648a01f23033f15d60dc638f91c2d4c66c0a01621162471e806064acda63b70"
+TORCH_WHEEL_BASE="${TORCH_WHEEL_BASE:-https://mirrors.aliyun.com/pytorch-wheels/cu124}"
+TORCH_WHEEL_URL="${TORCH_WHEEL_BASE}/torch-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl"
+TORCHVISION_WHEEL_URL="${TORCH_WHEEL_BASE}/torchvision-0.21.0%2Bcu124-cp312-cp312-linux_x86_64.whl"
+TORCHAUDIO_WHEEL_URL="${TORCH_WHEEL_BASE}/torchaudio-2.6.0%2Bcu124-cp312-cp312-linux_x86_64.whl"
+TORCH_WHEEL_SHA256="a393b506844035c0dac2f30ea8478c343b8e95a429f06f3b3cadfc7f53adb597"
+TORCHVISION_WHEEL_SHA256="efb53ea0af7bf09b7b53e2a18b9be6d245f7d46a90b51d5cf97f37e9b929a991"
+TORCHAUDIO_WHEEL_SHA256="3e5ffa69606171c74f3e2b969785ead50b782ca657e746aaee1ee7cc88dcfc08"
 FLA_WHEEL_URL="${FLA_WHEEL_URL:-https://pypi.tuna.tsinghua.edu.cn/packages/60/ee/a3cba17965482b35c4990af90bad108e82c32edcb59911c37f318b5f4198/flash_linear_attention-0.4.2-py3-none-any.whl}"
 FLA_CORE_WHEEL_URL="${FLA_CORE_WHEEL_URL:-https://pypi.tuna.tsinghua.edu.cn/packages/ee/36/3c303f92bafea7c3f97d68bbb83d18cc42e30cd0bfb1b7cfe589360f11d6/fla_core-0.4.2-py3-none-any.whl}"
 FLA_WHEEL_SHA256="c08be006ce4dbe1be81f54938ee8e6fc7968cfba397c8d06c7669e97b8c44c0d"
@@ -75,7 +75,7 @@ export PIP_CONFIG_FILE=/dev/null
 unset PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_NO_INDEX
 
 # Refuse mirror redirects before starting any large download.  The hashes are
-# the SHA-256 values published in PyTorch's official cu121 wheel index; pip
+# the SHA-256 values published in PyTorch's official cu124 wheel index; pip
 # verifies that the domestic mirror serves byte-identical artifacts.
 "$SWIFT_PYTHON" - \
   "$TORCH_WHEEL_URL" \
@@ -119,9 +119,9 @@ if [[ "$audit_only" -eq 1 ]]; then
 fi
 
 "$SWIFT_PYTHON" -m pip install --index-url "$PYPI_INDEX_URL" --upgrade pip setuptools wheel
-# This is the last PyTorch release for which the official project publishes a
-# CUDA 12.1 wheel set. Install byte-identical domestic mirror copies directly;
-# an index page may otherwise redirect pip back to download.pytorch.org.
+# PyTorch 2.6 is the first stable release that pins Triton 3.2. Install
+# byte-identical domestic mirror copies directly; an index page may otherwise
+# redirect pip back to download.pytorch.org.
 "$SWIFT_PYTHON" -m pip install \
   --index-url "$PYPI_INDEX_URL" \
   "${TORCH_WHEEL_URL}#sha256=${TORCH_WHEEL_SHA256}" \
@@ -154,15 +154,20 @@ expected = {
     "peft": "0.19.1",
     "flash-linear-attention": "0.4.2",
     "fla-core": "0.4.2",
+    "triton": "3.2.0",
 }
 versions = {name: importlib.metadata.version(name) for name in expected}
 if versions != expected:
     raise SystemExit(f"training dependency lock mismatch: {versions!r}")
 
 import torch
-if not str(torch.__version__).startswith("2.5.1+cu121") or torch.version.cuda != "12.1":
+if not str(torch.__version__).startswith("2.6.0+cu124") or torch.version.cuda != "12.4":
     raise SystemExit(
-        f"expected torch 2.5.1+cu121 / CUDA 12.1, found {torch.__version__} / {torch.version.cuda}"
+        f"expected torch 2.6.0+cu124 / CUDA 12.4, found {torch.__version__} / {torch.version.cuda}"
+    )
+if importlib.metadata.version("triton") != "3.2.0":
+    raise SystemExit(
+        f"expected triton 3.2.0, found {importlib.metadata.version('triton')}"
     )
 
 from swift import get_processor, get_template  # noqa: F401

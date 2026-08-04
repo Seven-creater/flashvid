@@ -11,12 +11,13 @@ def _text(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
 
 
-def test_training_lock_pins_cuda121_and_qwen35_official_stack() -> None:
-    lock = _text("configs/training/qwen35_9b_sft_cuda121.lock.txt")
+def test_training_lock_pins_cuda124_and_qwen35_official_stack() -> None:
+    lock = _text("configs/training/qwen35_9b_sft_cuda124.lock.txt")
     expected = {
-        "torch==2.5.1+cu121",
-        "torchvision==0.20.1+cu121",
-        "torchaudio==2.5.1+cu121",
+        "torch==2.6.0+cu124",
+        "torchvision==0.21.0+cu124",
+        "torchaudio==2.6.0+cu124",
+        "triton==3.2.0",
         "ms-swift==4.4.2",
         "transformers==5.9.0",
         "qwen-vl-utils==0.0.14",
@@ -33,10 +34,10 @@ def test_training_lock_pins_cuda121_and_qwen35_official_stack() -> None:
 def test_environment_installer_is_python312_and_venv_isolated() -> None:
     text = _text("scripts/install_ms_swift_442.sh")
     assert 'PYTHON312="${PYTHON312:-python3.12}"' in text
-    assert ".venv-qwen35-sft-cu121" in text
+    assert ".venv-qwen35-sft-cu124" in text
     assert "--system-site-packages" not in text
     assert "include-system-site-packages = false" in text
-    assert "https://mirrors.aliyun.com/pytorch-wheels/cu121" in text
+    assert "https://mirrors.aliyun.com/pytorch-wheels/cu124" in text
     assert "https://pypi.tuna.tsinghua.edu.cn/packages/60/ee/" in text
     assert 'PYPI_INDEX_URL="${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"' in text
     assert '[[ "$HF_ENDPOINT" == "https://hf-mirror.com" ]]' in text
@@ -47,7 +48,8 @@ def test_environment_installer_is_python312_and_venv_isolated() -> None:
     assert '"$1" == "--audit-only"' in text
     assert "domestic mirror audit passed; no packages were downloaded" in text
     assert 'allowed_hosts = {"mirrors.aliyun.com", "pypi.tuna.tsinghua.edu.cn"}' in text
-    assert "222be02548c2e74a21a8fbc8e5b8d2eef9f9faee865d70385d2eb1b9aabcbc76" in text
+    assert "a393b506844035c0dac2f30ea8478c343b8e95a429f06f3b3cadfc7f53adb597" in text
+    assert "expected triton 3.2.0" in text
     assert 'HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"' in text
     assert "c08be006ce4dbe1be81f54938ee8e6fc7968cfba397c8d06c7669e97b8c44c0d" in text
     assert '"${FLA_WHEEL_URL}#sha256=${FLA_WHEEL_SHA256}"' in text

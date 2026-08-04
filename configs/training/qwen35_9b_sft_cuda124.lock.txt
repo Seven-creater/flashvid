@@ -1,10 +1,11 @@
 # Reproducible Qwen3.5-9B LoRA training stack for Python 3.12.
 # PyTorch is installed first from SHA-pinned Aliyun domestic copies of the
-# official cu121 wheels by scripts/install_ms_swift_442.sh. Exact pins prevent
-# the subsequent ms-swift install from silently replacing that CUDA stack.
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
-torchaudio==2.5.1+cu121
+# official cu124 wheels by scripts/install_ms_swift_442.sh. PyTorch 2.6 pins
+# Triton 3.2, which flash-linear-attention 0.4.2 requires at import time.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+torchaudio==2.6.0+cu124
+triton==3.2.0
 
 # ms-swift 4.4.2 and the dependencies required by its Qwen3.5 guide.
 ms-swift==4.4.2

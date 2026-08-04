@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from peft import LoraConfig
 from safetensors.torch import save_file
 
 from scripts.verify_qwen35_lora_smoke import verify_smoke_run
+
+peft = pytest.importorskip("peft")
+LoraConfig = peft.LoraConfig
 
 
 def _smoke_output(

@@ -1558,6 +1558,59 @@ def _record_needs_retry(record: dict[str, Any]) -> bool:
     )
 
 
+def frozen_candidate_costs(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Return cumulative Direct cost, failing closed on incomplete accounting."""
+
+    executed = record.get("executed_usage")
+    if isinstance(executed, Mapping):
+        usage_source: Mapping[str, Any] = executed
+    elif all(record.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+        usage_source = record
+    else:
+        raw_usage = record.get("usage")
+        usage_source = raw_usage if isinstance(raw_usage, Mapping) else {}
+
+    usage: dict[str, int] = {}
+    usage_complete = True
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage_source.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            usage_complete = False
+            usage[key] = 0
+        else:
+            usage[key] = int(value)
+
+    visual_value = record.get("visual_tokens")
+    visual_complete = record.get("visual_usage_complete") is True
+    if visual_value is None and isinstance(executed, Mapping):
+        visual_value = executed.get("visual_tokens")
+    if not visual_complete and isinstance(executed, Mapping):
+        visual_complete = executed.get("visual_usage_complete") is True
+    if (
+        isinstance(visual_value, bool)
+        or not isinstance(visual_value, (int, float))
+        or not math.isfinite(float(visual_value))
+        or float(visual_value) < 0
+    ):
+        visual_tokens = 0
+        visual_complete = False
+    else:
+        visual_tokens = int(visual_value)
+
+    return {
+        "usage": usage,
+        "visual_tokens": visual_tokens,
+        "complete": bool(
+            usage_complete and visual_complete and not record.get("error")
+        ),
+    }
+
+
 def evaluate(
     samples: list[Sample],
     evaluator: Any,
@@ -1702,16 +1755,8 @@ def evaluate(
             result.setdefault("candidate_rerun", 0)
             candidate_record = (candidate_records or {}).get(sample.sample_id)
             if candidate_record is not None:
-                raw_candidate_usage = candidate_record.get("usage")
-                candidate_usage_source = (
-                    raw_candidate_usage
-                    if isinstance(raw_candidate_usage, Mapping)
-                    else candidate_record
-                )
-                candidate_usage = {
-                    key: int(candidate_usage_source.get(key, 0) or 0)
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                }
+                candidate_cost = frozen_candidate_costs(candidate_record)
+                candidate_usage = candidate_cost["usage"]
                 agent_usage_source = result.get("usage")
                 agent_usage_mapping = (
                     agent_usage_source
@@ -1733,9 +1778,7 @@ def evaluate(
                             continue
                         for key in agent_usage:
                             agent_usage[key] += int(request_usage.get(key, 0) or 0)
-                candidate_visual_tokens = int(
-                    candidate_record.get("visual_tokens", 0) or 0
-                )
+                candidate_visual_tokens = int(candidate_cost["visual_tokens"])
                 agent_visual_tokens = int(result.get("visual_tokens", 0) or 0)
                 result.update(
                     {
@@ -1747,9 +1790,7 @@ def evaluate(
                             or 0.0
                         ),
                         "candidate_visual_tokens": candidate_visual_tokens,
-                        "candidate_cost_complete": not bool(
-                            candidate_record.get("error")
-                        ),
+                        "candidate_cost_complete": candidate_cost["complete"],
                         "agent_usage": agent_usage,
                         "agent_visual_tokens": agent_visual_tokens,
                         "end_to_end_prompt_tokens": (

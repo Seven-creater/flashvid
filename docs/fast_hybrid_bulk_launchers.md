@@ -31,7 +31,7 @@ $PYTHON scripts/launch_fast_hybrid_teacher_matrix.py \
   --repo-root "$PWD" \
   --concurrency-per-endpoint 16 \
   --timeout 80 \
-  --resume --retry-errors \
+  --resume \
   --print-nohup-command
 ```
 
@@ -45,6 +45,11 @@ launcher freezes a command plan before inference and audits exact sample IDs,
 deferred scoring, generation seed, schedule, manifest hash, and
 `candidate_rerun=0` after all children finish. A missing candidate file or
 candidate sample stops the matrix before any model request.
+
+Teacher model/parse failures are immutable outcomes and are never retried by
+the bulk launcher. Each API request already receives the one frozen, same-seed
+immediate retry inside the Fast Hybrid adapter; `--resume` only fills samples
+that have no committed row.
 
 ## Candidate-blind Judge matrix
 

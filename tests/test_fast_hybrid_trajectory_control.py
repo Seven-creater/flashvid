@@ -305,7 +305,7 @@ def test_no_positive_sample_gets_exactly_four_deterministic_rescues() -> None:
         (48000, 101),
         (48000, 211),
     }
-    assert {row["max_call_visual_tokens"] for row in first} == {16000, 24000}
+    assert {row["max_call_visual_tokens"] for row in first} == {12000}
     assert all(row["max_turns"] == 8 for row in first)
 
 

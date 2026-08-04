@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from flashvid_eval.privacy import AnnotationLeakError
-from flashvid_eval.runner import evaluate
+from flashvid_eval.runner import evaluate, frozen_candidate_costs
 from flashvid_eval.schemas import Sample
 
 
@@ -52,12 +52,18 @@ def test_deferred_fast_hybrid_result_never_joins_scoring_fields(tmp_path: Path) 
         candidate_answers={"sample-1": "A"},
         candidate_records={
             "sample-1": {
-                "usage": {
+                "executed_usage": {
                     "prompt_tokens": 11,
                     "completion_tokens": 2,
                     "total_tokens": 13,
                 },
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "total_tokens": 6,
+                },
                 "visual_tokens": 7,
+                "visual_usage_complete": True,
                 "latency_s": 0.5,
             }
         },
@@ -76,6 +82,29 @@ def test_deferred_fast_hybrid_result_never_joins_scoring_fields(tmp_path: Path) 
     assert row["end_to_end_total_tokens"] == 16
     assert row["end_to_end_visual_tokens"] == 7
     assert row["end_to_end_latency_s"] >= 0.5
+    assert row["candidate_cost_complete"] is True
+
+
+def test_candidate_cost_fails_closed_when_visual_accounting_is_incomplete() -> None:
+    cost = frozen_candidate_costs(
+        {
+            "executed_usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 2,
+                "total_tokens": 13,
+            },
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "total_tokens": 6,
+            },
+            "visual_tokens": None,
+            "visual_usage_complete": False,
+        }
+    )
+    assert cost["usage"]["total_tokens"] == 13
+    assert cost["visual_tokens"] == 0
+    assert cost["complete"] is False
 
 
 def test_deferred_fast_hybrid_fails_closed_on_backend_annotation(tmp_path: Path) -> None:

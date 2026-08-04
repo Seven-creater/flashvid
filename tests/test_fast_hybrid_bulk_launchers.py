@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from flashvid_eval.fast_hybrid_trajectory_control import build_base_run_specs
+from flashvid_eval.fast_hybrid_trajectory_control import (
+    build_base_run_specs,
+    build_rescue_run_specs,
+    controller_fingerprint,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -141,7 +145,6 @@ def test_teacher_groups_complete_schedule_and_splits_endpoints(tmp_path: Path) -
         concurrency=16,
         timeout=80,
         resume=True,
-        retry_errors=True,
         write_artifacts=False,
     )
     assert len(jobs) == 3
@@ -159,7 +162,7 @@ def test_teacher_groups_complete_schedule_and_splits_endpoints(tmp_path: Path) -
         assert command[command.index("--trajectory-schedule-id") + 1] == job.schedule_id
         assert "--defer-scoring" in command
         assert "--resume" in command
-        assert "--retry-errors" in command
+        assert "--retry-errors" not in command
         assert command[command.index("--base-url") + 1] == job.endpoint
 
 
@@ -179,9 +182,54 @@ def test_teacher_fails_closed_when_candidate_is_missing(tmp_path: Path) -> None:
             concurrency=1,
             timeout=80,
             resume=False,
-            retry_errors=False,
             write_artifacts=False,
         )
+
+
+def test_rescue_plan_validates_and_builds_teacher_jobs(tmp_path: Path) -> None:
+    config, _, config_sha, candidates, _, _ = _fixture(tmp_path)
+    train600 = Path(config["train600"]["path"])
+    train_rows = common.read_jsonl(train600)
+    dataset_hashes = {
+        dataset: item["train_manifest_sha256"]
+        for dataset, item in config["datasets"].items()
+    }
+    controller = controller_fingerprint(
+        manifest_sha256=config["train600"]["sha256"],
+        config_sha256=config_sha,
+        dataset_manifest_sha256s=dataset_hashes,
+    )
+    rescue_specs = build_rescue_run_specs(
+        train_rows,
+        no_positive_sample_ids=[
+            f"{row['dataset']}/{row['sample_id']}" for row in train_rows
+        ],
+        manifest_sha256=config["train600"]["sha256"],
+        config_sha256=config_sha,
+        controller_sha256=controller,
+        dataset_manifest_sha256s=dataset_hashes,
+    )
+    specs_path = tmp_path / "rescue_specs.jsonl"
+    _write_jsonl(specs_path, list(rescue_specs))
+    validated, sources, _ = common.validate_inputs(config, config_sha, specs_path)
+    jobs = teacher.build_jobs(
+        config=config,
+        config_sha256=config_sha,
+        specs=validated,
+        source_rows=sources,
+        candidate_paths=candidates,
+        python="python",
+        repo_root=ROOT,
+        concurrency=16,
+        timeout=80,
+        resume=True,
+        write_artifacts=False,
+    )
+    assert len(jobs) == 12
+    assert all(
+        job.command[job.command.index("--max-call-visual-tokens") + 1] == "12000"
+        for job in jobs
+    )
 
 
 def test_spec_or_config_hash_change_is_rejected(tmp_path: Path) -> None:

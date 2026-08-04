@@ -133,7 +133,6 @@ def build_jobs(
     concurrency: int,
     timeout: float,
     resume: bool,
-    retry_errors: bool,
     write_artifacts: bool,
 ) -> list[TeacherJob]:
     teacher = config["teacher"]
@@ -242,10 +241,8 @@ def build_jobs(
             "--model-artifact-sha256",
             str(teacher["model_artifact_sha256"]),
         ]
-        if resume or retry_errors:
+        if resume:
             command.append("--resume")
-        if retry_errors:
-            command.append("--retry-errors")
         jobs.append(
             TeacherJob(
                 job_id=f"{phase}:{schedule_id}:{dataset}",
@@ -334,7 +331,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--concurrency-per-endpoint", type=int, default=16)
     parser.add_argument("--timeout", type=float, default=80.0)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--print-nohup-command", action="store_true")
     parser.add_argument("--detached-log", type=Path)
@@ -360,8 +356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=args.repo_root,
             concurrency=args.concurrency_per_endpoint,
             timeout=args.timeout,
-            resume=args.resume or args.retry_errors,
-            retry_errors=args.retry_errors,
+            resume=args.resume,
             write_artifacts=not args.dry_run and not args.print_nohup_command,
         )
         detached_log = args.detached_log or (
@@ -412,7 +407,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         execute_jobs(
             jobs,
             repo_root=args.repo_root,
-            retry_failed_processes=args.retry_errors,
+            retry_failed_processes=False,
         )
         audit = audit_outputs(jobs)
         freeze_json(plan_path.with_name(plan_path.stem + "_audit.json"), audit)

@@ -19,6 +19,7 @@ from flashvid_eval.fast_hybrid_eva import (
 )
 from flashvid_eval.privacy import assert_deferred_result_public
 from flashvid_eval.qwen_sft import canonical_sha256, read_jsonl, sha256_file
+from flashvid_eval.runner import frozen_candidate_costs
 from flashvid_eval.schemas import ModelSample
 
 
@@ -132,17 +133,13 @@ def load_ready_specs(
 def _cost_fields(
     result: dict[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, Any]:
-    raw_candidate_usage = candidate.get("usage")
-    usage_source = raw_candidate_usage if isinstance(raw_candidate_usage, Mapping) else candidate
-    candidate_usage = {
-        key: int(usage_source.get(key, 0) or 0)
-        for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-    }
+    candidate_cost = frozen_candidate_costs(candidate)
+    candidate_usage = candidate_cost["usage"]
     agent_usage = {
         key: int((result.get("usage") or {}).get(key, 0) or 0)
         for key in ("prompt_tokens", "completion_tokens", "total_tokens")
     }
-    candidate_visual = int(candidate.get("visual_tokens", 0) or 0)
+    candidate_visual = int(candidate_cost["visual_tokens"])
     agent_visual = int(result.get("visual_tokens", 0) or 0)
     candidate_latency = float(
         candidate.get("latency_s", candidate.get("elapsed_s", 0.0)) or 0.0
@@ -151,7 +148,7 @@ def _cost_fields(
         "candidate_usage": candidate_usage,
         "candidate_visual_tokens": candidate_visual,
         "candidate_latency_s": candidate_latency,
-        "candidate_cost_complete": not bool(candidate.get("error")),
+        "candidate_cost_complete": candidate_cost["complete"],
         "agent_usage": agent_usage,
         "agent_visual_tokens": agent_visual,
         "end_to_end_prompt_tokens": candidate_usage["prompt_tokens"]

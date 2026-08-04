@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import importlib.util
+import json
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +15,12 @@ from flashvid_eval.fast_hybrid_trajectory_control import (
 
 
 ANSWER = {("lsdbench", "one"): "B"}
+
+SCRIPT = Path(__file__).parents[1] / "scripts" / "finalize_fast_hybrid_compression.py"
+SPEC = importlib.util.spec_from_file_location("finalize_fast_hybrid_compression", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+finalizer_script = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(finalizer_script)
 
 
 def _base(*, tool_count: int = 1) -> dict:
@@ -194,3 +203,56 @@ def test_completed_dag_selects_cheapest_end_to_end_stable_replica() -> None:
     assert winner["_selection_stable"] is True
     assert winner["_compression_finalized"] is True
     assert winner["_selection_cost_basis"] == "end_to_end"
+
+
+def test_compression_ledger_requires_monotonic_immutable_result_files(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    second.write_text(json.dumps({"row": 2}) + "\n", encoding="utf-8")
+    first_hash = finalizer_script.sha256_file(first)
+    second_hash = finalizer_script.sha256_file(second)
+    fingerprint = "d" * 64
+    previous = {
+        "train600_sha256": "a" * 64,
+        "base_selected_sha256": "b" * 64,
+        "compression_specs_sha256": "c" * 64,
+        "replay_result_sha256s": {str(first.resolve()): first_hash},
+        "outcomes": {fingerprint: "failed"},
+        "rejection_reasons": {fingerprint: "incorrect"},
+    }
+    common = {
+        "train600_sha256": "a" * 64,
+        "base_selected_sha256": "b" * 64,
+        "compression_specs_sha256": "c" * 64,
+        "outcomes": {fingerprint: "failed"},
+        "rejection_reasons": {fingerprint: "incorrect"},
+    }
+    finalizer_script._validate_monotonic_ledger(
+        previous,
+        replay_result_sha256s={
+            str(first.resolve()): first_hash,
+            str(second.resolve()): second_hash,
+        },
+        **common,
+    )
+    with pytest.raises(RuntimeError, match="monotonic superset"):
+        finalizer_script._validate_monotonic_ledger(
+            previous,
+            replay_result_sha256s={str(second.resolve()): second_hash},
+            **common,
+        )
+    with pytest.raises(RuntimeError, match="outcome is not monotonic"):
+        finalizer_script._validate_monotonic_ledger(
+            previous,
+            replay_result_sha256s={str(first.resolve()): first_hash},
+            **{**common, "outcomes": {fingerprint: "passed"}},
+        )
+    with pytest.raises(RuntimeError, match="previous replay result changed"):
+        finalizer_script._validate_monotonic_ledger(
+            previous,
+            replay_result_sha256s={str(first.resolve()): "e" * 64},
+            **common,
+        )

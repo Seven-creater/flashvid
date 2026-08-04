@@ -64,6 +64,33 @@ def test_candidate_loader_requires_clean_uniform32_protocol(tmp_path: Path) -> N
         module.load_candidates(path, samples)
 
 
+def test_replay_cost_uses_cumulative_candidate_usage_and_requires_visual_audit() -> None:
+    result = {
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        "visual_tokens": 2,
+        "latency_s": 0.25,
+    }
+    candidate = {
+        "executed_usage": {
+            "prompt_tokens": 20,
+            "completion_tokens": 2,
+            "total_tokens": 22,
+        },
+        "usage": {"prompt_tokens": 8, "completion_tokens": 1, "total_tokens": 9},
+        "visual_tokens": 12,
+        "visual_usage_complete": True,
+        "latency_s": 0.5,
+    }
+    complete = module._cost_fields(result, candidate)
+    assert complete["candidate_usage"]["total_tokens"] == 22
+    assert complete["end_to_end_total_tokens"] == 26
+    assert complete["candidate_cost_complete"] is True
+
+    candidate["visual_usage_complete"] = False
+    incomplete = module._cost_fields(result, candidate)
+    assert incomplete["candidate_cost_complete"] is False
+
+
 def test_ready_specs_reject_parallel_nodes_for_same_sample(tmp_path: Path) -> None:
     train_hash = "a" * 64
     dataset_hash = "b" * 64

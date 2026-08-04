@@ -286,7 +286,12 @@ def test_non_direct_row_does_not_require_direct_media_accounting() -> None:
     )
 
 
-def _complete_matrix(tmp_path: Path, *, leak_stage: str | None = None) -> tuple[dict, list[Path]]:
+def _complete_matrix(
+    tmp_path: Path,
+    *,
+    leak_stage: str | None = None,
+    reject_q4_think: bool = False,
+) -> tuple[dict, list[Path]]:
     config = _config(tmp_path)
     protocol_tasks = []
     for model_key in ("q4", "q9"):
@@ -294,6 +299,8 @@ def _complete_matrix(tmp_path: Path, *, leak_stage: str | None = None) -> tuple[
             ("no_think", (1, 1, 1), 50),
             ("think", (2, 1, 1), 80),
         ):
+            if reject_q4_think and model_key == "q4" and protocol == "think":
+                continue
             for dataset in DATASETS:
                 protocol_tasks.append(
                     _task(
@@ -330,7 +337,11 @@ def _complete_matrix(tmp_path: Path, *, leak_stage: str | None = None) -> tuple[
                         phase="direct_dev",
                         dataset=dataset,
                         model_key=model_key,
-                        protocol="think",
+                        protocol=(
+                            "no_think"
+                            if reject_q4_think and model_key == "q4"
+                            else "think"
+                        ),
                         seed=42,
                         correct_count=_scores(counts, dataset),
                         tokens=tokens,
@@ -665,3 +676,64 @@ def test_cli_writes_machine_readable_report_and_schema_v2_winner(tmp_path: Path)
     frozen = json.loads(winner.read_text(encoding="utf-8"))
     assert frozen["schema_version"] == 2
     assert frozen["selection_report"]["sha256"] == file_sha256(summary)
+
+
+def test_winner_cli_accepts_q4_think_smoke_rejection(tmp_path: Path) -> None:
+    config, plans = _complete_matrix(tmp_path, reject_q4_think=True)
+    smoke_tasks = [
+        _task(
+            tmp_path,
+            config,
+            phase="protocol_smoke",
+            dataset=dataset,
+            model_key="q4",
+            protocol="think",
+            seed=42,
+            correct_count=1,
+            tokens=80,
+            suffix="q4-think-winner-smoke",
+            mode="direct",
+            sampling="uniform64",
+        )
+        for dataset in DATASETS
+    ]
+    smoke_plan = _plan(tmp_path, config, "protocol_smoke", smoke_tasks)
+    first_result = next(Path(smoke_tasks[0]["output_dir"]).glob("*.jsonl"))
+    rows = [json.loads(line) for line in first_result.read_text(encoding="utf-8").splitlines()]
+    rows[0].update(
+        {
+            "prediction": None,
+            "correct": False,
+            "error_type": "request_timeout",
+        }
+    )
+    first_result.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    config_path = tmp_path / "config.json"
+    _write_json(config_path, config)
+    summary = tmp_path / "selection_summary.json"
+    winner = tmp_path / "winner.json"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--config",
+        str(config_path),
+        "--reject-q4-think-from-smoke",
+        str(smoke_plan),
+        "--summary-output",
+        str(summary),
+        "--winner-output",
+        str(winner),
+    ]
+    for plan in plans:
+        command.extend(["--run-plan", str(plan)])
+    completed = subprocess.run(command, text=True, capture_output=True, check=True)
+
+    assert json.loads(completed.stdout)["status"] == "passed"
+    frozen_summary = json.loads(summary.read_text(encoding="utf-8"))
+    assert frozen_summary["protocol_selection"]["q4"]["protocol"] == "no_think"
+    assert frozen_summary["protocol_rejections"]["q4"]["think"]["failures"] == 1
+    assert "missing_protocol_audit:q4:think" not in frozen_summary["blocking_errors"]
+    assert json.loads(winner.read_text(encoding="utf-8"))["schema_version"] == 2

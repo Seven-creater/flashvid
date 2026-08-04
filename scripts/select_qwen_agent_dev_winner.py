@@ -10,6 +10,7 @@ from flashvid_eval.qwen_dev_selection import (
     build_frozen_winner,
     canonical_sha256,
     load_dev_runs,
+    load_protocol_smoke_rejection,
     write_frozen_json,
 )
 
@@ -28,6 +29,14 @@ def main() -> None:
         help="Recursively include protocol_audit/direct_dev/agent_dev plan JSON files.",
     )
     parser.add_argument("--teacher-model-key", choices=("q9", "q4"), default="q9")
+    parser.add_argument(
+        "--reject-q4-think-from-smoke",
+        type=Path,
+        help=(
+            "Allow q4 think to be explicitly rejected from a protocol_smoke plan "
+            "whose engineering failure rate exceeds 1%%."
+        ),
+    )
     parser.add_argument("--summary-output", type=Path, required=True)
     parser.add_argument("--winner-output", type=Path, required=True)
     args = parser.parse_args()
@@ -47,10 +56,20 @@ def main() -> None:
         raise ValueError("experiment config must be a JSON object")
     config_hash = canonical_sha256(config)
     runs = load_dev_runs(unique_plans, config_hash)
+    protocol_rejections = {}
+    if args.reject_q4_think_from_smoke is not None:
+        evidence = load_protocol_smoke_rejection(
+            args.reject_q4_think_from_smoke,
+            config_hash,
+            model_key="q4",
+            protocol="think",
+        )
+        protocol_rejections = {"q4": {"think": evidence}}
     report = build_dev_selection_report(
         config,
         runs,
         teacher_model_key=args.teacher_model_key,
+        protocol_rejections=protocol_rejections,
     )
     report_sha = write_frozen_json(args.summary_output, report)
     if report["status"] != "passed":

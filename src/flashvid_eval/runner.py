@@ -1585,11 +1585,17 @@ def evaluate(
                 expected_run_fingerprint is not None
                 and record.get("run_fingerprint") != expected_run_fingerprint
             ):
-                raise RuntimeError(
-                    f"resume fingerprint mismatch in {output_path}: "
-                    f"expected {expected_run_fingerprint}, "
-                    f"found {record.get('run_fingerprint')}"
-                )
+                if backend == "fast_hybrid_eva" and record.get("run_fingerprint") is None:
+                    # Early Fast Hybrid rows predate per-row fingerprints. The
+                    # CLI's frozen-input file already rejects config changes;
+                    # stamp these exact legacy rows during their first resume.
+                    record["run_fingerprint"] = expected_run_fingerprint
+                else:
+                    raise RuntimeError(
+                        f"resume fingerprint mismatch in {output_path}: "
+                        f"expected {expected_run_fingerprint}, "
+                        f"found {record.get('run_fingerprint')}"
+                    )
             cached[str(record.get("sample_id"))] = record
     pending = [
         sample for sample in samples
@@ -1684,6 +1690,8 @@ def evaluate(
             result.get("planner_route") or result.get("route") or _question_route(sample.question, sample.metadata),
         )
         result.setdefault("elapsed_s", time.perf_counter() - started)
+        if expected_run_fingerprint is not None:
+            result.setdefault("run_fingerprint", expected_run_fingerprint)
         return result
 
     mode = "a" if resume else "w"

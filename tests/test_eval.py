@@ -402,6 +402,52 @@ def test_fast_hybrid_records_missing_source_without_model_leak(tmp_path: Path) -
     assert record["candidate_rerun"] == 0
 
 
+def test_fast_hybrid_resume_stamps_legacy_missing_fingerprint(tmp_path: Path) -> None:
+    class FrozenEvaluator:
+        calls = 0
+
+        def run_fingerprint(self) -> str:
+            return "frozen-fast-hybrid"
+
+        def fast_hybrid_eva(self, sample: Sample, candidate: str | None) -> dict:
+            del sample, candidate
+            self.calls += 1
+            return {"prediction": "A"}
+
+    sample = Sample("x", "legacy-1", "v.mp4", "Q", {"A": "yes", "B": "no"}, "A")
+    output_dir = tmp_path / "legacy"
+    output_dir.mkdir()
+    output_path = output_dir / "x_fast_hybrid_eva.jsonl"
+    output_path.write_text(
+        json.dumps(
+            {
+                "dataset": "x",
+                "sample_id": "legacy-1",
+                "prediction": "A",
+                "answer": "A",
+                "correct": True,
+                "error": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evaluator = FrozenEvaluator()
+
+    evaluate(
+        [sample],
+        evaluator,
+        "fast_hybrid_eva",
+        output_dir,
+        resume=True,
+        candidate_answers={"legacy-1": "A"},
+    )
+
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert evaluator.calls == 0
+    assert record["run_fingerprint"] == "frozen-fast-hybrid"
+
+
 def _hybrid_sample(answer: str = "C") -> Sample:
     return Sample(
         "lvbench",

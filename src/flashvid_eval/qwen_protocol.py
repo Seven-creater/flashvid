@@ -28,13 +28,12 @@ class QwenInferenceProtocol:
         max_tokens: int | None = None,
         json_mode: bool | None = None,
     ) -> dict[str, Any]:
-        # vLLM applies structured-output grammar before its reasoning parser.
-        # Constraining a thinking response to JSON therefore constrains the
-        # hidden reasoning too and can prevent the parser from separating it.
+        # Keep thinking unconstrained by default because planner/tool turns may
+        # need non-MCQ schemas. Callers that own a final-answer turn can opt in:
+        # vLLM's Qwen3 reasoning parser applies the schema to final ``content``
+        # while preserving the separately returned reasoning stream.
         if json_mode is None:
             json_mode = not self.enable_thinking
-        elif self.enable_thinking:
-            json_mode = False
         kwargs: dict[str, Any] = {
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
             "temperature": self.temperature,
@@ -68,7 +67,7 @@ NO_THINK_PROTOCOL = QwenInferenceProtocol(
 )
 
 THINK_PROTOCOL = QwenInferenceProtocol(
-    protocol_id="think_v2_32768",
+    protocol_id="think_v3_32768_strict_final",
     enable_thinking=True,
     max_tokens=32768,
     length_retry_max_tokens=None,
@@ -87,7 +86,7 @@ QWEN_PROTOCOLS = {
 
 
 def mcq_answer_response_format(valid_letters: Iterable[str]) -> dict[str, Any]:
-    """Build a strict per-sample schema for a final no-thinking MCQ answer."""
+    """Build a strict per-sample schema for a final MCQ answer."""
 
     letters: list[str] = []
     for raw in valid_letters:

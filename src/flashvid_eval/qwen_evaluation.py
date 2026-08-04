@@ -241,7 +241,7 @@ class QwenBaselineRunner:
         )
         return _canonical_hash(
             {
-                "runner": "qwen_baseline_v4",
+                "runner": "qwen_baseline_v5",
                 "model": self.model,
                 "mode": self.config.mode,
                 "protocol": asdict(self.config.protocol),
@@ -281,8 +281,9 @@ class QwenBaselineRunner:
         latency = 0.0
         while True:
             kwargs = self.config.protocol.request_kwargs(max_tokens=requested)
-            if not self.config.protocol.enable_thinking:
-                kwargs["response_format"] = mcq_answer_response_format(valid_letters)
+            # This is always a final MCQ turn. The Qwen3 reasoning parser keeps
+            # hidden reasoning separate while vLLM constrains formal content.
+            kwargs["response_format"] = mcq_answer_response_format(valid_letters)
             kwargs["extra_body"] = {"return_token_ids": True}
             assert_annotation_free_request(
                 {
@@ -547,11 +548,7 @@ class QwenBaselineRunner:
             "enable_thinking": self.config.protocol.enable_thinking,
             "protocol_request": {
                 **self.config.protocol.request_kwargs(),
-                **(
-                    {"response_format": mcq_answer_response_format(tuple(choices))}
-                    if not self.config.protocol.enable_thinking
-                    else {}
-                ),
+                "response_format": mcq_answer_response_format(tuple(choices)),
                 "extra_body": {"return_token_ids": True},
             },
             "prompt_id": BASELINE_PROMPT_ID,

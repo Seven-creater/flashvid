@@ -79,14 +79,16 @@ def test_protocols_expose_thinking_and_length_retry_policy() -> None:
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     }
-    assert THINK_PROTOCOL.protocol_id == "think_v2_32768"
+    assert THINK_PROTOCOL.protocol_id == "think_v3_32768_strict_final"
     assert THINK_PROTOCOL.request_kwargs()["max_tokens"] == 32768
     assert THINK_PROTOCOL.request_kwargs()["sampling_params"]["top_p"] == 0.95
     assert THINK_PROTOCOL.request_kwargs()["chat_template_kwargs"] == {
         "enable_thinking": True
     }
     assert "response_format" not in THINK_PROTOCOL.request_kwargs()
-    assert "response_format" not in THINK_PROTOCOL.request_kwargs(json_mode=True)
+    assert THINK_PROTOCOL.request_kwargs(json_mode=True)["response_format"] == {
+        "type": "json_object"
+    }
     truncated = ChatResult("", {}, {}, 0.0, finish_reason="length")
     assert next_length_retry_max_tokens(THINK_PROTOCOL, truncated, 32768) is None
     assert next_length_retry_max_tokens(NO_THINK_PROTOCOL, truncated, 512) is None

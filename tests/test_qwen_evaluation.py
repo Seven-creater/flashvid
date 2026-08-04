@@ -122,7 +122,11 @@ def test_frozen_thinking_protocol_starts_at_32768_without_retry(tmp_path: Path) 
     )
     result = runner.run(ModelSample.from_sample(_sample(), None))
     assert [call["max_tokens"] for call in client.calls] == [32768]
-    assert all("response_format" not in call for call in client.calls)
+    response_format = client.calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["schema"]["properties"]["answer"][
+        "enum"
+    ] == list("ABCD")
     assert result["length_retry_used"] is False
     assert result["latency_s"] == 2
     assert result["completion_tokens"] == 2
@@ -328,7 +332,7 @@ def test_generation_seed_is_stable_per_sample_and_in_fingerprint(tmp_path: Path)
     assert first["content"] == '{"answer":"B"}'
 
 
-def test_baseline_fingerprint_uses_v4_sampling_and_answer_schema(
+def test_baseline_fingerprint_uses_v5_sampling_and_answer_schema(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -346,7 +350,7 @@ def test_baseline_fingerprint_uses_v4_sampling_and_answer_schema(
         QwenBaselineConfig("question_choices", NO_THINK_PROTOCOL),
     )
     assert runner.run_fingerprint() == "fingerprint"
-    assert captured["runner"] == "qwen_baseline_v4"
+    assert captured["runner"] == "qwen_baseline_v5"
 
 
 def test_evaluation_joins_private_answer_only_after_runner_returns(tmp_path: Path) -> None:

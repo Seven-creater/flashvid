@@ -5,6 +5,7 @@ shopt -s nullglob
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/src"
+SERVICE_OWNER_PROJECT_DIR="${SERVICE_OWNER_PROJECT_DIR:-$PROJECT_DIR}"
 
 PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
 SFT_PYTHON="${SFT_PYTHON:-$PROJECT_DIR/.venv-qwen35-sft-cu124/bin/python}"
@@ -38,6 +39,10 @@ PY
 }
 
 stop_owned_services() {
+  if [[ "$SERVICE_OWNER_PROJECT_DIR" != "$PROJECT_DIR" ]]; then
+    bash "$SERVICE_OWNER_PROJECT_DIR/scripts/stop_qwen_agent.sh" 8200
+    bash "$SERVICE_OWNER_PROJECT_DIR/scripts/stop_qwen_agent.sh" 8201
+  fi
   bash "$PROJECT_DIR/scripts/stop_qwen_agent.sh" 8200
   bash "$PROJECT_DIR/scripts/stop_qwen_agent.sh" 8201
   SERVICES_STARTED=0

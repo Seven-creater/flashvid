@@ -5,6 +5,7 @@ shopt -s nullglob
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/src"
+SERVICE_OWNER_PROJECT_DIR="${SERVICE_OWNER_PROJECT_DIR:-$PROJECT_DIR}"
 
 PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
 CONFIG="${CONFIG:-configs/experiments/fast_hybrid_eva_sft.json}"
@@ -67,6 +68,9 @@ ensure_base_service() {
   local port=$1 devices=$2 allow_shared=$3
   if model_healthy "$port" Qwen3.5-9B; then return 0; fi
   echo "base service health check failed; safely restarting owned port $port" >&2
+  if [[ "$SERVICE_OWNER_PROJECT_DIR" != "$PROJECT_DIR" ]]; then
+    bash "$SERVICE_OWNER_PROJECT_DIR/scripts/stop_qwen_agent.sh" "$port"
+  fi
   bash "$PROJECT_DIR/scripts/stop_qwen_agent.sh" "$port"
   CUDA_DEVICES="$devices" ALLOW_SHARED_GPUS="$allow_shared" \
     bash "$PROJECT_DIR/scripts/launch_qwen_agent_service.sh" \

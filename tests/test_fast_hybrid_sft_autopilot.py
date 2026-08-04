@@ -17,6 +17,9 @@ def test_autopilot_is_one_shot_resumable_and_bounded() -> None:
     assert "teacher_audit_passed" in text
     assert "sleep 60" in text
     assert "resume_base_teacher_once" in text
+    assert "TEACHER_CODE_PROJECT_DIR" in text
+    assert '"$TEACHER_CODE_PROJECT_DIR/scripts/launch_fast_hybrid_teacher_matrix.py"' in text
+    assert '--repo-root "$TEACHER_CODE_PROJECT_DIR"' in text
     assert "--resume" in text
     assert "run_fast_hybrid_post_teacher.sh" in text
     assert "run_fast_hybrid_train_eval.sh" in text
@@ -46,6 +49,7 @@ def test_train_eval_enforces_smoke_dev_winner_and_single_test_gate() -> None:
 
 def test_post_teacher_recovers_only_allowlisted_owned_base_services() -> None:
     text = _text("scripts/run_fast_hybrid_post_teacher.sh")
+    assert "SERVICE_OWNER_PROJECT_DIR" in text
     assert "ensure_base_service 8200 0,1,2,3 1" in text
     assert "ensure_base_service 8201 4,5,6,7 0" in text
     assert 'stop_qwen_agent.sh" "$port"' in text
@@ -57,6 +61,7 @@ def test_post_teacher_recovers_only_allowlisted_owned_base_services() -> None:
 
 def test_train_eval_only_stops_owned_project_services() -> None:
     text = _text("scripts/run_fast_hybrid_train_eval.sh")
+    assert "SERVICE_OWNER_PROJECT_DIR" in text
     assert 'stop_qwen_agent.sh" 8200' in text
     assert 'stop_qwen_agent.sh" 8201' in text
     assert "ALLOW_SHARED_GPUS=1" in text
@@ -96,6 +101,11 @@ def test_new_python_clis_are_directly_executable() -> None:
             capture_output=True,
             text=True,
         )
+
+
+def test_sft_eval_retries_a_resume_safe_child_once() -> None:
+    text = _text("scripts/run_fast_hybrid_sft_eval.py")
+    assert "retry_failed_processes=True" in text
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is unavailable")

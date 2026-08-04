@@ -258,7 +258,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.dry_run:
             return 0
         freeze_json(plan_path, plan)
-        execute_jobs(jobs, repo_root=args.repo_root.resolve(), retry_failed_processes=False)
+        # Each child is resume-safe. Retry the failed process once so a transient
+        # service/API interruption does not strand an otherwise complete matrix.
+        execute_jobs(jobs, repo_root=args.repo_root.resolve(), retry_failed_processes=True)
         files: dict[str, Any] = {}
         for job, dataset in zip(jobs, DATASETS):
             entry = protocol["splits"][args.phase][dataset]

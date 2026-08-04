@@ -5,6 +5,7 @@ shopt -s nullglob
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/src"
+SERVICE_OWNER_PROJECT_DIR="${SERVICE_OWNER_PROJECT_DIR:-$PROJECT_DIR}"
 
 PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
 ROOT="${ROOT:-results/eval/fast_hybrid_eva_sft}"
@@ -81,6 +82,9 @@ for _ in $(seq 1 24); do
   sleep 5
 done
 if ! model_healthy; then
+  if [[ "$SERVICE_OWNER_PROJECT_DIR" != "$PROJECT_DIR" ]]; then
+    bash "$SERVICE_OWNER_PROJECT_DIR/scripts/stop_qwen_agent.sh" 8200
+  fi
   bash scripts/stop_qwen_agent.sh 8200
   CUDA_DEVICES=0,1,2,3 ALLOW_SHARED_GPUS=1 \
     bash scripts/launch_qwen_agent_service.sh "$MODEL_PATH" Qwen3.5-9B 8200 4

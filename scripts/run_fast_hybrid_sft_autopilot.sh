@@ -9,6 +9,8 @@ PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
 CONFIG="${CONFIG:-configs/experiments/fast_hybrid_eva_sft.json}"
 CONFIG_SHA="${CONFIG_SHA:-74c2e3a7ecf0dbae30d00037bc748fe0861fdba2501fcf94efeb8aa58856e830}"
 ROOT="${ROOT:-results/eval/fast_hybrid_eva_sft}"
+TEACHER_CODE_PROJECT_DIR="${TEACHER_CODE_PROJECT_DIR:-$PROJECT_DIR}"
+TEACHER_CONFIG="${TEACHER_CONFIG:-$TEACHER_CODE_PROJECT_DIR/configs/experiments/fast_hybrid_eva_sft.json}"
 BASE_SPECS="$ROOT/trajectories/control_v2/base_plan.jsonl"
 STATE="$ROOT/autopilot/master_state.jsonl"
 CURRENT_STAGE=initializing
@@ -81,11 +83,11 @@ resume_base_teacher_once() {
   lv=$(candidate_from_teacher_inputs lvbench)
   lsd=$(candidate_from_teacher_inputs lsdbench)
   cg=$(candidate_from_teacher_inputs cgbench)
-  "$PYTHON" scripts/launch_fast_hybrid_teacher_matrix.py \
-    --config "$CONFIG" --expected-config-sha256 "$CONFIG_SHA" \
+  "$PYTHON" "$TEACHER_CODE_PROJECT_DIR/scripts/launch_fast_hybrid_teacher_matrix.py" \
+    --config "$TEACHER_CONFIG" --expected-config-sha256 "$CONFIG_SHA" \
     --specs "$BASE_SPECS" --candidate-results "lvbench=$lv" \
     --candidate-results "lsdbench=$lsd" --candidate-results "cgbench=$cg" \
-    --python "$PYTHON" --repo-root "$PROJECT_DIR" \
+    --python "$PYTHON" --repo-root "$TEACHER_CODE_PROJECT_DIR" \
     --concurrency-per-endpoint 16 --timeout 80 --resume
 }
 

@@ -130,6 +130,10 @@ TEACHER_AUDIT="$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}_audit.json"
 REPAIRED_TEACHER_AUDIT="$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}_repaired_audit.json"
 if [[ -f "$REPAIRED_TEACHER_AUDIT" ]]; then
   TEACHER_AUDIT="$REPAIRED_TEACHER_AUDIT"
+  "$PYTHON" scripts/repair_fast_hybrid_teacher_provenance.py \
+    --plan "$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}.json" \
+    --failed-audit "$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}_audit.json" \
+    --output-audit "$TEACHER_AUDIT" >/dev/null
 fi
 "$PYTHON" - "$TEACHER_AUDIT" <<'PY'
 import json, sys

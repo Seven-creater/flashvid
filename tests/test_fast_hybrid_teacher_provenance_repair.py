@@ -81,26 +81,52 @@ def _fixture(tmp_path: Path, *, error_type: str = "TimeoutError") -> tuple[Path,
         "run_fingerprint": SHA_RUN,
     }
     good = {"sample_id": "good", **common, "annotation_leak_check": "passed"}
-    failed = {
-        "sample_id": "timeout",
-        "error": f"{error_type}: timed out",
-        "error_type": error_type,
-        "prediction": "A",
-        "scoring_deferred": True,
-        "candidate_rerun": 0,
-        "run_fingerprint": SHA_RUN,
-        "annotation_leak_check": "not_run",
-    }
+    failed_rows = [
+        {
+            "sample_id": sample_id,
+            "error": f"{error_type}: timed out",
+            "error_type": error_type,
+            "prediction": prediction,
+            "scoring_deferred": True,
+            "candidate_rerun": 0,
+            "run_fingerprint": SHA_RUN,
+            "annotation_leak_check": "not_run",
+        }
+        for sample_id, prediction in (("timeout-1", "A"), ("timeout-2", "B"))
+    ]
     output.write_text(
-        json.dumps(good) + "\n" + json.dumps(failed) + "\n", encoding="utf-8"
+        "".join(
+            json.dumps(row) + "\n" for row in (good, *failed_rows)
+        ),
+        encoding="utf-8",
+    )
+    command = (
+        "python",
+        "evaluate.py",
+        "--expected-manifest-sha256",
+        SHA_MANIFEST,
+        "--seed",
+        "17",
+        "--trajectory-schedule-id",
+        "budget_006000_seed_17",
+        "--trajectory-variant-id",
+        "base",
+        "--trajectory-replica-id",
+        "0",
+        "--experiment-config-sha256",
+        SHA_CONFIG,
+        "--model-artifact-sha256",
+        SHA_MODEL,
+        "--train600-manifest-sha256",
+        SHA_TRAIN,
     )
     job = TeacherJob(
         job_id="base:budget_006000_seed_17:lsdbench",
         endpoint="http://127.0.0.1:8200/v1",
-        command=("python", "evaluate.py"),
+        command=command,
         log_path=tmp_path / "teacher.log",
         output_path=output,
-        expected_ids=("good", "timeout"),
+        expected_ids=("good", "timeout-1", "timeout-2"),
         dataset="lsdbench",
         phase="base",
         schedule_id="budget_006000_seed_17",
@@ -110,6 +136,12 @@ def _fixture(tmp_path: Path, *, error_type: str = "TimeoutError") -> tuple[Path,
     plan = {
         "schema_version": 1,
         "kind": "fast_hybrid_teacher_matrix",
+        "config_sha256": SHA_CONFIG,
+        "candidate_sha256s": {
+            "lvbench": "1" * 64,
+            "lsdbench": SHA_CANDIDATE,
+            "cgbench": "2" * 64,
+        },
         "jobs": [
             {
                 "job_id": job.job_id,
@@ -140,6 +172,7 @@ def test_repairs_only_missing_timeout_provenance_and_preserves_failed_audit(
 ) -> None:
     plan, failed_audit, repaired_audit, output = _fixture(tmp_path)
     failed_audit_sha = file_sha256(failed_audit)
+    before_rows = [json.loads(line) for line in output.read_text().splitlines()]
 
     report = repair_teacher_provenance(
         plan_path=plan,
@@ -148,7 +181,7 @@ def test_repairs_only_missing_timeout_provenance_and_preserves_failed_audit(
     )
 
     assert report["status"] == "passed"
-    assert report["repaired_rows"] == 1
+    assert report["repaired_rows"] == 2
     assert file_sha256(failed_audit) == failed_audit_sha
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     timeout = rows[1]
@@ -159,6 +192,16 @@ def test_repairs_only_missing_timeout_provenance_and_preserves_failed_audit(
     assert timeout["generation_seed"] == 17
     assert timeout["manifest_sha256"] == SHA_MANIFEST
     assert timeout["model_artifact_sha256"] == SHA_MODEL
+    assert rows[2]["trajectory_schedule_id"] == "budget_006000_seed_17"
+
+    allowed = set(report["repairs"][0]["added_fields"])
+    for before, after in zip(before_rows, rows):
+        if before["sample_id"] == "good":
+            assert before == after
+            continue
+        assert {key: value for key, value in before.items() if key not in allowed} == {
+            key: value for key, value in after.items() if key not in allowed
+        }
 
     repeated = repair_teacher_provenance(
         plan_path=plan,
@@ -169,10 +212,37 @@ def test_repairs_only_missing_timeout_provenance_and_preserves_failed_audit(
 
 
 def test_refuses_to_relabel_non_timeout_failure(tmp_path: Path) -> None:
-    plan, failed_audit, repaired_audit, _output = _fixture(
+    plan, failed_audit, repaired_audit, output = _fixture(
         tmp_path, error_type="ValueError"
     )
+    before_sha = file_sha256(output)
     with pytest.raises(RuntimeError, match="refusing non-timeout"):
+        repair_teacher_provenance(
+            plan_path=plan,
+            failed_audit_path=failed_audit,
+            output_audit_path=repaired_audit,
+        )
+    assert file_sha256(output) == before_sha
+
+
+def test_rejects_forged_repaired_audit(tmp_path: Path) -> None:
+    plan, failed_audit, repaired_audit, _output = _fixture(tmp_path)
+    repaired_audit.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "fast_hybrid_teacher_repaired_audit",
+                "status": "passed",
+                "jobs": 1,
+                "rows": 3,
+                "issues": [],
+                "source_plan_sha256": file_sha256(plan),
+                "source_failed_audit_sha256": file_sha256(failed_audit),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="does not match immutable inputs"):
         repair_teacher_provenance(
             plan_path=plan,
             failed_audit_path=failed_audit,

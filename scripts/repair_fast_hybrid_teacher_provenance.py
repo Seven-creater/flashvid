@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,21 @@ except ModuleNotFoundError:  # imported as a module by tests
 
 
 _REPAIRABLE_ERROR_TYPES = {"TimeoutError"}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    digest = str(value or "").strip().lower()
+    if not _SHA256_RE.fullmatch(digest):
+        raise ValueError(f"{label} must be a SHA-256 digest")
+    return digest
+
+
+def _command_arg(command: Sequence[str], flag: str) -> str:
+    indexes = [index for index, value in enumerate(command) if value == flag]
+    if len(indexes) != 1 or indexes[0] + 1 >= len(command):
+        raise ValueError(f"Teacher command must contain exactly one {flag}")
+    return str(command[indexes[0] + 1])
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
@@ -65,11 +81,27 @@ def _jobs_from_plan(plan: Mapping[str, Any]) -> list[TeacherJob]:
     return jobs
 
 
-def _frozen_inputs(job: TeacherJob) -> dict[str, Any]:
+def _frozen_inputs(job: TeacherJob, plan: Mapping[str, Any]) -> dict[str, Any]:
     path = job.output_path.parent / f"frozen_inputs_{job.dataset}.json"
     frozen = _load_object(path, "Teacher frozen inputs")
     manifest = frozen.get("manifest")
     candidates = frozen.get("candidate_results")
+    candidate_hashes = plan.get("candidate_sha256s")
+    if not isinstance(candidate_hashes, Mapping):
+        raise ValueError("Teacher plan has no candidate_sha256s")
+    config_hash = _require_sha256(plan.get("config_sha256"), "plan config_sha256")
+    expected_candidate_hash = _require_sha256(
+        candidate_hashes.get(job.dataset), f"plan {job.dataset} candidate SHA-256"
+    )
+    model_hash = _require_sha256(
+        frozen.get("model_artifact_sha256"), "frozen model_artifact_sha256"
+    )
+    train_hash = _require_sha256(
+        frozen.get("train600_manifest_sha256"), "frozen Train600 SHA-256"
+    )
+    run_fingerprint = _require_sha256(
+        frozen.get("run_fingerprint"), "frozen run_fingerprint"
+    )
     if (
         frozen.get("dataset") != job.dataset
         or not isinstance(manifest, Mapping)
@@ -79,21 +111,50 @@ def _frozen_inputs(job: TeacherJob) -> dict[str, Any]:
         or frozen.get("trajectory_schedule_id") != job.schedule_id
         or int(frozen.get("generation_seed", -1)) != job.planner_seed
         or frozen.get("scoring_deferred") is not True
+        or frozen.get("experiment_config_sha256") != config_hash
+        or candidates.get("sha256") != expected_candidate_hash
+        or _command_arg(job.command, "--expected-manifest-sha256")
+        != job.active_manifest_sha256
+        or int(_command_arg(job.command, "--seed")) != job.planner_seed
+        or _command_arg(job.command, "--trajectory-schedule-id") != job.schedule_id
+        or _command_arg(job.command, "--trajectory-variant-id")
+        != frozen.get("trajectory_variant_id")
+        or int(_command_arg(job.command, "--trajectory-replica-id"))
+        != int(frozen.get("trajectory_replica_id", -1))
+        or _command_arg(job.command, "--experiment-config-sha256") != config_hash
+        or _command_arg(job.command, "--model-artifact-sha256") != model_hash
+        or _command_arg(job.command, "--train600-manifest-sha256") != train_hash
     ):
         raise RuntimeError(f"Teacher frozen inputs disagree with plan: {path}")
+    frozen["run_fingerprint"] = run_fingerprint
     return frozen
 
 
 def _expected_fields(job: TeacherJob, frozen: Mapping[str, Any]) -> dict[str, Any]:
     candidate = frozen["candidate_results"]
-    model_hash = frozen.get("model_artifact_sha256")
+    model_hash = _require_sha256(
+        frozen.get("model_artifact_sha256"), "frozen model_artifact_sha256"
+    )
+    teacher_model_hash = _require_sha256(
+        frozen.get("teacher_model_artifact_sha256") or model_hash,
+        "frozen teacher_model_artifact_sha256",
+    )
     return {
-        "candidate_results_sha256": candidate.get("sha256"),
-        "teacher_model_sha256": model_hash,
+        "candidate_results_sha256": _require_sha256(
+            candidate.get("sha256"), "frozen candidate SHA-256"
+        ),
+        "teacher_model_sha256": teacher_model_hash,
         "model_artifact_sha256": model_hash,
-        "experiment_config_sha256": frozen.get("experiment_config_sha256"),
-        "manifest_sha256": job.active_manifest_sha256,
-        "train600_manifest_sha256": frozen.get("train600_manifest_sha256"),
+        "experiment_config_sha256": _require_sha256(
+            frozen.get("experiment_config_sha256"),
+            "frozen experiment_config_sha256",
+        ),
+        "manifest_sha256": _require_sha256(
+            job.active_manifest_sha256, "job active_manifest_sha256"
+        ),
+        "train600_manifest_sha256": _require_sha256(
+            frozen.get("train600_manifest_sha256"), "frozen Train600 SHA-256"
+        ),
         "trajectory_schedule_id": job.schedule_id,
         "trajectory_variant_id": frozen.get("trajectory_variant_id"),
         "trajectory_replica_id": frozen.get("trajectory_replica_id"),
@@ -124,7 +185,8 @@ def _repairable_row(
         )
 
 
-def _atomic_lines(path: Path, lines: Sequence[str]) -> None:
+def _stage_lines(path: Path, lines: Sequence[str]) -> tuple[Path, str]:
+    staged = path.with_name(path.name + ".provenance-repair.partial")
     with tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=path.parent, delete=False, newline=""
     ) as handle:
@@ -132,39 +194,48 @@ def _atomic_lines(path: Path, lines: Sequence[str]) -> None:
         handle.writelines(lines)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    os.replace(temporary, staged)
+    return staged, file_sha256(staged)
+
+
+def _intent_path(output_audit_path: Path) -> Path:
+    return output_audit_path.with_name(output_audit_path.stem + "_intent.json")
 
 
 def _validate_existing_report(
     report: Mapping[str, Any], *, plan_path: Path, failed_audit_path: Path
 ) -> None:
+    repairs = report.get("repairs")
+    files = report.get("files")
     if (
-        report.get("status") != "passed"
+        report.get("schema_version") != 1
+        or report.get("kind") != "fast_hybrid_teacher_repaired_audit"
+        or report.get("status") != "passed"
         or report.get("source_plan_sha256") != file_sha256(plan_path)
         or report.get("source_failed_audit_sha256") != file_sha256(failed_audit_path)
         or report.get("issues")
+        or not isinstance(repairs, list)
+        or not repairs
+        or int(report.get("repaired_rows", -1)) != len(repairs)
+        or not isinstance(files, list)
+        or not files
     ):
         raise RuntimeError("existing repaired audit does not match immutable inputs")
-    for item in report.get("files", []):
+    intent_path = Path(str(report.get("repair_intent") or ""))
+    if (
+        not intent_path.is_file()
+        or file_sha256(intent_path) != report.get("repair_intent_sha256")
+    ):
+        raise RuntimeError("existing repaired audit has a missing or changed intent")
+    for item in files:
+        if not isinstance(item, Mapping):
+            raise RuntimeError("existing repaired audit has an invalid file entry")
         path = Path(str(item.get("path") or ""))
         if not path.is_file() or file_sha256(path) != item.get("after_sha256"):
             raise RuntimeError(f"repaired Teacher result changed after audit: {path}")
 
 
-def repair_teacher_provenance(
-    *, plan_path: Path, failed_audit_path: Path, output_audit_path: Path
-) -> dict[str, Any]:
-    """Repair strictly eligible rows and freeze a separately named passed audit."""
-
-    if output_audit_path.exists():
-        report = _load_object(output_audit_path, "repaired Teacher audit")
-        _validate_existing_report(
-            report, plan_path=plan_path, failed_audit_path=failed_audit_path
-        )
-        return report
-
-    plan = _load_object(plan_path, "Teacher plan")
-    failed = _load_object(failed_audit_path, "failed Teacher audit")
+def _validate_failed_audit(failed: Mapping[str, Any]) -> set[str]:
     if (
         failed.get("status") != "failed"
         or not isinstance(failed.get("issues"), list)
@@ -176,20 +247,106 @@ def repair_teacher_provenance(
         )
     ):
         raise RuntimeError("source audit is not an exclusively provenance-failed audit")
+    return {str(issue.get("job_id") or "") for issue in failed["issues"]}
 
+
+def _validate_intent(
+    intent: Mapping[str, Any], *, plan_path: Path, failed_audit_path: Path
+) -> None:
+    if (
+        intent.get("schema_version") != 1
+        or intent.get("kind") != "fast_hybrid_teacher_provenance_repair_intent"
+        or intent.get("source_plan_sha256") != file_sha256(plan_path)
+        or intent.get("source_failed_audit_sha256") != file_sha256(failed_audit_path)
+        or not isinstance(intent.get("repairs"), list)
+        or not intent["repairs"]
+        or not isinstance(intent.get("files"), list)
+        or not intent["files"]
+    ):
+        raise RuntimeError("repair intent does not match immutable inputs")
+
+
+def _apply_intent(
+    intent: Mapping[str, Any], *, jobs: Sequence[TeacherJob], output_audit_path: Path
+) -> dict[str, Any]:
+    for item in intent["files"]:
+        if not isinstance(item, Mapping):
+            raise RuntimeError("repair intent has an invalid file entry")
+        path = Path(str(item.get("path") or ""))
+        staged = Path(str(item.get("staged_path") or ""))
+        before_sha = str(item.get("before_sha256") or "")
+        after_sha = str(item.get("after_sha256") or "")
+        current_sha = file_sha256(path)
+        if current_sha == after_sha:
+            continue
+        if current_sha != before_sha:
+            raise RuntimeError(f"Teacher result changed during provenance repair: {path}")
+        if not staged.is_file() or file_sha256(staged) != after_sha:
+            raise RuntimeError(f"staged provenance repair is missing or changed: {staged}")
+        os.replace(staged, path)
+
+    audit = audit_outputs(jobs)
+    if audit.get("status") != "passed":
+        raise RuntimeError(f"Teacher audit still fails after repair: {audit['issues'][:3]}")
+    intent_path = Path(str(intent["repair_intent"]))
+    report = {
+        "schema_version": 1,
+        "kind": "fast_hybrid_teacher_repaired_audit",
+        **audit,
+        "source_plan": intent["source_plan"],
+        "source_plan_sha256": intent["source_plan_sha256"],
+        "source_failed_audit": intent["source_failed_audit"],
+        "source_failed_audit_sha256": intent["source_failed_audit_sha256"],
+        "repair_intent": str(intent_path),
+        "repair_intent_sha256": file_sha256(intent_path),
+        "repair_policy": "timeout_rows_provenance_only_v2",
+        "repaired_rows": len(intent["repairs"]),
+        "repairs": intent["repairs"],
+        "files": intent["files"],
+    }
+    freeze_json(output_audit_path, report)
+    for item in intent["files"]:
+        staged = Path(str(item.get("staged_path") or ""))
+        if staged.is_file():
+            staged.unlink()
+    return report
+
+
+def repair_teacher_provenance(
+    *, plan_path: Path, failed_audit_path: Path, output_audit_path: Path
+) -> dict[str, Any]:
+    """Repair strictly eligible rows and freeze a separately named passed audit."""
+
+    plan = _load_object(plan_path, "Teacher plan")
+    failed = _load_object(failed_audit_path, "failed Teacher audit")
     jobs = _jobs_from_plan(plan)
-    issue_jobs = {str(issue.get("job_id") or "") for issue in failed["issues"]}
+    issue_jobs = _validate_failed_audit(failed)
     known_jobs = {job.job_id for job in jobs}
     if not issue_jobs or not issue_jobs <= known_jobs:
         raise RuntimeError("source audit refers to unknown Teacher jobs")
 
+    if output_audit_path.exists():
+        report = _load_object(output_audit_path, "repaired Teacher audit")
+        _validate_existing_report(
+            report, plan_path=plan_path, failed_audit_path=failed_audit_path
+        )
+        if audit_outputs(jobs).get("status") != "passed":
+            raise RuntimeError("current Teacher results no longer pass repaired audit")
+        return report
+
+    intent_path = _intent_path(output_audit_path)
+    if intent_path.exists():
+        intent = _load_object(intent_path, "Teacher provenance repair intent")
+        _validate_intent(
+            intent, plan_path=plan_path, failed_audit_path=failed_audit_path
+        )
+        return _apply_intent(intent, jobs=jobs, output_audit_path=output_audit_path)
+
     repair_items: list[dict[str, Any]] = []
     changed_files: list[dict[str, Any]] = []
     for job in jobs:
-        if job.job_id not in issue_jobs:
-            continue
-        frozen = _frozen_inputs(job)
-        expected = _expected_fields(job, frozen)
+        frozen = _frozen_inputs(job, plan) if job.job_id in issue_jobs else None
+        expected = _expected_fields(job, frozen) if frozen is not None else None
         before_sha = file_sha256(job.output_path)
         lines = job.output_path.read_text(encoding="utf-8").splitlines(keepends=True)
         seen: set[str] = set()
@@ -202,62 +359,75 @@ def repair_teacher_provenance(
             if not sample_id or sample_id in seen:
                 raise ValueError(f"{job.output_path} has duplicate/empty sample_id")
             seen.add(sample_id)
-            if not _row_needs_repair(row, expected):
-                continue
-            _repairable_row(row, job=job, frozen=frozen)
-            added: list[str] = []
-            for key, value in expected.items():
-                current = row.get(key)
-                if current not in (None, value):
-                    raise RuntimeError(
-                        f"refusing conflicting provenance repair: "
-                        f"{job.job_id}/{sample_id}/{key}"
-                    )
-                if current != value:
-                    row[key] = value
-                    added.append(key)
-            lines[index] = json.dumps(row, ensure_ascii=False) + "\n"
-            repair_items.append(
-                {
-                    "job_id": job.job_id,
-                    "sample_id": sample_id,
-                    "error_type": row.get("error_type"),
-                    "added_fields": sorted(added),
-                }
+            mismatch = (
+                row.get("scoring_deferred") is not True
+                or row.get("trajectory_schedule_id") != job.schedule_id
+                or int(row.get("generation_seed", -1)) != job.planner_seed
+                or row.get("manifest_sha256") != job.active_manifest_sha256
+                or int(row.get("candidate_rerun", -1)) != 0
             )
-            changed = True
+            if mismatch:
+                if expected is None or frozen is None:
+                    raise RuntimeError(
+                        f"unreported Teacher provenance mismatch: {job.job_id}/{sample_id}"
+                    )
+                _repairable_row(row, job=job, frozen=frozen)
+                added: list[str] = []
+                for key, value in expected.items():
+                    current = row.get(key)
+                    if current not in (None, value):
+                        raise RuntimeError(
+                            f"refusing conflicting provenance repair: "
+                            f"{job.job_id}/{sample_id}/{key}"
+                        )
+                    if current != value:
+                        row[key] = value
+                        added.append(key)
+                if _row_needs_repair(row, expected):
+                    raise RuntimeError(
+                        f"provenance repair remained incomplete: {job.job_id}/{sample_id}"
+                    )
+                lines[index] = json.dumps(row, ensure_ascii=False) + "\n"
+                repair_items.append(
+                    {
+                        "job_id": job.job_id,
+                        "sample_id": sample_id,
+                        "error_type": row.get("error_type"),
+                        "added_fields": sorted(added),
+                    }
+                )
+                changed = True
         if seen != set(job.expected_ids):
             raise RuntimeError(f"Teacher result coverage mismatch: {job.job_id}")
         if changed:
-            _atomic_lines(job.output_path, lines)
+            staged, after_sha = _stage_lines(job.output_path, lines)
             changed_files.append(
                 {
                     "path": str(job.output_path),
                     "before_sha256": before_sha,
-                    "after_sha256": file_sha256(job.output_path),
+                    "after_sha256": after_sha,
+                    "staged_path": str(staged),
                 }
             )
 
     if not repair_items:
         raise RuntimeError("failed audit contained no strictly repairable rows")
-    audit = audit_outputs(jobs)
-    if audit.get("status") != "passed":
-        raise RuntimeError(f"Teacher audit still fails after repair: {audit['issues'][:3]}")
-    report = {
+    if {item["job_id"] for item in repair_items} != issue_jobs:
+        raise RuntimeError("failed audit job set differs from full repair preflight")
+    intent = {
         "schema_version": 1,
-        "kind": "fast_hybrid_teacher_repaired_audit",
-        **audit,
+        "kind": "fast_hybrid_teacher_provenance_repair_intent",
         "source_plan": str(plan_path),
         "source_plan_sha256": file_sha256(plan_path),
         "source_failed_audit": str(failed_audit_path),
         "source_failed_audit_sha256": file_sha256(failed_audit_path),
-        "repair_policy": "timeout_rows_provenance_only_v1",
-        "repaired_rows": len(repair_items),
+        "repair_intent": str(intent_path),
+        "repair_policy": "timeout_rows_provenance_only_v2",
         "repairs": repair_items,
         "files": changed_files,
     }
-    freeze_json(output_audit_path, report)
-    return report
+    freeze_json(intent_path, intent)
+    return _apply_intent(intent, jobs=jobs, output_audit_path=output_audit_path)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

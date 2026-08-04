@@ -60,6 +60,12 @@ repair_teacher_audit_once() {
 teacher_audit_passed() {
   local audit=$1
   [[ -f "$audit" ]] || return 1
+  if [[ "$audit" == *_repaired_audit.json ]]; then
+    local stem=${audit%_repaired_audit.json}
+    "$PYTHON" scripts/repair_fast_hybrid_teacher_provenance.py \
+      --plan "${stem}.json" --failed-audit "${stem}_audit.json" \
+      --output-audit "$audit" >/dev/null || return 1
+  fi
   "$PYTHON" - "$audit" <<'PY' >/dev/null
 import json, sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
@@ -118,6 +124,10 @@ while ! teacher_audit_passed "$(teacher_audit_path)"; do
   fi
   if repair_teacher_audit_once; then
     continue
+  fi
+  if [[ -f "$(teacher_audit_path)" ]]; then
+    echo "existing Teacher audit could not be safely repaired; refusing plan rebuild" >&2
+    exit 1
   fi
   echo "base Teacher exited without a passed audit; resuming missing work once" >&2
   resume_base_teacher_once

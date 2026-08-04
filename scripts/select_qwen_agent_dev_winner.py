@@ -13,6 +13,7 @@ from flashvid_eval.qwen_dev_selection import (
     load_protocol_smoke_rejection,
     write_frozen_json,
 )
+from flashvid_eval.qwen_plan_index import file_sha256, load_selection_plan_index
 
 
 def main() -> None:
@@ -20,6 +21,11 @@ def main() -> None:
         description="Summarize frozen Qwen Dev runs and freeze a promotion-gated winner."
     )
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--selection-plan-index",
+        type=Path,
+        help="Frozen canonical allowlist of Dev run plans and protocol rejections.",
+    )
     parser.add_argument("--run-plan", type=Path, action="append", default=[])
     parser.add_argument(
         "--run-plan-dir",
@@ -41,25 +47,51 @@ def main() -> None:
     parser.add_argument("--winner-output", type=Path, required=True)
     args = parser.parse_args()
 
-    plan_paths = list(args.run_plan)
-    for directory in args.run_plan_dir:
-        if not directory.is_dir():
-            raise FileNotFoundError(directory)
-        for prefix in ("protocol_audit", "direct_dev", "agent_dev"):
-            plan_paths.extend(directory.rglob(f"{prefix}*.json"))
-    unique_plans = sorted({path.resolve() for path in plan_paths})
-    if not unique_plans:
-        parser.error("at least one --run-plan or --run-plan-dir is required")
-
     config = json.loads(args.config.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
         raise ValueError("experiment config must be a JSON object")
     config_hash = canonical_sha256(config)
+    legacy_inputs_used = bool(
+        args.run_plan or args.run_plan_dir or args.reject_q4_think_from_smoke
+    )
+    if args.selection_plan_index is not None and legacy_inputs_used:
+        parser.error(
+            "--selection-plan-index is mutually exclusive with --run-plan, "
+            "--run-plan-dir, and --reject-q4-think-from-smoke"
+        )
+
+    rejection_path = args.reject_q4_think_from_smoke
+    selection_index_reference = None
+    if args.selection_plan_index is not None:
+        index = load_selection_plan_index(args.selection_plan_index, config_hash)
+        selection_index_reference = {
+            "path": str(args.selection_plan_index.resolve()),
+            "sha256": file_sha256(args.selection_plan_index),
+            "index_sha256": index["index_sha256"],
+        }
+        unique_plans = [Path(str(item["path"])) for item in index["run_plans"]]
+        rejection = index.get("q4_think_smoke_rejection")
+        rejection_path = (
+            Path(str(rejection["path"])) if isinstance(rejection, dict) else None
+        )
+    else:
+        plan_paths = list(args.run_plan)
+        for directory in args.run_plan_dir:
+            if not directory.is_dir():
+                raise FileNotFoundError(directory)
+            for prefix in ("protocol_audit", "direct_dev", "agent_dev"):
+                plan_paths.extend(directory.rglob(f"{prefix}*.json"))
+        unique_plans = sorted({path.resolve() for path in plan_paths})
+        if not unique_plans:
+            parser.error(
+                "--selection-plan-index or at least one --run-plan/--run-plan-dir is required"
+            )
+
     runs = load_dev_runs(unique_plans, config_hash)
     protocol_rejections = {}
-    if args.reject_q4_think_from_smoke is not None:
+    if rejection_path is not None:
         evidence = load_protocol_smoke_rejection(
-            args.reject_q4_think_from_smoke,
+            rejection_path,
             config_hash,
             model_key="q4",
             protocol="think",
@@ -71,6 +103,10 @@ def main() -> None:
         teacher_model_key=args.teacher_model_key,
         protocol_rejections=protocol_rejections,
     )
+    if selection_index_reference is not None:
+        report.pop("selection_state_sha256", None)
+        report["selection_plan_index"] = selection_index_reference
+        report["selection_state_sha256"] = canonical_sha256(report)
     report_sha = write_frozen_json(args.summary_output, report)
     if report["status"] != "passed":
         print(
@@ -91,6 +127,8 @@ def main() -> None:
         report_path=args.summary_output,
         report_sha256=report_sha,
     )
+    if selection_index_reference is not None:
+        winner["selection_plan_index"] = selection_index_reference
     winner_sha = write_frozen_json(args.winner_output, winner)
     print(
         json.dumps(

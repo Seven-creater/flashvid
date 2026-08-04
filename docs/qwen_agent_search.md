@@ -117,12 +117,32 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 4. `a3_hierarchical_search`
 5. `a4_independent_arbitration`
 
-全部完成后冻结 q9 winner：
+全部完成后先冻结唯一的 run-plan allowlist。不要对运行目录做 glob；恢复计划和原计划
+可能包含相同逻辑任务，显式索引会在写入前拒绝这种重复。Q4 thinking 在 smoke 被拒绝的
+证据也放进同一个索引，避免选择时漏传：
+
+```bash
+$PYTHON_BIN scripts/freeze_qwen_selection_plan_index.py \
+  --config configs/experiments/qwen_agent_search.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/protocol_audit_q9.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/protocol_audit_q4_no_think.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/direct_dev_q9_no_think.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/direct_dev_q4_no_think.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/agent_dev_q9_no_think_a0_eva_clean_all.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/agent_dev_q9_no_think_a1_storyboard_zoom_all.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/agent_dev_q9_no_think_a2_multi_clue_memory_all.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/agent_dev_q9_no_think_a3_hierarchical_search_all.json \
+  --run-plan results/eval/qwen_agent_search/run_plans/agent_dev_q9_no_think_a4_independent_arbitration_all.json \
+  --reject-q4-think-from-smoke results/eval/qwen_agent_search/run_plans/protocol_smoke_q4.json \
+  --output results/eval/qwen_agent_search/frozen/q9_dev_selection_plan_index.json
+```
+
+随后仅从该索引冻结 q9 winner：
 
 ```bash
 $PYTHON_BIN scripts/select_qwen_agent_dev_winner.py \
   --config configs/experiments/qwen_agent_search.json \
-  --run-plan-dir results/eval/qwen_agent_search/run_plans \
+  --selection-plan-index results/eval/qwen_agent_search/frozen/q9_dev_selection_plan_index.json \
   --teacher-model-key q9 \
   --summary-output results/eval/qwen_agent_search/frozen/q9_dev_selection.json \
   --winner-output results/eval/qwen_agent_search/frozen/q9_agent_winner.json

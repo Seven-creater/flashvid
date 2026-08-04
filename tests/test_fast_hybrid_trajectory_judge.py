@@ -12,6 +12,7 @@ from flashvid_eval.client import ChatResult
 from flashvid_eval.fast_hybrid_trajectory_judge import (
     FastHybridTrajectoryJudge,
     TrajectoryJudgeConfig,
+    _question_and_choices_prompt,
     bind_trajectory_jobs,
 )
 from flashvid_eval.privacy import AnnotationLeakError
@@ -98,7 +99,10 @@ def _spec() -> dict[str, Any]:
 
 
 def _trajectory(frame_paths: list[Path]) -> dict[str, Any]:
-    question = "Question: What colour is the car?\nA: red\nB: blue\nC: green"
+    question = (
+        "Video Length: 694 seconds. Original video resolution: 480p. "
+        "Question: What colour is the car?\nA: red\nB: blue\nC: green"
+    )
     return {
         "dataset": "lvbench",
         "sample_id": "sample-1",
@@ -195,6 +199,8 @@ def test_judges_same_frames_candidate_blind_and_merges_provenance(tmp_path: Path
     assert all(call["temperature"] == pytest.approx(0.2) for call in client.calls)
 
     serialized = json.dumps(client.calls, ensure_ascii=False)
+    assert "Video Length" not in serialized
+    assert "Original video resolution" not in serialized
     assert "Direct candidate" not in serialized
     assert "PRIVATE_CANDIDATE_EXPLANATION" not in serialized
     assert "final_prediction" not in serialized
@@ -204,6 +210,21 @@ def test_judges_same_frames_candidate_blind_and_merges_provenance(tmp_path: Path
         is False
         for call in client.calls
     )
+
+
+def test_question_recovery_rejects_unsafe_prefix(tmp_path: Path) -> None:
+    trajectory = _trajectory(_frames(tmp_path))
+    unsafe = (
+        "Direct candidate: A. "
+        "Question: What colour is the car?\nA: red\nB: blue\nC: green"
+    )
+    trajectory["request_trace"][0]["messages"][1]["content"] = unsafe
+    trajectory["conversation_traces"][0]["messages"][1]["content"] = unsafe
+
+    with pytest.raises(
+        ValueError, match="deferred trajectory has no public question/choices prompt"
+    ):
+        _question_and_choices_prompt(trajectory)
 
 
 def test_strict_json_parse_failure_is_not_fallback(tmp_path: Path) -> None:

@@ -27,6 +27,10 @@ from .qwen_protocol import mcq_answer_response_format, parse_strict_json_mcq_ans
 
 JUDGE_SEEDS = (17, 42, 73)
 _OPTION_RE = re.compile(r"(?m)^([A-H]):\s+\S")
+_EVA_PUBLIC_METADATA_RE = re.compile(
+    r"\AVideo Length:\s*\d+(?:\.\d+)?\s*seconds\.\s*"
+    r"Original video resolution:\s*\d+(?:\.\d+)?p\.\s*\Z"
+)
 _PROVENANCE_FIELDS = (
     "schema_version",
     "phase",
@@ -105,11 +109,12 @@ class TrajectoryJudgeConfig:
     def fingerprint(self) -> str:
         return canonical_sha256(
             {
-                "runner": "fast_hybrid_trajectory_judge_v1",
+                "runner": "fast_hybrid_trajectory_judge_v2",
                 "config": asdict(self),
                 "system_prompt": _JUDGE_SYSTEM_PROMPT,
                 "answer_protocol": "strict_json_single_answer_v1",
-                "evidence_protocol": "reuse_selected_frames_without_replanning_v1",
+                "evidence_protocol": "reuse_selected_frames_without_replanning_v2",
+                "question_recovery_protocol": "strict_eva_public_metadata_v1",
             }
         )
 
@@ -172,8 +177,18 @@ def _question_and_choices_prompt(trajectory: Mapping[str, Any]) -> str:
             if not isinstance(message, Mapping) or message.get("role") != "user":
                 continue
             text = _as_text(message.get("content")).strip()
-            if text.startswith("Question:") and len(_OPTION_RE.findall(text)) >= 2:
-                candidates.append(text)
+            question_index = text.find("Question:")
+            if question_index < 0:
+                continue
+            prefix = text[:question_index]
+            # Official EVA prepends only public video duration/resolution metadata.
+            # Accept that exact shape (or no prefix), but reject arbitrary text so a
+            # candidate hint can never be stripped and silently sent to the Judge.
+            if prefix and _EVA_PUBLIC_METADATA_RE.fullmatch(prefix) is None:
+                continue
+            public_prompt = text[question_index:].strip()
+            if len(_OPTION_RE.findall(public_prompt)) >= 2:
+                candidates.append(public_prompt)
     if not candidates:
         raise ValueError("deferred trajectory has no public question/choices prompt")
     # Later official-EVA turns repeat the same initial prompt.  Reject genuinely

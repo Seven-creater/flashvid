@@ -47,6 +47,24 @@ class _MissingVisualUsageEvaluator(_DeferredEvaluator):
         return result
 
 
+class _TimeoutEvaluator(_DeferredEvaluator):
+    def static_audit_fields(self) -> dict:
+        return {
+            "experiment_config_sha256": "e" * 64,
+            "model_artifact_sha256": "m" * 64,
+            "manifest_sha256": "d" * 64,
+            "train600_manifest_sha256": "t" * 64,
+            "trajectory_schedule_id": "budget_006000_seed_17",
+            "trajectory_variant_id": "base",
+            "trajectory_replica_id": 0,
+            "generation_seed": 17,
+            "scoring_deferred": True,
+        }
+
+    def fast_hybrid_eva(self, sample: Sample, candidate: str | None) -> dict:
+        raise TimeoutError("timed out")
+
+
 def _sample() -> Sample:
     return Sample(
         dataset="lsdbench",
@@ -165,3 +183,24 @@ def test_deferred_fast_hybrid_fails_closed_on_backend_annotation(tmp_path: Path)
             candidate_answers={"sample-1": "A"},
             defer_scoring=True,
         )
+
+
+def test_exception_row_keeps_frozen_trajectory_provenance(tmp_path: Path) -> None:
+    evaluate(
+        [_sample()],
+        _TimeoutEvaluator(),
+        "fast_hybrid_eva",
+        tmp_path,
+        candidate_answers={"sample-1": "A"},
+        defer_scoring=True,
+    )
+
+    row = json.loads((tmp_path / "lsdbench_fast_hybrid_eva.jsonl").read_text())
+    assert row["error"] == "TimeoutError: timed out"
+    assert row["prediction"] == "A"
+    assert row["annotation_leak_check"] == "not_run"
+    assert row["trajectory_schedule_id"] == "budget_006000_seed_17"
+    assert row["generation_seed"] == 17
+    assert row["manifest_sha256"] == "d" * 64
+    assert row["train600_manifest_sha256"] == "t" * 64
+    assert row["candidate_rerun"] == 0

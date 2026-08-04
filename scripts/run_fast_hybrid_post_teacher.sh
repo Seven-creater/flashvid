@@ -127,6 +127,10 @@ test "$(wc -l < "$BASE_SPECS")" -eq 7200
 test "$(wc -l "${BASE_RAW[@]}" | tail -n 1 | awk '{print $1}')" -eq 7200
 BASE_SPEC_SHA=$(sha256sum "$BASE_SPECS" | awk '{print $1}')
 TEACHER_AUDIT="$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}_audit.json"
+REPAIRED_TEACHER_AUDIT="$ROOT/run_plans/teacher_${BASE_SPEC_SHA:0:12}_repaired_audit.json"
+if [[ -f "$REPAIRED_TEACHER_AUDIT" ]]; then
+  TEACHER_AUDIT="$REPAIRED_TEACHER_AUDIT"
+fi
 "$PYTHON" - "$TEACHER_AUDIT" <<'PY'
 import json, sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))

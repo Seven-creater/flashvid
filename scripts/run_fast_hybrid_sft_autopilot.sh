@@ -37,7 +37,24 @@ trap cleanup EXIT
 teacher_audit_path() {
   local specs_sha
   specs_sha=$(sha256sum "$BASE_SPECS" | awk '{print $1}')
-  printf '%s/run_plans/teacher_%s_audit.json\n' "$ROOT" "${specs_sha:0:12}"
+  local repaired="$ROOT/run_plans/teacher_${specs_sha:0:12}_repaired_audit.json"
+  if [[ -f "$repaired" ]]; then
+    printf '%s\n' "$repaired"
+  else
+    printf '%s/run_plans/teacher_%s_audit.json\n' "$ROOT" "${specs_sha:0:12}"
+  fi
+}
+
+repair_teacher_audit_once() {
+  local specs_sha stem plan failed repaired
+  specs_sha=$(sha256sum "$BASE_SPECS" | awk '{print $1}')
+  stem="teacher_${specs_sha:0:12}"
+  plan="$ROOT/run_plans/${stem}.json"
+  failed="$ROOT/run_plans/${stem}_audit.json"
+  repaired="$ROOT/run_plans/${stem}_repaired_audit.json"
+  [[ -f "$plan" && -f "$failed" ]] || return 1
+  "$PYTHON" scripts/repair_fast_hybrid_teacher_provenance.py \
+    --plan "$plan" --failed-audit "$failed" --output-audit "$repaired"
 }
 
 teacher_audit_passed() {
@@ -94,15 +111,17 @@ resume_base_teacher_once() {
 CURRENT_STAGE=wait_base_teacher
 mark_stage "$CURRENT_STAGE" started
 [[ -f "$BASE_SPECS" ]] || { echo "base Teacher plan is missing: $BASE_SPECS" >&2; exit 1; }
-TEACHER_AUDIT=$(teacher_audit_path)
-while ! teacher_audit_passed "$TEACHER_AUDIT"; do
+while ! teacher_audit_passed "$(teacher_audit_path)"; do
   if teacher_running; then
     sleep 60
     continue
   fi
+  if repair_teacher_audit_once; then
+    continue
+  fi
   echo "base Teacher exited without a passed audit; resuming missing work once" >&2
   resume_base_teacher_once
-  teacher_audit_passed "$TEACHER_AUDIT" || {
+  teacher_audit_passed "$(teacher_audit_path)" || {
     echo "base Teacher audit is still incomplete after the bounded resume" >&2
     exit 1
   }

@@ -17,6 +17,9 @@ def test_autopilot_is_one_shot_resumable_and_bounded() -> None:
     assert "teacher_audit_passed" in text
     assert "sleep 60" in text
     assert "resume_base_teacher_once" in text
+    assert "repair_teacher_audit_once" in text
+    assert "repair_fast_hybrid_teacher_provenance.py" in text
+    assert "_repaired_audit.json" in text
     assert "TEACHER_CODE_PROJECT_DIR" in text
     assert '"$TEACHER_CODE_PROJECT_DIR/scripts/launch_fast_hybrid_teacher_matrix.py"' in text
     assert '--repo-root "$TEACHER_CODE_PROJECT_DIR"' in text
@@ -103,6 +106,7 @@ def test_new_python_clis_are_directly_executable() -> None:
         "scripts/summarize_fast_hybrid_sft.py",
         "scripts/extract_hf_mirror_zip_member.py",
         "scripts/repair_direct_candidate_file.py",
+        "scripts/repair_fast_hybrid_teacher_provenance.py",
     ):
         subprocess.run(
             [sys.executable, path, "--help"],

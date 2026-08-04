@@ -186,7 +186,7 @@ $PYTHON_BIN scripts/build_qwen_agent_sft.py \
   --output-dir results/eval/qwen_agent_search/trajectories/counterfactual_specs
 ```
 
-按三个数据集分别运行 `run_qwen_counterfactuals.py` 后，再次调用 `collect_qwen_sft_inputs.py`，为每个反事实 JSONL 增加一个 `--counterfactual` 参数。然后用新 bundle 运行 `build_qwen_agent_sft.py --phase select`。bundle 会校验实验配置、run plan、所有轨迹文件、Train600、三个 Train200、9B artifact、Agent config 和 runner fingerprint；任一文件或哈希变化都会拒绝构建或续跑。
+按三个数据集分别通过 `launch_qwen_counterfactuals.sh` 启动 `run_qwen_counterfactuals.py` 参数；启动器强制 `setsid + nohup + --resume`、单请求 80 秒和 90 秒结果停滞保护。完成后再次调用 `collect_qwen_sft_inputs.py`，为每个反事实 JSONL 增加一个 `--counterfactual` 参数。然后用新 bundle 运行 `build_qwen_agent_sft.py --phase select`。bundle 会校验实验配置、run plan、所有轨迹文件、Train600、三个 Train200、9B artifact、Agent config 和 runner fingerprint；任一文件或哈希变化都会拒绝构建或续跑。
 
 训练前 GPU 4–7 必须全部空闲：
 

@@ -3,6 +3,8 @@ set -euo pipefail
 
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PYTHON_BIN=${PYTHON_BIN:-$PROJECT_DIR/.venv/bin/python}
+QWEN_STALL_TIMEOUT_S=${QWEN_STALL_TIMEOUT_S:-90}
+QWEN_WATCH_ROOT=${QWEN_WATCH_ROOT:-$PROJECT_DIR/results/eval/qwen_agent_search}
 
 usage() {
   echo "usage: $0 CONFIG PHASE MODEL_GROUP [run_qwen_agent_search.py args ...]" >&2
@@ -56,9 +58,20 @@ else
 fi
 args+=("$@")
 
+launch_args=("${args[@]}")
+if [[ "$QWEN_STALL_TIMEOUT_S" != "0" ]]; then
+  launch_args=(
+    "$PYTHON_BIN" "$PROJECT_DIR/scripts/run_with_progress_watchdog.py"
+    --watch-root "$QWEN_WATCH_ROOT"
+    --stall-seconds "$QWEN_STALL_TIMEOUT_S"
+    --
+    "${args[@]}"
+  )
+fi
+
 cd "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
-setsid nohup "${args[@]}" >>"$LOG_FILE" 2>&1 < /dev/null &
+setsid nohup "${launch_args[@]}" >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
-echo "started phase=$PHASE model=$MODEL_KEY pid=$pid log=$LOG_FILE"
+echo "started phase=$PHASE model=$MODEL_KEY pid=$pid stall_timeout_s=$QWEN_STALL_TIMEOUT_S log=$LOG_FILE"

@@ -16,6 +16,7 @@ from flashvid_eval.qwen_sft import (
     canonical_sha256,
     generate_counterfactual_specs,
     load_training_manifest,
+    load_trajectory_input_bundle,
     read_jsonl,
     select_stable_correct_trajectories,
     sha256_file,
@@ -81,55 +82,7 @@ def _summary_name(phase: str) -> str:
 def _load_input_bundle(
     path: Path, config_sha256: str
 ) -> tuple[list[Path], ExpectedTrajectoryProvenance]:
-    bundle = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(bundle, dict) or bundle.get("schema_version") != 1:
-        raise ValueError("input bundle must be a schema-v1 object")
-    claimed = str(bundle.get("bundle_sha256") or "")
-    computed = canonical_sha256(
-        {key: value for key, value in bundle.items() if key != "bundle_sha256"}
-    )
-    if claimed != computed:
-        raise RuntimeError("input bundle self-hash mismatch")
-    if bundle.get("config_sha256") != config_sha256:
-        raise RuntimeError("input bundle experiment config mismatch")
-
-    for field in ("config", "trajectory_run_plan"):
-        reference = bundle.get(field)
-        if not isinstance(reference, Mapping):
-            raise ValueError(f"input bundle has no {field} reference")
-        source_path = Path(str(reference.get("path") or ""))
-        if not source_path.is_file() or sha256_file(source_path) != reference.get(
-            "sha256"
-        ):
-            raise RuntimeError(f"bundled {field} changed: {source_path}")
-
-    trajectory_paths: list[Path] = []
-    for item in bundle.get("trajectory_files") or []:
-        if not isinstance(item, Mapping):
-            raise ValueError("bundled trajectory reference is not an object")
-        trajectory_path = Path(str(item.get("path") or ""))
-        if not trajectory_path.is_file() or sha256_file(trajectory_path) != item.get(
-            "sha256"
-        ):
-            raise RuntimeError(f"bundled trajectory file changed: {trajectory_path}")
-        trajectory_paths.append(trajectory_path)
-    provenance = bundle.get("expected_provenance")
-    if not trajectory_paths or not isinstance(provenance, Mapping):
-        raise ValueError("input bundle has no trajectories/provenance")
-    expected_provenance = ExpectedTrajectoryProvenance(
-        model=str(provenance.get("model") or ""),
-        model_artifact_sha256=str(provenance.get("model_artifact_sha256") or ""),
-        dataset_manifest_sha256s=frozenset(
-            provenance.get("dataset_manifest_sha256s") or []
-        ),
-        agent_config_sha256s=frozenset(
-            provenance.get("agent_config_sha256s") or []
-        ),
-        runner_fingerprints=frozenset(
-            provenance.get("runner_fingerprints") or []
-        ),
-    )
-    return trajectory_paths, expected_provenance
+    return load_trajectory_input_bundle(path, config_sha256)
 
 
 def _resume_or_refuse(
@@ -212,7 +165,9 @@ def build(
     selection_input = trajectories
     if phase == "counterfactuals":
         selection_input = [
-            row for row in trajectories if str(row.get("variant_id") or "base") == "base"
+            row
+            for row in trajectories
+            if str(row.get("variant_id") or "base") in {"base", "rescue"}
         ]
     selection = select_stable_correct_trajectories(
         selection_input,

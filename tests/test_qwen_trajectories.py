@@ -188,6 +188,32 @@ def test_trajectory_config_rejects_duplicate_judge_seeds() -> None:
         raise AssertionError("duplicate judge seeds were accepted")
 
 
+def test_rescue_trajectory_is_materialized_as_a_non_base_family() -> None:
+    trace = AgentTrace(
+        strategy="fake",
+        model="Qwen3.5-9B",
+        dataset="lvbench",
+        sample_id="sample-1",
+        prediction="B",
+        final_prediction="B",
+        annotation_leak_check="passed",
+    )
+    runner = _runner(trace, FakeClient(["B", "B", "B"]))
+    runner.config = TrajectoryGenerationConfig(
+        schedule_id="rescue_a4_dense_v1",
+        dataset_manifest_sha256="d" * 64,
+        train600_manifest_sha256="e" * 64,
+        experiment_config_sha256="c" * 64,
+        agent_config_sha256="a" * 64,
+        model_artifact_sha256="b" * 64,
+        variant_id="rescue",
+    )
+    row = runner.run(_sample())
+    assert row["variant_id"] == "rescue"
+    assert row["family_id"] == "rescue_a4_dense_v1~rescue"
+    assert row["trajectory_runner_fingerprint"] == runner.run_fingerprint()
+
+
 def test_fixed_evidence_replay_changes_only_the_frozen_frame_plan(
     tmp_path,
 ) -> None:

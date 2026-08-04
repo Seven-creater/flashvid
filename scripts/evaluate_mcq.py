@@ -586,6 +586,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--trajectory-replica-id", type=int, default=0)
+    parser.add_argument(
+        "--trajectory-variant-id",
+        default="base",
+        help=(
+            "Trajectory family variant. Normal 12-schedule generation uses 'base'; "
+            "the frozen dense A4 recovery path uses 'rescue'."
+        ),
+    )
     parser.add_argument("--candidate-results", type=Path)
     parser.add_argument(
         "--candidate-normalization-cache",
@@ -935,6 +943,10 @@ def main() -> None:
             raise ValueError("--trajectory-schedule-id requires --defer-scoring")
         if args.defer_scoring and args.trajectory_replica_id < 0:
             raise ValueError("trajectory-replica-id must be non-negative")
+        if args.defer_scoring and not args.trajectory_variant_id.strip():
+            raise ValueError("trajectory-variant-id cannot be empty")
+        if not args.defer_scoring and args.trajectory_variant_id != "base":
+            raise ValueError("non-base trajectory-variant-id requires --defer-scoring")
         if args.defer_scoring and args.expected_agent_config_sha256 is None:
             raise ValueError("--defer-scoring requires --expected-agent-config-sha256")
         if args.defer_scoring and args.train600_manifest_sha256 is None:
@@ -1004,6 +1016,7 @@ def main() -> None:
                     agent_config_sha256=agent_config_hash,
                     model_artifact_sha256=model_artifact_sha256,
                     replica_id=args.trajectory_replica_id,
+                    variant_id=args.trajectory_variant_id,
                 ),
             )
             result_adapter = None
@@ -1046,6 +1059,7 @@ def main() -> None:
                 "train600_manifest_sha256": train600_manifest_sha256,
                 "trajectory_schedule_id": schedule_id,
                 "trajectory_replica_id": args.trajectory_replica_id,
+                "trajectory_variant_id": args.trajectory_variant_id,
                 "agent_config": {
                     "path": str(args.agent_config.resolve()),
                     "sha256": agent_config_hash,

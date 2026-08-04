@@ -49,10 +49,13 @@ class TrajectoryGenerationConfig:
     model_artifact_sha256: str
     judge_seeds: tuple[int, ...] = (17, 42, 73)
     replica_id: int = 0
+    variant_id: str = "base"
 
     def __post_init__(self) -> None:
         if not self.schedule_id.strip():
             raise ValueError("schedule_id cannot be empty")
+        if not self.variant_id.strip():
+            raise ValueError("variant_id cannot be empty")
         if len(set(self.judge_seeds)) != len(self.judge_seeds) or not self.judge_seeds:
             raise ValueError("judge_seeds must be unique and non-empty")
         for name in (
@@ -119,6 +122,7 @@ class QwenTrajectoryRunner:
             manifest_sha256=self.config.train600_manifest_sha256,
             dataset_manifest_sha256=self.config.dataset_manifest_sha256,
             config_sha256=self.config.experiment_config_sha256,
+            variant_id=self.config.variant_id,
         )
         if trace.annotation_leak_check != "passed":
             row["judge_confirmations"] = []

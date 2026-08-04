@@ -69,6 +69,7 @@ def collect_bundle(
     config_path: Path,
     trajectory_plan: Path,
     counterfactual_paths: list[Path],
+    rescue_index_path: Path | None = None,
 ) -> dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -174,6 +175,127 @@ def collect_bundle(
     if task_counts != Counter({dataset: SCHEDULES_PER_DATASET for dataset in DATASETS}):
         raise ValueError(f"trajectory plan schedule distribution mismatch: {task_counts}")
 
+    all_dataset_hashes = set(dataset_hashes)
+    rescue_files = 0
+    if rescue_index_path is not None:
+        rescue = json.loads(rescue_index_path.read_text(encoding="utf-8"))
+        if not isinstance(rescue, dict) or rescue.get("schema_version") != 1:
+            raise ValueError("rescue index must be schema v1")
+        claimed = str(rescue.get("rescue_index_sha256") or "")
+        computed = canonical_sha256(
+            {key: value for key, value in rescue.items() if key != "rescue_index_sha256"}
+        )
+        if claimed != computed:
+            raise RuntimeError("rescue index self-hash mismatch")
+        config_ref = rescue.get("experiment_config")
+        base_ref = rescue.get("source_base_bundle")
+        if (
+            not isinstance(config_ref, Mapping)
+            or config_ref.get("canonical_sha256") != config_hash
+            or not isinstance(base_ref, Mapping)
+            or rescue.get("train600_manifest_sha256") != train600_hash
+            or rescue.get("model_artifact_sha256") != model_hash
+            or rescue.get("variant_id") != "rescue"
+        ):
+            raise RuntimeError("rescue index provenance mismatch")
+        base_bundle_path = Path(str(base_ref.get("path") or ""))
+        if not base_bundle_path.is_file() or sha256_file(base_bundle_path) != base_ref.get(
+            "sha256"
+        ):
+            raise RuntimeError("rescue source base bundle changed")
+        base_bundle = json.loads(base_bundle_path.read_text(encoding="utf-8"))
+        if base_bundle.get("bundle_sha256") != base_ref.get("bundle_sha256"):
+            raise RuntimeError("rescue source base bundle identity mismatch")
+        base_files = sorted(
+            base_bundle.get("trajectory_files") or [], key=lambda item: item["path"]
+        )
+        if base_files != sorted(trajectory_files, key=lambda item: item["path"]):
+            raise RuntimeError("rescue was discovered from a different base matrix")
+        rescue_agent = rescue.get("agent_config")
+        manifests = rescue.get("manifests")
+        if not isinstance(rescue_agent, Mapping) or not isinstance(manifests, Mapping):
+            raise ValueError("rescue index has no Agent/manifests")
+        rescue_agent_path = Path(str(rescue_agent.get("path") or ""))
+        rescue_agent_hash = _require_sha256(
+            rescue_agent.get("sha256"), "rescue Agent config"
+        )
+        if (
+            not rescue_agent_path.is_file()
+            or sha256_file(rescue_agent_path) != rescue_agent_hash
+        ):
+            raise RuntimeError("rescue Agent config changed")
+        for dataset in DATASETS:
+            manifest_ref = manifests.get(dataset)
+            if not isinstance(manifest_ref, Mapping):
+                raise ValueError(f"rescue index has no {dataset} manifest")
+            expected_rows = int(manifest_ref.get("count") or 0)
+            if expected_rows < 0:
+                raise ValueError(f"{dataset} rescue manifest count cannot be negative")
+            manifest_path = Path(str(manifest_ref.get("path") or ""))
+            manifest_hash = _require_sha256(
+                manifest_ref.get("sha256"), f"{dataset} rescue manifest"
+            )
+            if not manifest_path.is_file() or sha256_file(manifest_path) != manifest_hash:
+                raise RuntimeError(f"{dataset} rescue manifest changed")
+            manifest_ids = {
+                str(row.get("sample_id") or "")
+                for _, row in _read_rows(manifest_path)
+            }
+            if "" in manifest_ids or len(manifest_ids) != expected_rows:
+                raise ValueError(f"{dataset} rescue manifest count/ID mismatch")
+            if expected_rows == 0:
+                continue
+            output_dir = Path(str(manifest_ref.get("result_dir") or ""))
+            result_path = _one(output_dir, f"{dataset}_*.jsonl")
+            frozen_path = _one(output_dir, f"frozen_inputs_{dataset}_*.json")
+            frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+            runner_hash = _require_sha256(
+                frozen.get("run_fingerprint"), "rescue runner fingerprint"
+            )
+            if (
+                frozen.get("dataset") != dataset
+                or frozen.get("manifest", {}).get("sha256") != manifest_hash
+                or frozen.get("model") != "Qwen3.5-9B"
+                or frozen.get("model_artifact_sha256") != model_hash
+                or frozen.get("experiment_config_sha256") != config_hash
+                or frozen.get("scoring_deferred") is not True
+                or frozen.get("train600_manifest_sha256") != train600_hash
+                or frozen.get("trajectory_schedule_id") != rescue.get("schedule_id")
+                or frozen.get("trajectory_variant_id") != "rescue"
+                or frozen.get("agent_config", {}).get("sha256") != rescue_agent_hash
+            ):
+                raise RuntimeError(f"rescue frozen-input mismatch: {frozen_path}")
+            seen_samples: set[str] = set()
+            for line_number, row in _read_rows(result_path):
+                assert_deferred_result_public(row)
+                sample_id = str(row.get("sample_id") or "")
+                if not sample_id or sample_id in seen_samples:
+                    raise ValueError(
+                        f"{result_path}:{line_number}: duplicate/empty rescue sample"
+                    )
+                seen_samples.add(sample_id)
+                if (
+                    row.get("variant_id") != "rescue"
+                    or row.get("trajectory_runner_fingerprint") != runner_hash
+                    or row.get("runner_fingerprint") != runner_hash
+                    or row.get("dataset_manifest_sha256") != manifest_hash
+                    or row.get("train600_manifest_sha256") != train600_hash
+                    or row.get("manifest_sha256") != train600_hash
+                    or row.get("agent_config_sha256") != rescue_agent_hash
+                    or row.get("model_artifact_sha256") != model_hash
+                    or row.get("scoring_deferred") is not True
+                ):
+                    raise RuntimeError(f"{result_path}:{line_number}: rescue provenance mismatch")
+            if seen_samples != manifest_ids:
+                raise ValueError(f"{dataset} rescue result coverage mismatch")
+            trajectory_files.append(
+                {"path": str(result_path.resolve()), "sha256": sha256_file(result_path)}
+            )
+            all_dataset_hashes.add(manifest_hash)
+            agent_hashes.add(rescue_agent_hash)
+            runner_hashes.add(runner_hash)
+            rescue_files += 1
+
     for path in counterfactual_paths:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -191,7 +313,7 @@ def collect_bundle(
         )
         if (
             dataset not in DATASETS
-            or dataset_hash not in dataset_hashes
+            or dataset_hash not in all_dataset_hashes
             or frozen.get("train600_manifest_sha256") != train600_hash
             or frozen.get("model") != "Qwen3.5-9B"
             or frozen.get("model_artifact_sha256") != model_hash
@@ -240,11 +362,12 @@ def collect_bundle(
             "plan_sha256": plan["plan_sha256"],
         },
         "counterfactual_files": len(counterfactual_paths),
+        "rescue_files": rescue_files,
         "trajectory_files": sorted(trajectory_files, key=lambda item: item["path"]),
         "expected_provenance": {
             "model": "Qwen3.5-9B",
             "model_artifact_sha256": model_hash,
-            "dataset_manifest_sha256s": sorted(dataset_hashes),
+            "dataset_manifest_sha256s": sorted(all_dataset_hashes),
             "agent_config_sha256s": sorted(agent_hashes),
             "runner_fingerprints": sorted(runner_hashes),
         },
@@ -260,12 +383,14 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--trajectory-run-plan", type=Path, required=True)
     parser.add_argument("--counterfactual", type=Path, action="append", default=[])
+    parser.add_argument("--rescue-index", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     bundle = collect_bundle(
         config_path=args.config,
         trajectory_plan=args.trajectory_run_plan,
         counterfactual_paths=args.counterfactual,
+        rescue_index_path=args.rescue_index,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(bundle, ensure_ascii=False, sort_keys=True, indent=2) + "\n"

@@ -83,6 +83,10 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "preflight_qwen35_9b_lora.py",
         "smoke_one_sample.jsonl",
         "--max_steps 1",
+        "--logging_steps 1",
+        "--save_steps 1",
+        "verify_qwen35_lora_smoke.py",
+        "training_update.json",
     ):
         assert expected in text
 

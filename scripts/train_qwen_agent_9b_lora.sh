@@ -271,7 +271,12 @@ training_length_args=(
 if [[ "$smoke" -eq 1 ]]; then
   training_length_args=(
     --max_steps 1
-    --save_strategy no
+    --logging_strategy steps
+    --logging_steps 1
+    --logging_first_step true
+    --save_strategy steps
+    --save_steps 1
+    --save_total_limit 1
   )
 fi
 
@@ -312,3 +317,9 @@ NPROC_PER_NODE="$gpu_count" \
   --output_dir "$OUTPUT_DIR" \
   "${training_length_args[@]}" \
   "${resume_args[@]}"
+
+if [[ "$smoke" -eq 1 ]]; then
+  "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/verify_qwen35_lora_smoke.py" \
+    --output-dir "$OUTPUT_DIR" \
+    --report "$OUTPUT_DIR/preflight/training_update.json"
+fi

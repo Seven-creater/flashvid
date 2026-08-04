@@ -305,6 +305,10 @@ def test_protocol_audit_enumerates_models_protocols_and_datasets(tmp_path: Path)
     assert all(task.resume and task.concurrency == 24 for task in tasks)
     assert all(task.command[0] == sys.executable for task in tasks)
     assert all("--model-artifact-sha256" in task.command for task in tasks)
+    assert all(
+        task.command[task.command.index("--timeout") + 1] == "3600"
+        for task in tasks
+    )
 
 
 def test_protocol_smoke_uses_frozen_dev10_for_both_models_and_protocols(

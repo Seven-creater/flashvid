@@ -79,6 +79,7 @@ BASELINE_MODES = {
     "permuted_choices",
     "mismatched_video",
 }
+QWEN_REQUEST_TIMEOUT_S = 3600
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -1092,6 +1093,8 @@ def _task_command(
         _path_arg(output_dir),
         "--concurrency",
         str(concurrency),
+        "--timeout",
+        str(QWEN_REQUEST_TIMEOUT_S),
         "--experiment-config-sha256",
         config_hash,
     ]

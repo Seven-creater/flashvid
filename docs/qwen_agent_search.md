@@ -45,8 +45,10 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 ```
 
 当前冻结的 thinking 协议从首轮即统一使用 `max_tokens=32768`，不得混入旧的
-8192→32768 重试结果。no-thinking 最终答案请求必须使用按本题实际选项字母生成的
-JSON Schema；thinking 和 Agent 工具规划请求不得套用该答案 Schema。smoke 完整通过后，
+8192→32768 重试结果。no-thinking 和 thinking 的最终答案请求都必须使用按本题实际
+选项字母生成的 JSON Schema；只有可能返回工具调用的 Agent 规划轮不得套用答案
+Schema。vLLM 的 Qwen3 reasoning parser 会保留独立 reasoning，只约束正式 content。
+smoke 完整通过后，
 再运行 q9 协议审计：
 
 ```bash
@@ -76,7 +78,15 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
   --protocol "$Q9_PROTOCOL"
 ```
 
-q4 将 `q9/Q9` 替换为 `q4/Q4`。错误视频诊断前必须先用 `build_mismatched_video_map.py` 生成三组冻结映射。`question_choices` 是真正无视频；`choices_only` 连问题也删除；二者视觉 Token 必须为 0。
+q4 将 `q9/Q9` 替换为 `q4/Q4`。错误视频诊断前先冻结三库、三个 seed 的同库同
+时长桶映射；已有文件只有逐字一致才允许复用，不会覆盖不同产物：
+
+```bash
+$PYTHON_BIN scripts/freeze_qwen_mismatched_videos.py \
+  --config configs/experiments/qwen_agent_search.json
+```
+
+`question_choices` 是真正无视频；`choices_only` 连问题也删除；二者视觉 Token 必须为 0。
 
 ## 3. A0–A4 Dev 搜索
 

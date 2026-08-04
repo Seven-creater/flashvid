@@ -14,6 +14,8 @@ ALLOWED_LOCAL_MEDIA_PATH=${ALLOWED_LOCAL_MEDIA_PATH:-/data02}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-32768}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
+ALLOW_SHARED_GPUS=${ALLOW_SHARED_GPUS:-0}
 VLLM_BIN=${VLLM_BIN:-$PROJECT_DIR/.venv/bin/vllm}
 VLLM_ENV_DIR=$(cd "$(dirname "$VLLM_BIN")/.." && pwd)
 CUDA_COMPAT_DIR=${CUDA_COMPAT_DIR:-$VLLM_ENV_DIR/cuda-compat}
@@ -57,9 +59,14 @@ active_gpu_pids=$(
     | sort -u
 )
 if [[ -n "$active_gpu_pids" ]]; then
-  echo "selected GPUs are already in use; refusing to touch these PIDs:" >&2
+  if [[ "$ALLOW_SHARED_GPUS" != "1" ]]; then
+    echo "selected GPUs are already in use; refusing to touch these PIDs:" >&2
+    echo "$active_gpu_pids" >&2
+    echo "set ALLOW_SHARED_GPUS=1 only after confirming coexistence is safe" >&2
+    exit 2
+  fi
+  echo "warning: sharing selected GPUs with existing PIDs; they will not be touched:" >&2
   echo "$active_gpu_pids" >&2
-  exit 2
 fi
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
@@ -96,6 +103,7 @@ exec "$VLLM_BIN" serve "$MODEL_PATH" \
   --data-parallel-size "$DATA_PARALLEL_SIZE" \
   --tensor-parallel-size 1 \
   --dtype bfloat16 \
+  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \

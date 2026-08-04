@@ -8,13 +8,16 @@ SWIFT_PYTHON="${SWIFT_PYTHON:-${SFT_ENV_DIR}/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B}"
 EXPECTED_MODEL_ARTIFACT_SHA256="${EXPECTED_MODEL_ARTIFACT_SHA256:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora}"
+FORMAL_OUTPUT_DIR="$OUTPUT_DIR"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
 
 train_data=""
 resume=0
+smoke=0
+output_dir_explicit=0
 
 usage() {
-  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume]" >&2
+  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -27,10 +30,15 @@ while [[ $# -gt 0 ]]; do
     --output-dir)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       OUTPUT_DIR="$2"
+      output_dir_explicit=1
       shift 2
       ;;
     --resume)
       resume=1
+      shift
+      ;;
+    --smoke)
+      smoke=1
       shift
       ;;
     *)
@@ -40,12 +48,47 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$smoke" -eq 1 ]]; then
+  [[ "$output_dir_explicit" -eq 1 ]] || {
+    echo "--smoke requires an explicit independent --output-dir" >&2
+    exit 2
+  }
+  [[ "$resume" -eq 0 ]] || {
+    echo "--smoke cannot be combined with --resume" >&2
+    exit 2
+  }
+  [[ "$OUTPUT_DIR" != "$FORMAL_OUTPUT_DIR" ]] || {
+    echo "--smoke output directory must differ from the formal training output directory" >&2
+    exit 2
+  }
+fi
+
 [[ -f "$train_data" ]] || { echo "training JSONL not found: $train_data" >&2; exit 2; }
 [[ -e "$MODEL_PATH" ]] || { echo "Qwen3.5-9B model not found: $MODEL_PATH" >&2; exit 2; }
 [[ -x "$SWIFT_BIN" && -x "$SWIFT_PYTHON" ]] || {
   echo "ms-swift environment not found at $SFT_ENV_DIR" >&2
   exit 2
 }
+if [[ "$smoke" -eq 1 ]]; then
+  resolved_output_dir="$($SWIFT_PYTHON -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$OUTPUT_DIR")"
+  resolved_formal_output_dir="$($SWIFT_PYTHON -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$FORMAL_OUTPUT_DIR")"
+  case "${resolved_output_dir}/" in
+    "${resolved_formal_output_dir}/"*)
+      echo "--smoke output directory must resolve outside the formal training output directory" >&2
+      exit 2
+      ;;
+  esac
+  case "${resolved_formal_output_dir}/" in
+    "${resolved_output_dir}/"*)
+      echo "--smoke output directory cannot contain the formal training output directory" >&2
+      exit 2
+      ;;
+  esac
+  if [[ -d "$OUTPUT_DIR" && -n "$(find "$OUTPUT_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    echo "--smoke requires a new or empty output directory: $OUTPUT_DIR" >&2
+    exit 2
+  fi
+fi
 [[ "$EXPECTED_MODEL_ARTIFACT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
   echo "EXPECTED_MODEL_ARTIFACT_SHA256 must be a SHA-256" >&2
   exit 2
@@ -130,6 +173,18 @@ if [[ "$resume" -eq 1 ]]; then
   resume_args=(--resume_from_checkpoint "${OUTPUT_DIR}/${latest_checkpoint}")
 fi
 
+training_length_args=(
+  --num_train_epochs 3
+  --save_strategy epoch
+  --save_total_limit 3
+)
+if [[ "$smoke" -eq 1 ]]; then
+  training_length_args=(
+    --max_steps 1
+    --save_strategy no
+  )
+fi
+
 # gpu_count x batch 1 x accumulation (32/gpu_count) = effective batch 32.
 # Per-message `loss` masks in the JSONL restrict supervision to approved
 # plan/tool/memory/stop/final assistant turns.
@@ -150,7 +205,6 @@ NPROC_PER_NODE="$gpu_count" \
   --lora_rank 16 \
   --lora_alpha 32 \
   --lora_dropout 0.05 \
-  --num_train_epochs 3 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps "$gradient_accumulation_steps" \
   --learning_rate 1e-4 \
@@ -162,9 +216,8 @@ NPROC_PER_NODE="$gpu_count" \
   --template_backend swift \
   --loss_scale default \
   --strict true \
-  --save_strategy epoch \
-  --save_total_limit 3 \
   --seed 42 \
   --data_seed 42 \
   --output_dir "$OUTPUT_DIR" \
+  "${training_length_args[@]}" \
   "${resume_args[@]}"

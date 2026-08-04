@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -1108,3 +1110,33 @@ def test_qwen9b_training_launcher_hard_gates_model_and_real_loss_mask() -> None:
     assert "verify_swift_loss_mask.py" in text
     assert "--max_length 16384" in text
     assert "CUDA_VISIBLE_DEVICES:-4,5,6,7" in text
+    assert "--smoke requires an explicit independent --output-dir" in text
+    assert "--smoke cannot be combined with --resume" in text
+    assert "--max_steps 1" in text
+    assert "--num_train_epochs 3" in text
+
+
+def test_qwen_sft_runbook_uses_frozen_winner_and_builder_output() -> None:
+    text = Path("docs/qwen_agent_search.md").read_text(encoding="utf-8")
+    assert "frozen/agent_winner.json" not in text
+    assert "frozen/q9_agent_winner.json" in text
+    assert "--output-dir results/eval/qwen_agent_search/trajectories/selected" in text
+    assert "--train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl" in text
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is unavailable")
+def test_qwen9b_training_launcher_rejects_smoke_without_independent_output() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/train_qwen_agent_9b_lora.sh",
+            "--train-data",
+            "does-not-need-to-exist.jsonl",
+            "--smoke",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires an explicit independent --output-dir" in result.stderr

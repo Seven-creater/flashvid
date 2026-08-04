@@ -161,7 +161,7 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 $PYTHON_BIN scripts/freeze_qwen_rescue_inputs.py \
   --config configs/experiments/qwen_agent_search.json \
   --base-bundle results/eval/qwen_agent_search/trajectories/base_bundle.json \
-  --frozen-winner results/eval/qwen_agent_search/frozen/agent_winner.json \
+  --frozen-winner results/eval/qwen_agent_search/frozen/q9_agent_winner.json \
   --output-dir results/eval/qwen_agent_search/trajectories/rescue/frozen
 
 PYTHON_BIN=$PYTHON_BIN QWEN_STALL_TIMEOUT_S=90 bash scripts/launch_qwen_rescue.sh \
@@ -186,19 +186,35 @@ $PYTHON_BIN scripts/build_qwen_agent_sft.py \
   --output-dir results/eval/qwen_agent_search/trajectories/counterfactual_specs
 ```
 
-按三个数据集分别通过 `launch_qwen_counterfactuals.sh` 启动 `run_qwen_counterfactuals.py` 参数；启动器强制 `setsid + nohup + --resume`、单请求 80 秒和 90 秒结果停滞保护。完成后再次调用 `collect_qwen_sft_inputs.py`，为每个反事实 JSONL 增加一个 `--counterfactual` 参数。然后用新 bundle 运行 `build_qwen_agent_sft.py --phase select`。bundle 会校验实验配置、run plan、所有轨迹文件、Train600、三个 Train200、9B artifact、Agent config 和 runner fingerprint；任一文件或哈希变化都会拒绝构建或续跑。
+按三个数据集分别通过 `launch_qwen_counterfactuals.sh` 启动 `run_qwen_counterfactuals.py` 参数；启动器强制 `setsid + nohup + --resume`、单请求 80 秒和 90 秒结果停滞保护。完成后再次调用 `collect_qwen_sft_inputs.py`，为每个反事实 JSONL 增加一个 `--counterfactual` 参数。然后用新 bundle 运行 `build_qwen_agent_sft.py --phase select`。bundle 会校验实验配置、run plan、所有轨迹文件、Train600、三个 Train200、9B artifact、Agent config 和 runner fingerprint；任一文件或哈希变化都会拒绝构建或续跑。`--phase select` 的训练文件始终是其 `--output-dir` 下实际生成的 `sft.jsonl`，例如：
+
+```bash
+$PYTHON_BIN scripts/build_qwen_agent_sft.py \
+  --phase select \
+  --train-manifest results/eval/qwen_agent_search/frozen/train600.jsonl \
+  --input-bundle results/eval/qwen_agent_search/trajectories/all_inputs.json \
+  --config-sha256 "$CONFIG_SHA" \
+  --output-dir results/eval/qwen_agent_search/trajectories/selected
+```
 
 训练前 GPU 4–7 必须全部空闲：
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 \
 SFT_ENV_DIR=$PROJECT_DIR/.venv-swift \
+  bash scripts/train_qwen_agent_9b_lora.sh \
+  --smoke \
+  --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
+  --output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora_smoke
+
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+SFT_ENV_DIR=$PROJECT_DIR/.venv-swift \
   setsid nohup bash scripts/train_qwen_agent_9b_lora.sh \
-  --train-data results/eval/qwen_agent_search/sft_data/qwen_agent_sft.jsonl \
+  --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
   > logs/qwen_agent_sft.log 2>&1 < /dev/null &
 ```
 
-训练脚本在占用 GPU 前验证模型 artifact、`ms-swift==4.4.2`、真实 Qwen3.5 模板 loss mask；只有 plan/tool/memory/stop/final assistant token 计算 loss。
+训练脚本在占用 GPU 前验证模型 artifact、`ms-swift==4.4.2`、真实 Qwen3.5 模板 loss mask；只有 plan/tool/memory/stop/final assistant token 计算 loss。正式三轮训练前必须先执行 `--smoke`，它强制使用显式、独立于正式 checkpoint 的输出目录并只反向传播 1 step；smoke 成功后再启动上面的正式任务。
 
 每个 epoch 用 `freeze_qwen_sft_checkpoint.py` 冻结 LoRA，然后用 `LORA_PATH`、`LORA_SERVED_NAME` 启动服务并运行：
 

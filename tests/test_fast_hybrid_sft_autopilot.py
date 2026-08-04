@@ -72,6 +72,12 @@ def test_train_eval_only_stops_owned_project_services() -> None:
     assert "rm -rf" not in text
 
 
+def test_lvbench_recovery_accepts_read_only_candidate_from_another_worktree() -> None:
+    text = _text("scripts/recover_lvbench_sft_inputs.sh")
+    assert "LV_ORIGINAL_CANDIDATE" in text
+    assert "expected-original-sha256" in text
+
+
 def test_server_paths_never_use_foreign_sources_or_runtime_installs() -> None:
     for path in (
         "scripts/run_fast_hybrid_post_teacher.sh",

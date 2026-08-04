@@ -10,6 +10,7 @@ SERVICE_OWNER_PROJECT_DIR="${SERVICE_OWNER_PROJECT_DIR:-$PROJECT_DIR}"
 PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
 ROOT="${ROOT:-results/eval/fast_hybrid_eva_sft}"
 RECOVERY_BASE_URL="${LV_RECOVERY_BASE_URL:-http://127.0.0.1:8200/v1}"
+RECOVERY_TIMEOUT="${LV_RECOVERY_TIMEOUT:-90}"
 VIDEO_DIR="${LV_VIDEO_DIR:-/data02/pretrained_model/cvr_learn/cvr_data/06_lvbench/videos}"
 MANIFEST=/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl
 MANIFEST_SHA=2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb
@@ -104,7 +105,7 @@ fi
   --base-url "$RECOVERY_BASE_URL" --api-key no --model Qwen3.5-9B \
   --model-artifact-sha256 "$MODEL_SHA" --manifest "$SUBSET" \
   --expected-manifest-sha256 "$SUBSET_SHA" --sample 2 --seed 42 \
-  --output-dir "$PATCH_DIR" --concurrency 2 --timeout 90 \
+  --output-dir "$PATCH_DIR" --concurrency 2 --timeout "$RECOVERY_TIMEOUT" \
   --experiment-config-sha256 "$QWEN_CONFIG_SHA" --baseline-mode direct \
   --qwen-protocol no_think_greedy --direct-sampling uniform32 \
   --resume --retry-errors

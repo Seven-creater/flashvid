@@ -76,6 +76,7 @@ def test_lvbench_recovery_accepts_read_only_candidate_from_another_worktree() ->
     text = _text("scripts/recover_lvbench_sft_inputs.sh")
     assert "LV_ORIGINAL_CANDIDATE" in text
     assert "LV_RECOVERY_BASE_URL" in text
+    assert "LV_RECOVERY_TIMEOUT" in text
     assert "expected-original-sha256" in text
     assert "--resume --retry-errors" in text
 

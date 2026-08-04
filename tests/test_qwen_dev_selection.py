@@ -17,12 +17,14 @@ from flashvid_eval.qwen_dev_selection import (
     canonical_sha256,
     file_sha256,
     load_dev_runs,
+    load_protocol_smoke_rejection,
     _row_failed,
     write_frozen_json,
 )
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "select_qwen_agent_dev_winner.py"
+PROTOCOL_SCRIPT = Path(__file__).parents[1] / "scripts" / "select_qwen_protocol_dev.py"
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -386,6 +388,7 @@ def test_complete_dev_matrix_selects_per_model_and_strictly_promotes(tmp_path: P
     runs = load_dev_runs(plans, canonical_sha256(config))
     report = build_dev_selection_report(config, runs)
     assert report["status"] == "passed"
+    assert "protocol_rejections" not in report
     assert report["protocol_selection"]["q4"]["protocol"] == "think"
     assert report["protocol_selection"]["q9"]["protocol"] == "think"
     assert report["direct_selection"]["q4"]["sampling"] == "uniform32"
@@ -454,6 +457,144 @@ def test_protocol_selection_rejects_mixed_thinking_output_budgets(
     assert think["initial_length_truncations"] == 1
     assert think["eligible"] is False
     assert "frozen_32768_length_truncation" in think["rejection_reasons"]
+
+
+def test_q4_think_smoke_failure_can_replace_its_full_dev_audit(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    audit_tasks = []
+    for model_key, protocols in (("q4", ("no_think",)), ("q9", ("no_think", "think"))):
+        for protocol in protocols:
+            for dataset in DATASETS:
+                audit_tasks.append(
+                    _task(
+                        tmp_path,
+                        config,
+                        phase="protocol_audit",
+                        dataset=dataset,
+                        model_key=model_key,
+                        protocol=protocol,
+                        seed=42,
+                        correct_count=1 if protocol == "no_think" else 2,
+                        tokens=50 if protocol == "no_think" else 80,
+                        suffix=f"{model_key}-{protocol}",
+                        mode="direct",
+                        sampling="uniform64",
+                    )
+                )
+    audit_plan = _plan(tmp_path, config, "protocol_audit", audit_tasks)
+
+    smoke_tasks = [
+        _task(
+            tmp_path,
+            config,
+            phase="protocol_smoke",
+            dataset=dataset,
+            model_key="q4",
+            protocol="think",
+            seed=42,
+            correct_count=1,
+            tokens=80,
+            suffix="q4-think-smoke",
+            mode="direct",
+            sampling="uniform64",
+        )
+        for dataset in DATASETS
+    ]
+    smoke_plan = _plan(tmp_path, config, "protocol_smoke", smoke_tasks)
+    first_result = next(Path(smoke_tasks[0]["output_dir"]).glob("*.jsonl"))
+    rows = [json.loads(line) for line in first_result.read_text(encoding="utf-8").splitlines()]
+    rows[0].update(
+        {
+            "prediction": None,
+            "correct": False,
+            "error_type": "request_timeout",
+        }
+    )
+    first_result.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    for task in smoke_tasks[1:]:
+        next(Path(task["output_dir"]).glob("*.jsonl")).unlink()
+
+    evidence = load_protocol_smoke_rejection(
+        smoke_plan,
+        canonical_sha256(config),
+        model_key="q4",
+        protocol="think",
+    )
+    assert evidence["failures"] == 1
+    assert evidence["observed_rows"] == 3
+    assert evidence["expected_rows"] == 9
+    report = build_dev_selection_report(
+        config,
+        load_dev_runs([audit_plan], canonical_sha256(config)),
+        protocol_rejections={"q4": {"think": evidence}},
+    )
+    assert report["protocol_selection"]["q4"]["protocol"] == "no_think"
+    assert report["protocol_selection"]["q9"]["protocol"] == "think"
+    assert "missing_protocol_audit:q4:think" not in report["blocking_errors"]
+    rejected = next(
+        point
+        for point in report["protocol_selection"]["q4"]["points"]
+        if point["point_id"] == "q4:think:smoke_rejected"
+    )
+    assert rejected["eligible"] is False
+    assert rejected["rejection_evidence"]["failures"] == 1
+
+    config_path = tmp_path / "config.json"
+    output_path = tmp_path / "protocol_selection.json"
+    _write_json(config_path, config)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(PROTOCOL_SCRIPT),
+            "--config",
+            str(config_path),
+            "--run-plan",
+            str(audit_plan),
+            "--reject-q4-think-from-smoke",
+            str(smoke_plan),
+            "--output",
+            str(output_path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert json.loads(completed.stdout)["q4_protocol"] == "no_think"
+    frozen = json.loads(output_path.read_text(encoding="utf-8"))
+    assert frozen["protocol_rejections"]["q4"]["think"]["failures"] == 1
+
+
+def test_smoke_rejection_requires_explicit_failure_rate_above_one_percent(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    smoke_tasks = [
+        _task(
+            tmp_path,
+            config,
+            phase="protocol_smoke",
+            dataset=dataset,
+            model_key="q4",
+            protocol="think",
+            seed=42,
+            correct_count=1,
+            tokens=80,
+            suffix="q4-think-smoke-clean",
+            mode="direct",
+            sampling="uniform64",
+        )
+        for dataset in DATASETS
+    ]
+    smoke_plan = _plan(tmp_path, config, "protocol_smoke", smoke_tasks)
+    with pytest.raises(RuntimeError, match="does not exceed"):
+        load_protocol_smoke_rejection(
+            smoke_plan,
+            canonical_sha256(config),
+            model_key="q4",
+            protocol="think",
+        )
 
 
 def test_leaking_candidate_is_rejected_without_corrupting_incumbent(tmp_path: Path) -> None:

@@ -23,6 +23,7 @@ SUPPORTED_STAGES = (
 )
 DEV_PHASES = frozenset(
     {
+        "protocol_smoke",
         "protocol_audit",
         "direct_dev",
         "agent_dev",
@@ -31,6 +32,8 @@ DEV_PHASES = frozenset(
         "final_matrix",
     }
 )
+
+SMOKE_PROTOCOL_REJECTION_REASON = "smoke_engineering_failure_rate_above_1_percent"
 
 
 def canonical_sha256(payload: Any) -> str:
@@ -330,6 +333,138 @@ def load_dev_runs(
     return tuple(runs)
 
 
+def load_protocol_smoke_rejection(
+    plan_path: Path,
+    experiment_config_sha256: str,
+    *,
+    model_key: str,
+    protocol: str,
+    failure_rate_threshold: float = 0.01,
+) -> dict[str, Any]:
+    """Validate explicit smoke failures that justify skipping a full protocol audit."""
+    plan = load_frozen_run_plan(plan_path, experiment_config_sha256)
+    if plan.get("phase") != "protocol_smoke":
+        raise ValueError("protocol smoke rejection requires a protocol_smoke plan")
+
+    matching_tasks: dict[str, Mapping[str, Any]] = {}
+    for task in plan["tasks"]:
+        if not isinstance(task, Mapping):
+            raise ValueError(f"run plan task is not an object: {plan_path}")
+        command_raw = task.get("command")
+        if not isinstance(command_raw, list) or not all(
+            isinstance(item, str) for item in command_raw
+        ):
+            raise ValueError("run plan task command must be a string list")
+        command = list(command_raw)
+        if str(task.get("model_key") or "") != model_key:
+            continue
+        if _command_value(command, "--qwen-protocol") != protocol:
+            continue
+        if _command_value(command, "--baseline-mode") != "direct":
+            raise ValueError("protocol smoke rejection requires Direct smoke results")
+        if _command_value(command, "--direct-sampling") != "uniform64":
+            raise ValueError("protocol smoke rejection requires uniform64 smoke results")
+        dataset = str(task.get("dataset") or "")
+        if dataset in matching_tasks:
+            raise ValueError(f"duplicate smoke task for {model_key}:{protocol}:{dataset}")
+        matching_tasks[dataset] = task
+
+    if set(matching_tasks) != set(DATASETS):
+        raise RuntimeError(
+            f"smoke plan must declare all datasets for {model_key}:{protocol}"
+        )
+
+    expected_rows = 0
+    observed_rows = 0
+    failures = 0
+    sources: list[dict[str, Any]] = []
+    for dataset in DATASETS:
+        task = matching_tasks[dataset]
+        manifest_path = Path(str(task.get("manifest") or ""))
+        expected_manifest_hash = str(task.get("manifest_sha256") or "").lower()
+        if not manifest_path.is_file() or file_sha256(manifest_path) != expected_manifest_hash:
+            raise RuntimeError(f"smoke manifest changed or is unavailable: {manifest_path}")
+        manifest_rows = _read_jsonl(manifest_path)
+        manifest_ids = {str(row["sample_id"]) for row in manifest_rows}
+        expected_rows += len(manifest_rows)
+
+        output_dir = Path(str(task.get("output_dir") or ""))
+        result_paths = sorted(output_dir.glob(f"{dataset}_*.jsonl")) if output_dir.is_dir() else []
+        if not result_paths:
+            continue
+        if len(result_paths) != 1:
+            raise ValueError(
+                f"expected at most one smoke result for {dataset}, found {len(result_paths)}"
+            )
+        result_path = result_paths[0]
+        rows = _read_jsonl(result_path)
+        result_ids = {str(row["sample_id"]) for row in rows}
+        if not result_ids <= manifest_ids:
+            raise RuntimeError(f"smoke result contains samples outside its manifest: {result_path}")
+        if any(str(row.get("dataset") or "") != dataset for row in rows):
+            raise RuntimeError(f"smoke result dataset differs from run plan: {result_path}")
+        expected_model = str(task.get("model") or "")
+        if any(
+            row.get("model") not in {None, "", expected_model}
+            or (not row.get("model") and not _row_failed(row))
+            for row in rows
+        ):
+            raise RuntimeError(f"smoke result model differs from run plan: {result_path}")
+        frozen_paths = sorted(output_dir.glob(f"frozen_inputs_{dataset}_*.json"))
+        if len(frozen_paths) != 1:
+            raise ValueError(
+                f"expected one frozen smoke input for {dataset}, found {len(frozen_paths)}"
+            )
+        frozen = _load_json(frozen_paths[0], "frozen smoke input")
+        fingerprints = {str(row.get("run_fingerprint") or "") for row in rows}
+        if len(fingerprints) != 1 or "" in fingerprints:
+            raise RuntimeError(f"smoke result run fingerprint is missing or mixed: {result_path}")
+        if fingerprints != {str(frozen.get("run_fingerprint") or "")}:
+            raise RuntimeError(f"smoke result/frozen fingerprint mismatch: {result_path}")
+        if str(frozen.get("experiment_config_sha256") or "") != experiment_config_sha256:
+            raise RuntimeError(f"frozen smoke config differs from run plan: {frozen_paths[0]}")
+        if str(frozen.get("model") or "") != expected_model:
+            raise RuntimeError(f"frozen smoke model differs from run plan: {frozen_paths[0]}")
+        if str(frozen.get("qwen_protocol") or "") != protocol:
+            raise RuntimeError(f"frozen smoke protocol differs from run plan: {frozen_paths[0]}")
+        frozen_manifest = frozen.get("manifest")
+        if not isinstance(frozen_manifest, Mapping) or str(
+            frozen_manifest.get("sha256") or ""
+        ).lower() != expected_manifest_hash:
+            raise RuntimeError(f"frozen smoke manifest differs from run plan: {frozen_paths[0]}")
+        observed_rows += len(rows)
+        failures += sum(_row_failed(row) for row in rows)
+        sources.append(
+            {
+                "dataset": dataset,
+                "result": str(result_path.resolve()),
+                "sha256": file_sha256(result_path),
+                "rows": len(rows),
+            }
+        )
+
+    failure_rate = failures / expected_rows if expected_rows else 0.0
+    if failure_rate <= failure_rate_threshold:
+        raise RuntimeError(
+            f"{model_key}:{protocol} explicit smoke failure rate {failure_rate:.6f} "
+            f"does not exceed {failure_rate_threshold:.6f}"
+        )
+    return {
+        "model_key": model_key,
+        "protocol": protocol,
+        "reason": SMOKE_PROTOCOL_REJECTION_REASON,
+        "expected_rows": expected_rows,
+        "observed_rows": observed_rows,
+        "missing_rows": expected_rows - observed_rows,
+        "failures": failures,
+        "failure_rate": failure_rate,
+        "threshold": failure_rate_threshold,
+        "source_run_plan": str(plan_path.resolve()),
+        "source_run_plan_sha256": file_sha256(plan_path),
+        "sources": sources,
+    }
+
+
 def _row_failed(row: Mapping[str, Any]) -> bool:
     direct_media_accounting_failed = False
     if row.get("baseline_mode") == "direct":
@@ -525,13 +660,17 @@ def _select_protocols(
     config: Mapping[str, Any],
     runs: Sequence[DevRun],
     blocking: list[str],
+    protocol_rejections: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Point]]:
     selections: dict[str, Any] = {}
     selected_points: dict[str, Point] = {}
+    rejections = protocol_rejections or {}
     protocol_runs = [run for run in runs if run.phase == "protocol_audit"]
     for model_key in config["models"]:
         points: dict[str, Point] = {}
+        rejected_points: dict[str, dict[str, Any]] = {}
         for protocol in config["protocols"]:
+            rejection = (rejections.get(model_key) or {}).get(protocol)
             group = [
                 run
                 for run in protocol_runs
@@ -541,9 +680,23 @@ def _select_protocols(
                 and run.sampling == "uniform64"
             ]
             if not group:
+                if rejection is not None:
+                    rejected_points[protocol] = {
+                        "point_id": f"{model_key}:{protocol}:smoke_rejected",
+                        "eligible": False,
+                        "rejection_reasons": [str(rejection["reason"])],
+                        "rejection_evidence": dict(rejection),
+                    }
+                    continue
                 blocking.append(f"missing_protocol_audit:{model_key}:{protocol}")
                 continue
             points[protocol] = _make_point(f"{model_key}:{protocol}:uniform64", group)
+            if rejection is not None:
+                points[protocol].summary["eligible"] = False
+                reason = str(rejection["reason"])
+                if reason not in points[protocol].summary["rejection_reasons"]:
+                    points[protocol].summary["rejection_reasons"].append(reason)
+                points[protocol].summary["rejection_evidence"] = dict(rejection)
             length_truncations = sum(
                 _row_had_length_truncation(row)
                 for row in points[protocol].rows.values()
@@ -566,7 +719,13 @@ def _select_protocols(
         eligible = [point for point in points.values() if point.summary["eligible"]]
         if not eligible:
             blocking.append(f"no_eligible_protocol:{model_key}")
-            selections[model_key] = {"selected": None, "points": [p.summary for p in points.values()]}
+            selections[model_key] = {
+                "selected": None,
+                "points": [
+                    *(points[key].summary for key in sorted(points)),
+                    *(rejected_points[key] for key in sorted(rejected_points)),
+                ],
+            }
             continue
         selected = min(eligible, key=_point_rank)
         selected_points[model_key] = selected
@@ -574,7 +733,10 @@ def _select_protocols(
             "selected": selected.point_id,
             "protocol": selected.point_id.split(":")[1],
             "selection_order": "accuracy,stability,regressions,total_tokens",
-            "points": [points[key].summary for key in sorted(points)],
+            "points": [
+                *(points[key].summary for key in sorted(points)),
+                *(rejected_points[key] for key in sorted(rejected_points)),
+            ],
         }
     return selections, selected_points
 
@@ -872,10 +1034,13 @@ def build_dev_selection_report(
     runs: Sequence[DevRun],
     *,
     teacher_model_key: str = "q9",
+    protocol_rejections: Mapping[str, Mapping[str, Mapping[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     experiment_hash = canonical_sha256(config)
     blocking: list[str] = []
-    protocol_selection, _protocol_points = _select_protocols(config, runs, blocking)
+    protocol_selection, _protocol_points = _select_protocols(
+        config, runs, blocking, protocol_rejections
+    )
     direct_selection, direct_points = _select_direct(
         config, runs, protocol_selection, blocking
     )
@@ -946,6 +1111,8 @@ def build_dev_selection_report(
         "winner": winner_summary,
         "blocking_errors": sorted(set(blocking)),
     }
+    if protocol_rejections:
+        report["protocol_rejections"] = protocol_rejections
     report["selection_state_sha256"] = canonical_sha256(report)
     return report
 

@@ -9,6 +9,7 @@ from flashvid_eval.qwen_dev_selection import (
     build_dev_selection_report,
     canonical_sha256,
     load_dev_runs,
+    load_protocol_smoke_rejection,
     write_frozen_json,
 )
 
@@ -19,6 +20,14 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-plan", type=Path, action="append", required=True)
+    parser.add_argument(
+        "--reject-q4-think-from-smoke",
+        type=Path,
+        help=(
+            "Allow q4 think to be explicitly rejected from a protocol_smoke plan "
+            "whose engineering failure rate exceeds 1%%."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = json.loads(args.config.read_text(encoding="utf-8"))
@@ -28,7 +37,20 @@ def main() -> None:
     runs = load_dev_runs(args.run_plan, config_hash)
     if not runs or any(run.phase != "protocol_audit" for run in runs):
         raise ValueError("protocol selector only accepts protocol_audit plans")
-    full_report = build_dev_selection_report(config, runs)
+    protocol_rejections = {}
+    if args.reject_q4_think_from_smoke is not None:
+        evidence = load_protocol_smoke_rejection(
+            args.reject_q4_think_from_smoke,
+            config_hash,
+            model_key="q4",
+            protocol="think",
+        )
+        protocol_rejections = {"q4": {"think": evidence}}
+    full_report = build_dev_selection_report(
+        config,
+        runs,
+        protocol_rejections=protocol_rejections,
+    )
     selection = full_report["protocol_selection"]
     if any(not (selection.get(key) or {}).get("protocol") for key in ("q9", "q4")):
         raise RuntimeError("one or both models have no eligible protocol")
@@ -47,6 +69,8 @@ def main() -> None:
         "source_run_plans": full_report["source_run_plans"],
         "policy": full_report["policy"],
     }
+    if protocol_rejections:
+        report["protocol_rejections"] = protocol_rejections
     report["selection_state_sha256"] = canonical_sha256(report)
     digest = write_frozen_json(args.output, report)
     print(

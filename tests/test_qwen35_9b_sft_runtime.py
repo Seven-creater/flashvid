@@ -89,6 +89,9 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "--save_steps 1",
         "verify_qwen35_lora_smoke.py",
         "training_update.json",
+        "--formal-output-dir",
+        "--smoke-report",
+        "qwen_sft_smoke_gate.py",
     ):
         assert expected in text
 
@@ -119,6 +122,14 @@ def test_full_preflight_requests_weight_load_and_one_step() -> None:
     assert '"relative_l1": errors' in python
     assert "AutoModelForImageTextToText.from_pretrained" in python
     assert 'device_map="auto"' in python
+
+
+def test_smoke_and_formal_runs_are_explicitly_bound() -> None:
+    launcher = _text("scripts/train_qwen_agent_9b_lora.sh")
+    assert "--smoke requires --formal-output-dir" in launcher
+    assert "formal training requires --smoke-report" in launcher
+    assert 'qwen_sft_smoke_gate.py" bind' in launcher
+    assert 'qwen_sft_smoke_gate.py" check' in launcher
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is unavailable")

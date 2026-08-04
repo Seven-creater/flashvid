@@ -678,6 +678,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--teacher-model-artifact-sha256",
+        help=(
+            "SHA-256 of the frozen base/Teacher model. For an SFT LoRA run, "
+            "--model-artifact-sha256 identifies the served base+adapter stack "
+            "while this value continues to identify the unchanged base model."
+        ),
+    )
+    parser.add_argument(
         "--server-max-model-len",
         type=int,
         default=131072,
@@ -1215,6 +1223,14 @@ def main() -> None:
             args.model_artifact_sha256,
             "model-artifact-sha256",
         )
+        teacher_model_artifact_sha256 = (
+            _validated_sha256(
+                args.teacher_model_artifact_sha256,
+                "teacher-model-artifact-sha256",
+            )
+            if args.teacher_model_artifact_sha256 is not None
+            else model_artifact_sha256
+        )
         train600_manifest_sha256 = (
             _validated_sha256(
                 args.train600_manifest_sha256,
@@ -1327,7 +1343,9 @@ def main() -> None:
             max_call_visual_tokens=args.max_call_visual_tokens,
             max_total_visual_tokens=args.max_total_visual_tokens,
             candidate_results_sha256=candidate_hash,
-            teacher_model_sha256=model_artifact_sha256,
+            teacher_model_sha256=teacher_model_artifact_sha256,
+            served_model_sha256=model_artifact_sha256,
+            manifest_sha256=manifest_hash,
             experiment_config_sha256=experiment_config_sha256,
             scoring_deferred=args.defer_scoring,
             teacher_temperature=args.controller_temperature,
@@ -1367,6 +1385,7 @@ def main() -> None:
                 "generation_seed": args.seed,
                 "experiment_config_sha256": experiment_config_sha256,
                 "model_artifact_sha256": model_artifact_sha256,
+                "teacher_model_artifact_sha256": teacher_model_artifact_sha256,
                 "train600_manifest_sha256": train600_manifest_sha256,
                 "trajectory_schedule_id": args.trajectory_schedule_id,
                 "trajectory_variant_id": args.trajectory_variant_id,

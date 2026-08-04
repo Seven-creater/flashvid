@@ -5,15 +5,15 @@
 ## 1. 创建独立环境
 
 服务器必须提供 `python3.12`。安装器创建独立的
-`.venv-qwen35-sft-cu121`，不继承推理环境，也不覆盖已有 `.venv`：
+`.venv-qwen35-sft-cu124`，不继承推理环境，也不覆盖已有 `.venv`：
 
 ```bash
 bash scripts/install_ms_swift_442.sh
 ```
 
-安装器先从 PyTorch 官方 CUDA 12.1 索引安装
-`torch==2.5.1`，再安装
-`configs/training/qwen35_9b_sft_cuda121.lock.txt` 中的固定依赖，并执行
+安装器从固定的国内镜像安装
+`torch==2.6.0+cu124`，再安装
+`configs/training/qwen35_9b_sft_cuda124.lock.txt` 中的固定依赖，并执行
 `pip check`。安装报告写入 `.runtime/ms_swift_442/installed.json`。
 
 ## 2. 完整预检
@@ -22,14 +22,15 @@ bash scripts/install_ms_swift_442.sh
 
 1. 只尝试停止带本仓库 ownership marker 的 8200/8201 服务；
 2. 自动选择空闲的 GPU 0–7，若不能独占则退到 GPU 4–7；
-3. 验证每张卡总显存至少 42 GiB、CUDA 12.1、BF16 和固定依赖；
+3. 验证每张卡总显存至少 42 GiB、CUDA 12.4、BF16 和固定依赖；
 4. 通过 Transformers 加载本地 `Qwen3_5ForConditionalGeneration` 权重；
 5. 用训练 JSONL 的第一条样本执行一次、且仅一次反向传播。
 
 ```bash
 bash scripts/preflight_qwen35_9b_lora.sh \
   --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
-  --output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora_smoke
+  --output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora_smoke \
+  --formal-output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora
 ```
 
 ownership、UID、vLLM 命令或端口任一项不匹配时，停止操作会直接失败；脚本不会使用
@@ -43,6 +44,8 @@ ownership、UID、vLLM 命令或端口任一项不匹配时，停止操作会直
 CUDA_VISIBLE_DEVICES=4,5,6,7 \
 setsid nohup bash scripts/train_qwen_agent_9b_lora.sh \
   --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
+  --output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora \
+  --smoke-report results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora_smoke/preflight/training_update.json \
   > logs/qwen_agent_sft.log 2>&1 < /dev/null &
 ```
 

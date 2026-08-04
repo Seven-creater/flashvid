@@ -76,8 +76,16 @@ def _changed_span(base: list[int], probe: list[int]) -> tuple[int, int]:
     return prefix, end
 
 
-def _encode(template: TemplateLike, messages: list[dict[str, Any]]) -> tuple[list[int], list[int]]:
-    encoded = template.encode({"messages": messages})
+def _encode(
+    template: TemplateLike,
+    record: Mapping[str, Any],
+    messages: list[dict[str, Any]],
+) -> tuple[list[int], list[int]]:
+    payload: dict[str, Any] = {"messages": messages}
+    for key in ("images", "videos"):
+        if key in record:
+            payload[key] = deepcopy(record[key])
+    encoded = template.encode(payload)
     if "input_ids" not in encoded or "labels" not in encoded:
         raise RuntimeError("template.encode did not return input_ids and labels")
     input_ids = _to_int_list(encoded["input_ids"], "input_ids")
@@ -134,7 +142,7 @@ def verify_records_with_template(
                     raise RuntimeError("loss is only valid on assistant messages")
                 messages.append({"role": role, "content": content})
 
-        base_ids, _ = _encode(template, messages)
+        base_ids, _ = _encode(template, record, messages)
         record_masked = 0
         record_assistant = 0
         for message_index, message in enumerate(messages):
@@ -145,7 +153,7 @@ def verify_records_with_template(
             )
             probe_messages = deepcopy(messages)
             probe_messages[message_index]["content"] += marker
-            probe_ids, probe_labels = _encode(template, probe_messages)
+            probe_ids, probe_labels = _encode(template, record, probe_messages)
             start, end = _changed_span(base_ids, probe_ids)
             span_labels = probe_labels[start:end]
             should_train = role == "assistant" and message.get("loss") is True
@@ -209,7 +217,7 @@ def verify_all_record_encodings(
         messages = record.get("messages")
         if not isinstance(messages, list) or not messages:
             raise RuntimeError(f"record {record_index} has no messages")
-        input_ids, labels = _encode(template, messages)
+        input_ids, labels = _encode(template, record, messages)
         if len(input_ids) > max_length:
             raise RuntimeError(
                 f"record {record_index} encoded to {len(input_ids)} tokens, "

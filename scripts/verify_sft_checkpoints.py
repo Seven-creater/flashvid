@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,7 @@ import torch
 from safetensors import safe_open
 
 
-DEFAULT_STEPS = (13, 26, 39)
+_CHECKPOINT_NAME = re.compile(r"checkpoint-(\d+)")
 
 
 def _sha256(path: Path) -> str:
@@ -53,13 +54,50 @@ def _tensor_schema_and_finiteness(path: Path) -> tuple[dict[str, Any], int]:
     return schema, tensor_count
 
 
-def verify_checkpoints(root: Path, expected_steps: tuple[int, ...]) -> dict[str, Any]:
+def _discover_checkpoints(root: Path) -> list[tuple[int, Path]]:
+    discovered: list[tuple[int, Path]] = []
+    malformed: list[str] = []
+    for path in root.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        match = _CHECKPOINT_NAME.fullmatch(path.name)
+        if match is None:
+            malformed.append(path.name)
+            continue
+        discovered.append((int(match.group(1)), path))
+
+    if malformed:
+        raise ValueError(f"invalid checkpoint directory names: {sorted(malformed)}")
+    if len(discovered) != 3:
+        raise ValueError(
+            "expected exactly 3 checkpoint-N directories, "
+            f"found {len(discovered)}: {sorted(path.name for _, path in discovered)}"
+        )
+
+    discovered.sort(key=lambda item: item[0])
+    steps = [step for step, _ in discovered]
+    if any(current <= previous for previous, current in zip(steps, steps[1:])):
+        raise ValueError(f"checkpoint steps must be strictly increasing: {steps}")
+    return discovered
+
+
+def verify_checkpoints(
+    root: Path, expected_steps: tuple[int, ...] | None = None
+) -> dict[str, Any]:
     if not root.is_dir():
         raise ValueError(f"checkpoint root not found: {root}")
+    explicit_steps = tuple(expected_steps or ())
+    if explicit_steps:
+        checkpoint_specs = [
+            (step, root / f"checkpoint-{step}") for step in explicit_steps
+        ]
+    else:
+        checkpoint_specs = _discover_checkpoints(root)
+    resolved_steps = tuple(step for step, _ in checkpoint_specs)
+
     checkpoints: list[dict[str, Any]] = []
     reference_schema: dict[str, Any] | None = None
-    for ordinal, step in enumerate(expected_steps, start=1):
-        checkpoint = root / f"checkpoint-{step}"
+    for ordinal, (step, checkpoint) in enumerate(checkpoint_specs, start=1):
         if not checkpoint.is_dir():
             raise ValueError(f"missing checkpoint directory: {checkpoint}")
         adapter = checkpoint / "adapter_model.safetensors"
@@ -92,7 +130,9 @@ def verify_checkpoints(root: Path, expected_steps: tuple[int, ...]) -> dict[str,
         if reference_schema is None:
             reference_schema = schema
         elif schema != reference_schema:
-            raise ValueError(f"{adapter}: tensor schema differs from checkpoint-{expected_steps[0]}")
+            raise ValueError(
+                f"{adapter}: tensor schema differs from checkpoint-{resolved_steps[0]}"
+            )
         checkpoints.append(
             {
                 "name": checkpoint.name,
@@ -106,18 +146,20 @@ def verify_checkpoints(root: Path, expected_steps: tuple[int, ...]) -> dict[str,
             }
         )
 
-    extras = sorted(
-        path.name
-        for path in root.glob("checkpoint-*")
-        if path.is_dir() and path.name not in {f"checkpoint-{step}" for step in expected_steps}
-    )
-    if extras:
-        raise ValueError(f"unexpected checkpoint directories: {extras}")
+    if explicit_steps:
+        extras = sorted(
+            path.name
+            for path in root.glob("checkpoint-*")
+            if path.is_dir()
+            and path.name not in {f"checkpoint-{step}" for step in explicit_steps}
+        )
+        if extras:
+            raise ValueError(f"unexpected checkpoint directories: {extras}")
     return {
         "schema_version": 1,
         "status": "complete",
         "checkpoint_root": str(root.resolve()),
-        "expected_steps": list(expected_steps),
+        "expected_steps": list(resolved_steps),
         "checkpoints": checkpoints,
     }
 
@@ -130,7 +172,7 @@ def main() -> None:
     parser.add_argument("--expected-step", type=int, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    expected_steps = tuple(args.expected_step) or DEFAULT_STEPS
+    expected_steps = tuple(args.expected_step) or None
     try:
         payload = verify_checkpoints(args.checkpoint_root, expected_steps)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
@@ -138,7 +180,7 @@ def main() -> None:
             "schema_version": 1,
             "status": "failed",
             "checkpoint_root": str(args.checkpoint_root.resolve()),
-            "expected_steps": list(expected_steps),
+            "expected_steps": list(expected_steps or ()),
             "error": str(error),
         }
     _write_json(args.output, payload)

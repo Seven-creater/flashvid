@@ -103,6 +103,8 @@ def _evaluator(records: list[dict]) -> tuple[FastHybridEvaEvaluator, list[str]]:
     evaluator.max_total_visual_tokens = 24000
     evaluator.candidate_results_sha256 = "a" * 64
     evaluator.teacher_model_sha256 = "b" * 64
+    evaluator.served_model_sha256 = "b" * 64
+    evaluator.manifest_sha256 = "1" * 64
     evaluator.experiment_config_sha256 = "c" * 64
     evaluator.scoring_deferred = True
     evaluator.teacher_temperature = 0.0
@@ -171,6 +173,21 @@ def test_fast_hybrid_fingerprint_freezes_generation_and_trajectory_context() -> 
         "trajectory_variant_id": "changed",
     }
     assert evaluator.run_fingerprint() != original
+
+
+def test_fast_hybrid_audit_distinguishes_base_and_served_stack() -> None:
+    evaluator, _ = _evaluator([_run_record("A")])
+    evaluator.scoring_deferred = False
+    evaluator.trajectory_context = {}
+    evaluator.teacher_model_sha256 = "b" * 64
+    evaluator.served_model_sha256 = "s" * 64
+    evaluator.manifest_sha256 = "m" * 64
+
+    audit = evaluator.static_audit_fields()
+
+    assert audit["teacher_model_sha256"] == "b" * 64
+    assert audit["model_artifact_sha256"] == "s" * 64
+    assert audit["manifest_sha256"] == "m" * 64
 
 
 def test_fast_hybrid_allows_only_confirmed_visual_change() -> None:

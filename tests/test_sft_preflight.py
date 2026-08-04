@@ -231,6 +231,16 @@ class _FakeTemplate:
         return {"input_ids": input_ids, "labels": labels}
 
 
+class _MediaAwareFakeTemplate(_FakeTemplate):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoded_media: list[tuple[list[str] | None, list[str] | None]] = []
+
+    def encode(self, value: dict) -> dict[str, list[int]]:
+        self.encoded_media.append((value.get("images"), value.get("videos")))
+        return super().encode(value)
+
+
 def test_real_template_probe_logic_accepts_expected_masks() -> None:
     records = [{"messages": _messages(0.25)}]
     report = verify_records_with_template(records, _FakeTemplate(), sample_count=1)
@@ -252,6 +262,26 @@ def test_real_template_probe_honors_explicit_false_assistant_loss() -> None:
     )
     assert report["assistant_loss_probes"] == 1
     assert report["masked_role_probes"] == 4
+
+
+def test_real_template_checks_preserve_top_level_media_for_every_encoding() -> None:
+    template = _MediaAwareFakeTemplate()
+    record = {
+        "messages": [
+            {"role": "system", "content": "Use observations only."},
+            {"role": "user", "content": "Inspect this frame and clip: <image><video>"},
+            {"role": "assistant", "content": "Answer: A", "loss": True},
+        ],
+        "images": ["/frozen/frame.png"],
+        "videos": ["/frozen/clip.mp4"],
+    }
+
+    verify_records_with_template([record], template, sample_count=1)
+    verify_all_record_encodings([record], template)
+
+    assert template.encoded_media
+    assert all(images == ["/frozen/frame.png"] for images, _videos in template.encoded_media)
+    assert all(videos == ["/frozen/clip.mp4"] for _images, videos in template.encoded_media)
 
 
 @pytest.mark.parametrize(

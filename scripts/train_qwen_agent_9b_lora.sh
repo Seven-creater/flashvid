@@ -8,7 +8,7 @@ SWIFT_PYTHON="${SWIFT_PYTHON:-${SFT_ENV_DIR}/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B}"
 EXPECTED_MODEL_ARTIFACT_SHA256="${EXPECTED_MODEL_ARTIFACT_SHA256:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora}"
-FORMAL_OUTPUT_DIR="$OUTPUT_DIR"
+FORMAL_OUTPUT_DIR=""
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 MIN_GPU_MEMORY_MIB="${MIN_GPU_MEMORY_MIB:-43008}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -17,11 +17,13 @@ train_data=""
 resume=0
 smoke=0
 output_dir_explicit=0
+formal_output_dir_explicit=0
+smoke_report=""
 release_project_services=0
 load_weights_preflight=0
 
 usage() {
-  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke] [--release-project-services] [--load-weights-preflight]" >&2
+  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke --formal-output-dir DIR | --smoke-report FILE] [--release-project-services] [--load-weights-preflight]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -35,6 +37,17 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { usage; exit 2; }
       OUTPUT_DIR="$2"
       output_dir_explicit=1
+      shift 2
+      ;;
+    --formal-output-dir)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      FORMAL_OUTPUT_DIR="$2"
+      formal_output_dir_explicit=1
+      shift 2
+      ;;
+    --smoke-report)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      smoke_report="$2"
       shift 2
       ;;
     --resume)
@@ -69,8 +82,26 @@ if [[ "$smoke" -eq 1 ]]; then
     echo "--smoke cannot be combined with --resume" >&2
     exit 2
   }
+  [[ "$formal_output_dir_explicit" -eq 1 ]] || {
+    echo "--smoke requires --formal-output-dir to bind the later formal run" >&2
+    exit 2
+  }
+  [[ -z "$smoke_report" ]] || {
+    echo "--smoke cannot be combined with --smoke-report" >&2
+    exit 2
+  }
   [[ "$OUTPUT_DIR" != "$FORMAL_OUTPUT_DIR" ]] || {
     echo "--smoke output directory must differ from the formal training output directory" >&2
+    exit 2
+  }
+fi
+if [[ "$smoke" -eq 0 ]]; then
+  [[ "$formal_output_dir_explicit" -eq 0 ]] || {
+    echo "--formal-output-dir is only valid with --smoke" >&2
+    exit 2
+  }
+  [[ -n "$smoke_report" ]] || {
+    echo "formal training requires --smoke-report from a passed bound smoke run" >&2
     exit 2
   }
 fi
@@ -109,6 +140,13 @@ fi
   echo "EXPECTED_MODEL_ARTIFACT_SHA256 must be a SHA-256" >&2
   exit 2
 }
+if [[ "$smoke" -eq 0 ]]; then
+  "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/qwen_sft_smoke_gate.py" check \
+    --report "$smoke_report" \
+    --formal-output-dir "$OUTPUT_DIR" \
+    --train-data "$train_data" \
+    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256"
+fi
 
 # The server cannot reach huggingface.co. Training uses the frozen local model;
 # the mirror remains available for harmless metadata lookups by dependencies.
@@ -322,4 +360,10 @@ if [[ "$smoke" -eq 1 ]]; then
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/verify_qwen35_lora_smoke.py" \
     --output-dir "$OUTPUT_DIR" \
     --report "$OUTPUT_DIR/preflight/training_update.json"
+  "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/qwen_sft_smoke_gate.py" bind \
+    --report "$OUTPUT_DIR/preflight/training_update.json" \
+    --smoke-output-dir "$OUTPUT_DIR" \
+    --formal-output-dir "$FORMAL_OUTPUT_DIR" \
+    --train-data "$train_data" \
+    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256"
 fi

@@ -652,6 +652,8 @@ class FastHybridEvaEvaluator:
         max_total_visual_tokens: int = 24000,
         candidate_results_sha256: str | None = None,
         teacher_model_sha256: str | None = None,
+        served_model_sha256: str | None = None,
+        manifest_sha256: str | None = None,
         experiment_config_sha256: str | None = None,
         scoring_deferred: bool = False,
         teacher_temperature: float = 0.0,
@@ -671,6 +673,8 @@ class FastHybridEvaEvaluator:
         self.max_total_visual_tokens = max_total_visual_tokens
         self.candidate_results_sha256 = candidate_results_sha256
         self.teacher_model_sha256 = teacher_model_sha256
+        self.served_model_sha256 = served_model_sha256 or teacher_model_sha256
+        self.manifest_sha256 = manifest_sha256
         self.trajectory_context = _validated_trajectory_context(trajectory_context)
         context_config = self.trajectory_context.get("experiment_config_sha256")
         if (
@@ -687,12 +691,12 @@ class FastHybridEvaEvaluator:
             else context_config
         )
         if (
-            teacher_model_sha256 is not None
+            self.served_model_sha256 is not None
             and self.trajectory_context.get("model_artifact_sha256") is not None
-            and str(teacher_model_sha256).lower()
+            and str(self.served_model_sha256).lower()
             != self.trajectory_context["model_artifact_sha256"]
         ):
-            raise ValueError("teacher model hash conflicts with trajectory_context")
+            raise ValueError("served model hash conflicts with trajectory_context")
         self.scoring_deferred = bool(scoring_deferred)
         self.teacher_temperature = float(teacher_temperature)
         self.generation_seed = int(generation_seed)
@@ -711,6 +715,10 @@ class FastHybridEvaEvaluator:
             "max_total_visual_tokens": self.max_total_visual_tokens,
             "candidate_results_sha256": self.candidate_results_sha256,
             "teacher_model_sha256": self.teacher_model_sha256,
+            "served_model_sha256": getattr(
+                self, "served_model_sha256", self.teacher_model_sha256
+            ),
+            "manifest_sha256": getattr(self, "manifest_sha256", None),
             "experiment_config_sha256": self.experiment_config_sha256,
             "scoring_deferred": self.scoring_deferred,
             "teacher_temperature": self.teacher_temperature,
@@ -726,7 +734,7 @@ class FastHybridEvaEvaluator:
     def static_audit_fields(self) -> dict[str, Any]:
         context = dict(getattr(self, "trajectory_context", {}) or {})
         model_artifact = context.get("model_artifact_sha256") or getattr(
-            self, "teacher_model_sha256", None
+            self, "served_model_sha256", None
         )
         return {
             "candidate_results_sha256": getattr(
@@ -738,7 +746,10 @@ class FastHybridEvaEvaluator:
                 context.get("experiment_config_sha256")
                 or getattr(self, "experiment_config_sha256", None)
             ),
-            "manifest_sha256": context.get("manifest_sha256"),
+            "manifest_sha256": (
+                context.get("manifest_sha256")
+                or getattr(self, "manifest_sha256", None)
+            ),
             "train600_manifest_sha256": context.get("train600_manifest_sha256"),
             "trajectory_schedule_id": context.get("trajectory_schedule_id"),
             "trajectory_variant_id": context.get("trajectory_variant_id"),

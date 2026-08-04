@@ -378,24 +378,6 @@ def positive_rejection_reason(
             return "unstable_judges"
     if observed != expected_seeds:
         return "incomplete_judge_confirmation"
-    # Stable correctness is necessary but not sufficient for cost-ranked SFT
-    # selection.  A successful trajectory whose API usage is incomplete must
-    # be rejected explicitly; otherwise ``min(..., key=_end_to_end_cost_key)``
-    # aborts the entire rescue plan instead of treating this one run as
-    # ineligible.
-    if row.get("end_to_end_total_tokens_complete") is not True:
-        return "end_to_end_total_cost_incomplete"
-    if row.get("end_to_end_visual_tokens_complete") is not True:
-        return "end_to_end_visual_cost_incomplete"
-    try:
-        for key in (
-            "end_to_end_total_tokens",
-            "end_to_end_visual_tokens",
-            "end_to_end_latency_s",
-        ):
-            _cost_number(row, key)
-    except ValueError:
-        return "end_to_end_cost_invalid"
     return None
 
 

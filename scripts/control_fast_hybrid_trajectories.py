@@ -5,18 +5,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from flashvid_eval.fast_hybrid_trajectory_control import (
     BASE_PLANNER_SEEDS,
     BASE_VISUAL_BUDGETS,
+    SelectionOutcome,
     build_base_run_specs,
     build_rescue_run_specs,
     controller_fingerprint,
     generate_compression_replay_specs,
     pending_run_specs,
+    positive_rejection_reason,
     select_lowest_cost_positives,
     validate_prejudge_coverage,
 )
@@ -66,6 +70,73 @@ def _load_many(paths: Sequence[Path]) -> list[dict[str, Any]]:
 
 def _phase_rows(rows: Iterable[Mapping[str, Any]], phase: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows if str(row.get("phase") or "base") == phase]
+
+
+def _complete_cost_rejection_reason(row: Mapping[str, Any]) -> str | None:
+    if row.get("end_to_end_total_tokens_complete") is not True:
+        return "end_to_end_total_cost_incomplete"
+    if row.get("end_to_end_visual_tokens_complete") is not True:
+        return "end_to_end_visual_cost_incomplete"
+    for key in (
+        "end_to_end_total_tokens",
+        "end_to_end_visual_tokens",
+        "end_to_end_latency_s",
+    ):
+        value = row.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            return "end_to_end_cost_invalid"
+    return None
+
+
+def _select_complete_cost_positives(
+    rows: Iterable[Mapping[str, Any]],
+    answers: Mapping[tuple[str, str], str],
+) -> SelectionOutcome:
+    """Reject otherwise-positive rows with incomplete cost before ranking.
+
+    The frozen controller module is part of every existing run fingerprint, so
+    this operational compatibility filter intentionally lives in the CLI
+    wrapper.  It validates every source identity/ID before omitting a row and
+    preserves a specific offline rejection count for audit.
+    """
+
+    retained: list[dict[str, Any]] = []
+    cost_rejected: Counter[str] = Counter()
+    seen_ids: set[str] = set()
+    for raw in rows:
+        row = dict(raw)
+        trajectory_id = str(row.get("trajectory_id") or "")
+        if not trajectory_id or trajectory_id in seen_ids:
+            raise ValueError(f"missing or duplicate trajectory_id: {trajectory_id}")
+        seen_ids.add(trajectory_id)
+        identity = (
+            str(row.get("dataset") or "").lower(),
+            str(row.get("sample_id") or ""),
+        )
+        answer = answers.get(identity)
+        if answer is None:
+            raise ValueError(f"trajectory is outside Train600: {identity}")
+        if positive_rejection_reason(row, answer) is None:
+            reason = _complete_cost_rejection_reason(row)
+            if reason is not None:
+                cost_rejected[reason] += 1
+                continue
+        retained.append(row)
+
+    outcome = select_lowest_cost_positives(retained, answers)
+    rejected = Counter(outcome.rejected)
+    rejected.update(cost_rejected)
+    return SelectionOutcome(
+        selected=outcome.selected,
+        no_positive_sample_ids=outcome.no_positive_sample_ids,
+        rejected=dict(sorted(rejected.items())),
+        gate=outcome.gate,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -133,7 +204,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise RuntimeError(
                     f"base matrix is incomplete: {len(base_pending)} jobs missing"
                 )
-        base_selection = select_lowest_cost_positives(base_rows, manifest.answers)
+        base_selection = _select_complete_cost_positives(base_rows, manifest.answers)
         rescue_specs = build_rescue_run_specs(
             train_rows,
             no_positive_sample_ids=base_selection.no_positive_sample_ids,
@@ -159,6 +230,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "phase": args.phase,
                 "controller_fingerprint": fingerprint,
                 "no_positive_after_base": len(base_selection.no_positive_sample_ids),
+                "base_selection_rejected": base_selection.rejected,
                 "planned": len(rescue_specs),
                 "completed": len(rescue_specs) - len(pending),
                 "pending": len(pending),
@@ -181,7 +253,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     raise RuntimeError(
                         f"required rescue matrix is incomplete: {len(rescue_pending)} jobs missing"
                     )
-            selection = select_lowest_cost_positives(
+            selection = _select_complete_cost_positives(
                 [*base_rows, *rescue_rows], manifest.answers
             )
             compression = [

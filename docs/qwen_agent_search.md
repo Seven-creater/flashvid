@@ -221,14 +221,14 @@ $PYTHON_BIN scripts/build_qwen_agent_sft.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=4,5,6,7 \
-SFT_ENV_DIR=$PROJECT_DIR/.venv-swift \
+SFT_ENV_DIR=$PROJECT_DIR/.venv-qwen35-sft-cu121 \
   bash scripts/train_qwen_agent_9b_lora.sh \
   --smoke \
   --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
   --output-dir results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora_smoke
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 \
-SFT_ENV_DIR=$PROJECT_DIR/.venv-swift \
+SFT_ENV_DIR=$PROJECT_DIR/.venv-qwen35-sft-cu121 \
   setsid nohup bash scripts/train_qwen_agent_9b_lora.sh \
   --train-data results/eval/qwen_agent_search/trajectories/selected/sft.jsonl \
   > logs/qwen_agent_sft.log 2>&1 < /dev/null &

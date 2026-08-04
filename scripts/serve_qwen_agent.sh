@@ -71,10 +71,16 @@ fi
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export HF_HOME="$PROJECT_DIR/.cache/huggingface"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_CACHE="$PROJECT_DIR/.cache/transformers"
 export VLLM_CACHE_ROOT="$PROJECT_DIR/.cache/vllm"
 export XDG_CACHE_HOME="$PROJECT_DIR/.cache"
 export VLLM_USE_FLASHINFER_SAMPLER=0
+# stop_qwen_agent.sh requires this exact marker before it will signal a PID.
+# It survives exec and prevents a stale pid file from targeting another user's
+# vLLM process that happens to reuse the same PID and port.
+export FLASHVID_QWEN_OWNER_DIR="$PROJECT_DIR"
 if [[ -d "$CUDA_COMPAT_DIR" ]]; then
   export LD_LIBRARY_PATH="$CUDA_COMPAT_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi

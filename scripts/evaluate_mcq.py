@@ -724,6 +724,10 @@ def main() -> None:
         help="Poll partial downloads until --sample accessible items exist.",
     )
     args = parser.parse_args()
+    if args.defer_scoring and args.backend not in {"qwen_agent", "fast_hybrid_eva"}:
+        raise ValueError(
+            "--defer-scoring is supported only by qwen_agent and fast_hybrid_eva"
+        )
     if args.perception_temperature != 0.0:
         raise ValueError("FlashVID perception temperature is frozen at 0")
     if args.experiment_config_sha256 and (
@@ -790,13 +794,21 @@ def main() -> None:
     if args.backend == "qwen_baseline":
         if args.baseline_mode is None:
             raise ValueError("qwen_baseline requires --baseline-mode")
-        experiment_config_sha256 = _validated_sha256(
-            args.experiment_config_sha256,
-            "experiment-config-sha256",
+        experiment_config_sha256 = (
+            _validated_sha256(
+                args.experiment_config_sha256,
+                "experiment-config-sha256",
+            )
+            if args.defer_scoring or args.experiment_config_sha256 is not None
+            else None
         )
-        model_artifact_sha256 = _validated_sha256(
-            args.model_artifact_sha256,
-            "model-artifact-sha256",
+        model_artifact_sha256 = (
+            _validated_sha256(
+                args.model_artifact_sha256,
+                "model-artifact-sha256",
+            )
+            if args.defer_scoring or args.model_artifact_sha256 is not None
+            else None
         )
         if args.server_max_model_len <= 0:
             raise ValueError("server-max-model-len must be positive")
@@ -1174,6 +1186,43 @@ def main() -> None:
             raise ValueError(
                 "fast_hybrid_eva requires --candidate-results with frozen clean Direct output"
             )
+        if args.defer_scoring:
+            if args.trajectory_schedule_id is None:
+                raise ValueError(
+                    "fast_hybrid_eva --defer-scoring requires --trajectory-schedule-id"
+                )
+            if args.expected_agent_config_sha256 is not None:
+                raise ValueError(
+                    "fast_hybrid_eva uses its pinned implementation, not --expected-agent-config-sha256"
+                )
+            if args.train600_manifest_sha256 is None:
+                raise ValueError(
+                    "fast_hybrid_eva --defer-scoring requires --train600-manifest-sha256"
+                )
+            if args.trajectory_replica_id < 0:
+                raise ValueError("trajectory-replica-id must be non-negative")
+            if not args.trajectory_variant_id.strip():
+                raise ValueError("trajectory-variant-id cannot be empty")
+            if args.model != "Qwen3.5-9B":
+                raise ValueError("Fast Hybrid SFT trajectories require Qwen3.5-9B")
+        elif args.trajectory_schedule_id is not None:
+            raise ValueError("--trajectory-schedule-id requires --defer-scoring")
+        experiment_config_sha256 = _validated_sha256(
+            args.experiment_config_sha256,
+            "experiment-config-sha256",
+        )
+        model_artifact_sha256 = _validated_sha256(
+            args.model_artifact_sha256,
+            "model-artifact-sha256",
+        )
+        train600_manifest_sha256 = (
+            _validated_sha256(
+                args.train600_manifest_sha256,
+                "train600-manifest-sha256",
+            )
+            if args.defer_scoring
+            else None
+        )
         candidate_answers = {}
         candidate_records: dict[str, dict] = {}
         unavailable_ids: set[str] = set()
@@ -1278,6 +1327,24 @@ def main() -> None:
             max_call_visual_tokens=args.max_call_visual_tokens,
             max_total_visual_tokens=args.max_total_visual_tokens,
             candidate_results_sha256=candidate_hash,
+            teacher_model_sha256=model_artifact_sha256,
+            experiment_config_sha256=experiment_config_sha256,
+            scoring_deferred=args.defer_scoring,
+            teacher_temperature=args.controller_temperature,
+            generation_seed=args.seed,
+            trajectory_context=(
+                {
+                    "experiment_config_sha256": experiment_config_sha256,
+                    "model_artifact_sha256": model_artifact_sha256,
+                    "manifest_sha256": manifest_hash,
+                    "train600_manifest_sha256": train600_manifest_sha256,
+                    "trajectory_schedule_id": str(args.trajectory_schedule_id),
+                    "trajectory_variant_id": args.trajectory_variant_id,
+                    "trajectory_replica_id": args.trajectory_replica_id,
+                }
+                if args.defer_scoring
+                else None
+            ),
         )
         _write_frozen_json(
             args.output_dir / f"frozen_inputs_{args.dataset}.json",
@@ -1295,6 +1362,15 @@ def main() -> None:
                     "source_data_unavailable": len(unavailable_ids),
                 },
                 "agent_version": args.agent_version,
+                "scoring_deferred": args.defer_scoring,
+                "teacher_temperature": args.controller_temperature,
+                "generation_seed": args.seed,
+                "experiment_config_sha256": experiment_config_sha256,
+                "model_artifact_sha256": model_artifact_sha256,
+                "train600_manifest_sha256": train600_manifest_sha256,
+                "trajectory_schedule_id": args.trajectory_schedule_id,
+                "trajectory_variant_id": args.trajectory_variant_id,
+                "trajectory_replica_id": args.trajectory_replica_id,
                 "official_eva_commit": OFFICIAL_EVA_COMMIT,
                 "run_fingerprint": evaluator.run_fingerprint(),
             },
@@ -1483,6 +1559,12 @@ def main() -> None:
             retry_errors=args.retry_errors,
             candidate_answers=candidate_answers,
             candidate_sources=candidate_sources,
+            candidate_records=(
+                candidate_records
+                if args.backend == "fast_hybrid_eva"
+                else None
+            ),
+            defer_scoring=args.defer_scoring,
         )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

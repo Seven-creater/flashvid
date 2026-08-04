@@ -2,22 +2,26 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SFT_ENV_DIR="${SFT_ENV_DIR:-${PROJECT_DIR}/.venv-swift}"
+SFT_ENV_DIR="${SFT_ENV_DIR:-${PROJECT_DIR}/.venv-qwen35-sft-cu121}"
 SWIFT_BIN="${SWIFT_BIN:-${SFT_ENV_DIR}/bin/swift}"
 SWIFT_PYTHON="${SWIFT_PYTHON:-${SFT_ENV_DIR}/bin/python}"
 MODEL_PATH="${MODEL_PATH:-/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B}"
 EXPECTED_MODEL_ARTIFACT_SHA256="${EXPECTED_MODEL_ARTIFACT_SHA256:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/results/eval/qwen_agent_search/sft_checkpoints/qwen35_9b_lora}"
 FORMAL_OUTPUT_DIR="$OUTPUT_DIR"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+MIN_GPU_MEMORY_MIB="${MIN_GPU_MEMORY_MIB:-43008}"
+HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 train_data=""
 resume=0
 smoke=0
 output_dir_explicit=0
+release_project_services=0
+load_weights_preflight=0
 
 usage() {
-  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke]" >&2
+  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke] [--release-project-services] [--load-weights-preflight]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +45,14 @@ while [[ $# -gt 0 ]]; do
       smoke=1
       shift
       ;;
+    --release-project-services)
+      release_project_services=1
+      shift
+      ;;
+    --load-weights-preflight)
+      load_weights_preflight=1
+      shift
+      ;;
     *)
       usage
       exit 2
@@ -61,6 +73,10 @@ if [[ "$smoke" -eq 1 ]]; then
     echo "--smoke output directory must differ from the formal training output directory" >&2
     exit 2
   }
+fi
+if [[ "$load_weights_preflight" -eq 1 && "$smoke" -ne 1 ]]; then
+  echo "--load-weights-preflight is only valid with --smoke" >&2
+  exit 2
 fi
 
 [[ -f "$train_data" ]] || { echo "training JSONL not found: $train_data" >&2; exit 2; }
@@ -93,18 +109,94 @@ fi
   echo "EXPECTED_MODEL_ARTIFACT_SHA256 must be a SHA-256" >&2
   exit 2
 }
-gpu_count="$(awk -F',' '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")"
-[[ "$gpu_count" -ge 1 && $((32 % gpu_count)) -eq 0 ]] || {
-  echo "effective batch 32 must be divisible by selected GPU count: $CUDA_VISIBLE_DEVICES" >&2
+
+# The server cannot reach huggingface.co. Training uses the frozen local model;
+# the mirror remains available for harmless metadata lookups by dependencies.
+export HF_ENDPOINT
+export HF_HOME="${HF_HOME:-${PROJECT_DIR}/.cache/huggingface}"
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+
+if [[ "$release_project_services" -eq 1 ]]; then
+  # The helper has a strict port allowlist, same-UID check, vLLM command check,
+  # and an environment ownership marker.  A foreign or ambiguous PID aborts.
+  bash "$PROJECT_DIR/scripts/stop_qwen_agent.sh" 8200
+  bash "$PROJECT_DIR/scripts/stop_qwen_agent.sh" 8201
+fi
+
+gpu_free_memory_ok() {
+  local devices=$1
+  local device memory
+  IFS=',' read -ra requested_devices <<<"$devices"
+  for device in "${requested_devices[@]}"; do
+    memory="$(
+      nvidia-smi -i "$device" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
+        | head -n 1 \
+        | tr -d '[:space:]'
+    )"
+    [[ "$memory" =~ ^[0-9]+$ && "$memory" -ge "$MIN_GPU_MEMORY_MIB" ]] || return 1
+  done
+}
+
+eight_gpu_set="0,1,2,3,4,5,6,7"
+four_gpu_set="4,5,6,7"
+if [[ -z "$CUDA_VISIBLE_DEVICES" ]]; then
+  if gpu_free_memory_ok "$eight_gpu_set"; then
+    CUDA_VISIBLE_DEVICES="$eight_gpu_set"
+  elif gpu_free_memory_ok "$four_gpu_set"; then
+    CUDA_VISIBLE_DEVICES="$four_gpu_set"
+  else
+    echo "no 4/8-GPU SFT layout with at least 42 GiB free per GPU" >&2
+    exit 2
+  fi
+fi
+case "$CUDA_VISIBLE_DEVICES" in
+  "$eight_gpu_set") gpu_count=8; gradient_accumulation_steps=4 ;;
+  "$four_gpu_set") gpu_count=4; gradient_accumulation_steps=8 ;;
+  *)
+    echo "CUDA_VISIBLE_DEVICES must be $eight_gpu_set or $four_gpu_set" >&2
+    exit 2
+    ;;
+esac
+gpu_free_memory_ok "$CUDA_VISIBLE_DEVICES" || {
+  echo "each selected GPU must provide at least 42 GiB free: $CUDA_VISIBLE_DEVICES" >&2
   exit 2
 }
-gradient_accumulation_steps=$((32 / gpu_count))
+# A small foreign process is allowed only when the measured free-memory gate
+# still passes. The launcher never signals or otherwise manages foreign PIDs.
 
 "$SWIFT_PYTHON" -c \
   'import importlib.metadata as m
 version = m.version("ms-swift")
 assert version == "4.4.2", f"expected ms-swift 4.4.2, found {version}"'
-"$SWIFT_PYTHON" - "$train_data" <<'PY'
+mkdir -p "$OUTPUT_DIR/preflight"
+training_data="$train_data"
+loss_mask_samples=3
+if [[ "$smoke" -eq 1 ]]; then
+  training_data="$OUTPUT_DIR/preflight/smoke_one_sample.jsonl"
+  "$SWIFT_PYTHON" - "$train_data" "$training_data" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+output = Path(sys.argv[2])
+with source.open(encoding="utf-8") as handle:
+    for line_number, line in enumerate(handle, 1):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise SystemExit(f"row {line_number}: expected an object")
+        output.write_text(json.dumps(value, ensure_ascii=False) + "\n", encoding="utf-8")
+        break
+    else:
+        raise SystemExit("SFT data is empty")
+PY
+  loss_mask_samples=1
+fi
+
+"$SWIFT_PYTHON" - "$training_data" <<'PY'
 import json
 import sys
 
@@ -137,27 +229,25 @@ PY
 # Bind training to the exact frozen 9B artifact and prove that ms-swift's real
 # Qwen3.5 template honors each request-level assistant loss flag.  Both gates
 # run before the script reserves any GPU process.
-mkdir -p "$OUTPUT_DIR/preflight"
 "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/fingerprint_model_artifact.py" \
   --model-root "$MODEL_PATH" \
   --expected-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256" \
   --output "$OUTPUT_DIR/preflight/model_artifact.json"
 "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/verify_swift_loss_mask.py" \
-  --sft-data "$train_data" \
+  --sft-data "$training_data" \
   --model "$MODEL_PATH" \
-  --samples 3 \
+  --samples "$loss_mask_samples" \
   --output "$OUTPUT_DIR/preflight/swift_loss_mask.json"
-
-active_gpu_pids="$(
-  nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null \
-    | sed '/^[[:space:]]*$/d' \
-    | sort -u
-)"
-if [[ -n "$active_gpu_pids" ]]; then
-  echo "selected GPUs must be idle before Qwen3.5-9B SFT; active PIDs:" >&2
-  echo "$active_gpu_pids" >&2
-  exit 2
+model_preflight_args=()
+if [[ "$load_weights_preflight" -eq 1 ]]; then
+  model_preflight_args=(--load-weights)
 fi
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+"$SWIFT_PYTHON" "$PROJECT_DIR/scripts/preflight_qwen35_9b_lora.py" \
+  --model "$MODEL_PATH" \
+  --expected-gpu-count "$gpu_count" \
+  --output "$OUTPUT_DIR/preflight/qwen35_9b_runtime.json" \
+  "${model_preflight_args[@]}"
 
 resume_args=()
 if [[ "$resume" -eq 1 ]]; then
@@ -193,7 +283,7 @@ NPROC_PER_NODE="$gpu_count" \
 "$SWIFT_BIN" sft \
   --model "$MODEL_PATH" \
   --tuner_type lora \
-  --dataset "$train_data" \
+  --dataset "$training_data" \
   --split_dataset_ratio 0 \
   --add_version false \
   --check_model false \

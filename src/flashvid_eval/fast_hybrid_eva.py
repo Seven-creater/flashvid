@@ -9,6 +9,7 @@ candidate gate.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import contextvars
 import hashlib
 import importlib.util
@@ -39,12 +40,28 @@ _ACTIVE_CALLS: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.Contex
 _ACTIVE_TOOL_STATE: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "fast_hybrid_eva_tool_state"
 )
-_ACTIVE_FORCED_TOOL_CALL: contextvars.ContextVar[dict[str, Any] | None] = (
-    contextvars.ContextVar("fast_hybrid_eva_forced_tool_call", default=None)
+_ACTIVE_STAGE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "fast_hybrid_eva_stage", default="unknown"
+)
+_ACTIVE_GENERATION: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "fast_hybrid_eva_generation", default={"temperature": 0.0, "seed": 0}
+)
+_ACTIVE_FORCED_TOOL_CALLS: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("fast_hybrid_eva_forced_tool_calls", default=None)
 )
 _MODULE_LOCK = threading.Lock()
 _OFFICIAL_MODULE: Any | None = None
 _ORIGINAL_FRAME_SELECT: Any | None = None
+
+_TRAJECTORY_CONTEXT_KEYS = {
+    "experiment_config_sha256",
+    "model_artifact_sha256",
+    "manifest_sha256",
+    "train600_manifest_sha256",
+    "trajectory_schedule_id",
+    "trajectory_variant_id",
+    "trajectory_replica_id",
+}
 
 
 def _repo_root() -> Path:
@@ -78,51 +95,157 @@ def _usage_int(usage: dict[str, Any], key: str) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
 
+def _canonical_sha256(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validated_trajectory_context(
+    value: dict[str, Any] | None,
+) -> dict[str, Any]:
+    context = dict(value or {})
+    unknown = sorted(set(context) - _TRAJECTORY_CONTEXT_KEYS)
+    if unknown:
+        raise ValueError(
+            "unsupported trajectory_context keys: " + ", ".join(unknown)
+        )
+    for key in (
+        "experiment_config_sha256",
+        "model_artifact_sha256",
+        "manifest_sha256",
+        "train600_manifest_sha256",
+    ):
+        digest = context.get(key)
+        if digest is None:
+            continue
+        normalized = str(digest).strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError(f"trajectory_context {key} must be a SHA-256 digest")
+        context[key] = normalized
+    for key in ("trajectory_schedule_id", "trajectory_variant_id"):
+        identifier = context.get(key)
+        if identifier is not None:
+            normalized = str(identifier).strip()
+            if not normalized:
+                raise ValueError(f"trajectory_context {key} cannot be empty")
+            context[key] = normalized
+    replica = context.get("trajectory_replica_id")
+    if replica is not None:
+        if isinstance(replica, bool) or not isinstance(replica, int) or replica < 0:
+            raise ValueError(
+                "trajectory_context trajectory_replica_id must be a non-negative integer"
+            )
+    return context
+
+
+def _tool_call_blocks(content: str) -> list[str]:
+    return [
+        match.group(0)
+        for match in re.finditer(
+            r"<tool_call>.*?</tool_call>", content or "", flags=re.DOTALL
+        )
+    ]
+
+
+def _request_record(
+    kwargs: dict[str, Any],
+    *,
+    attempt: int,
+    content: str = "",
+    reasoning_content: str = "",
+    finish_reason: str | None = None,
+    usage: dict[str, Any] | None = None,
+    latency_s: float = 0.0,
+    error: str | None = None,
+    source: str = "model",
+) -> dict[str, Any]:
+    messages = deepcopy(list(kwargs.get("messages") or []))
+    record: dict[str, Any] = {
+        "stage": _ACTIVE_STAGE.get(),
+        "branch": _ACTIVE_STAGE.get(),
+        "request_kind": "eva_agent_turn",
+        "source": source,
+        "model": str(kwargs.get("model") or ""),
+        "messages": messages,
+        "content": content,
+        "assistant_content": content,
+        "assistant_tool_calls": _tool_call_blocks(content),
+        "reasoning_content": reasoning_content,
+        "finish_reason": finish_reason,
+        "usage": dict(usage or {}),
+        "latency_s": float(latency_s),
+        "max_tokens": int(kwargs.get("max_tokens", 2048)),
+        "temperature": float(kwargs.get("temperature", 0.0)),
+        "seed": int(kwargs.get("seed", 0)),
+        "enable_thinking": False,
+        "attempt_index": int(attempt),
+        "prompt_hash": _canonical_sha256(messages),
+    }
+    if error is not None:
+        record["error"] = error
+    return record
+
+
 class _OfficialAsyncCompletions:
     async def create(self, **kwargs: Any) -> Any:
         client = _ACTIVE_CLIENT.get()
         call_log = _ACTIVE_CALLS.get()
-        forced = _ACTIVE_FORCED_TOOL_CALL.get()
-        if forced is not None and not forced["used"]:
-            forced["used"] = True
+        forced = _ACTIVE_FORCED_TOOL_CALLS.get()
+        if forced is not None and int(forced["index"]) < len(forced["calls"]):
+            call_index = int(forced["index"])
+            forced["index"] = call_index + 1
+            forced_call = forced["calls"][call_index]
             content = (
                 "<tool_call>"
-                + json.dumps(forced["call"], separators=(",", ":"))
+                + json.dumps(forced_call, separators=(",", ":"))
                 + "</tool_call>"
             )
             call_log.append(
-                {
-                    "attempt": 0,
-                    "content": content,
-                    "reasoning_content": "",
-                    "finish_reason": "forced_official_confirmation_tool_call",
-                    "usage": {},
-                    "latency_s": 0.0,
-                }
+                _request_record(
+                    kwargs,
+                    attempt=0,
+                    content=content,
+                    finish_reason="forced_official_frame_select",
+                    source=str(forced.get("source") or "deterministic_tool_schedule"),
+                )
             )
             return SimpleNamespace(
                 usage=SimpleNamespace(total_tokens=0),
                 choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
             )
         last_error: Exception | None = None
+        generation = _ACTIVE_GENERATION.get()
+        request_kwargs = dict(kwargs)
+        request_kwargs["temperature"] = float(generation["temperature"])
+        request_kwargs["seed"] = int(generation["seed"])
         for attempt in range(2):
             try:
                 result = client.chat(
                     str(kwargs["model"]),
                     list(kwargs["messages"]),
                     max_tokens=int(kwargs.get("max_tokens", 2048)),
-                    temperature=float(kwargs.get("temperature", 0.0)),
+                    temperature=float(generation["temperature"]),
+                    seed=int(generation["seed"]),
                     chat_template_kwargs={"enable_thinking": False},
                 )
                 call_log.append(
-                    {
-                        "attempt": attempt + 1,
-                        "content": result.content,
-                        "reasoning_content": result.reasoning_content,
-                        "finish_reason": result.finish_reason,
-                        "usage": dict(result.usage),
-                        "latency_s": result.latency_s,
-                    }
+                    _request_record(
+                        request_kwargs,
+                        attempt=attempt + 1,
+                        content=result.content,
+                        reasoning_content=result.reasoning_content,
+                        finish_reason=result.finish_reason,
+                        usage=result.usage,
+                        latency_s=result.latency_s,
+                    )
                 )
                 return SimpleNamespace(
                     usage=SimpleNamespace(
@@ -137,10 +260,11 @@ class _OfficialAsyncCompletions:
             except Exception as exc:  # one immediate retry, then fail the sample
                 last_error = exc
                 call_log.append(
-                    {
-                        "attempt": attempt + 1,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
+                    _request_record(
+                        request_kwargs,
+                        attempt=attempt + 1,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
                 )
         assert last_error is not None
         raise last_error
@@ -162,6 +286,24 @@ async def _budgeted_frame_select(
 
     del tool_version
     state = _ACTIVE_TOOL_STATE.get()
+    expected_calls = state.get("strict_expected_calls")
+    if isinstance(expected_calls, list):
+        call_index = len(state["trace"])
+        if call_index >= len(expected_calls):
+            state["strict_replay_violation"] = "unplanned_extra_frame_select"
+            return None, None
+        expected = expected_calls[call_index]
+        for key in ("start_time", "end_time"):
+            if not math.isclose(
+                float(arguments.get(key, -1.0)),
+                float(expected.get(key, -2.0)),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            ):
+                state["strict_replay_violation"] = (
+                    f"planned_{key}_mismatch_at_call_{call_index}"
+                )
+                return None, None
     remaining = int(state["remaining"])
     if remaining <= 0:
         return None, None
@@ -201,6 +343,7 @@ async def _budgeted_frame_select(
         timeout=90.0,
     )
     if paths:
+        resolved_paths = [str(Path(path).expanduser().resolve()) for path in paths]
         state["remaining"] = remaining - estimated
         state["trace"].append(
             {
@@ -209,6 +352,7 @@ async def _budgeted_frame_select(
                 "nframes": len(paths),
                 "resize": resize,
                 "timestamps": list(timestamps or []),
+                "frame_paths": resolved_paths,
                 "estimated_visual_tokens": estimated,
                 "backend": "official_eva_select_frame_fallback",
             }
@@ -293,6 +437,62 @@ def _confirmation_system(first: str, other: str, version: str) -> str:
     )
 
 
+def _fixed_replay_system(candidate: str | None) -> str:
+    candidate_text = candidate or "unavailable"
+    return (
+        "Replay the supplied frozen evidence schedule using the official EVA Frame Select "
+        "Tool. The tool calls will be inserted deterministically; inspect every returned "
+        "timestamped frame and do not request any additional interval. "
+        f"Direct candidate: {candidate_text}. This is only a hypothesis, not ground truth. "
+        "Keep it unless the visible evidence directly supports another option. After the "
+        "scheduled observations, put the final choice on the last line exactly as Answer: X."
+    )
+
+
+def _validated_replay_calls(
+    planned_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not planned_calls:
+        raise ValueError("fixed evidence replay requires at least one planned call")
+    calls: list[dict[str, Any]] = []
+    for index, raw in enumerate(planned_calls):
+        arguments = raw.get("arguments") if raw.get("tool") == "frame_select" else raw
+        if not isinstance(arguments, dict):
+            raise ValueError(f"planned call {index} must be an object")
+        unknown = set(arguments) - {
+            "start_time",
+            "end_time",
+            "nframes",
+            "resize",
+            "evidence_request",
+            "source_actual_timestamps",
+        }
+        if unknown:
+            raise ValueError(
+                f"planned call {index} has unsupported fields: {sorted(unknown)}"
+            )
+        start = float(arguments["start_time"])
+        end = float(arguments["end_time"])
+        nframes = int(arguments["nframes"])
+        resize = float(arguments.get("resize", 1.0))
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError(f"planned call {index} has an invalid interval")
+        if nframes <= 0 or not math.isfinite(resize) or resize <= 0:
+            raise ValueError(f"planned call {index} has invalid frame settings")
+        calls.append(
+            {
+                "tool": "frame_select",
+                "arguments": {
+                    "start_time": start,
+                    "end_time": end,
+                    "nframes": nframes,
+                    "resize": resize,
+                },
+            }
+        )
+    return calls
+
+
 _QUESTION_TIMESTAMP = re.compile(
     r"(?<!\d)(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)(?!\d)"
 )
@@ -360,6 +560,12 @@ class FastHybridEvaEvaluator:
         max_call_visual_tokens: int = 12000,
         max_total_visual_tokens: int = 24000,
         candidate_results_sha256: str | None = None,
+        teacher_model_sha256: str | None = None,
+        experiment_config_sha256: str | None = None,
+        scoring_deferred: bool = False,
+        teacher_temperature: float = 0.0,
+        generation_seed: int = 0,
+        trajectory_context: dict[str, Any] | None = None,
     ) -> None:
         if version not in {"fast_hybrid_v1", "fast_hybrid_v2"}:
             raise ValueError(f"unsupported fast Hybrid version: {version}")
@@ -373,6 +579,34 @@ class FastHybridEvaEvaluator:
         self.max_call_visual_tokens = max_call_visual_tokens
         self.max_total_visual_tokens = max_total_visual_tokens
         self.candidate_results_sha256 = candidate_results_sha256
+        self.teacher_model_sha256 = teacher_model_sha256
+        self.trajectory_context = _validated_trajectory_context(trajectory_context)
+        context_config = self.trajectory_context.get("experiment_config_sha256")
+        if (
+            experiment_config_sha256 is not None
+            and context_config is not None
+            and str(experiment_config_sha256).lower() != context_config
+        ):
+            raise ValueError(
+                "experiment_config_sha256 conflicts with trajectory_context"
+            )
+        self.experiment_config_sha256 = (
+            str(experiment_config_sha256).lower()
+            if experiment_config_sha256 is not None
+            else context_config
+        )
+        if (
+            teacher_model_sha256 is not None
+            and self.trajectory_context.get("model_artifact_sha256") is not None
+            and str(teacher_model_sha256).lower()
+            != self.trajectory_context["model_artifact_sha256"]
+        ):
+            raise ValueError("teacher model hash conflicts with trajectory_context")
+        self.scoring_deferred = bool(scoring_deferred)
+        self.teacher_temperature = float(teacher_temperature)
+        self.generation_seed = int(generation_seed)
+        if self.teacher_temperature < 0:
+            raise ValueError("teacher_temperature cannot be negative")
         self.official = _load_official_module()
         self.official.FRAME_SAVE_ROOT = str(self.frame_root)
 
@@ -385,6 +619,12 @@ class FastHybridEvaEvaluator:
             "max_call_visual_tokens": self.max_call_visual_tokens,
             "max_total_visual_tokens": self.max_total_visual_tokens,
             "candidate_results_sha256": self.candidate_results_sha256,
+            "teacher_model_sha256": self.teacher_model_sha256,
+            "experiment_config_sha256": self.experiment_config_sha256,
+            "scoring_deferred": self.scoring_deferred,
+            "teacher_temperature": self.teacher_temperature,
+            "generation_seed": self.generation_seed,
+            "trajectory_context": self.trajectory_context,
             "official_commit": OFFICIAL_EVA_COMMIT,
             "official_eval_sha256": _sha256(_official_dir() / "eval-eva.py"),
             "official_frame_tool": frame_tool_identity(),
@@ -392,13 +632,43 @@ class FastHybridEvaEvaluator:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def static_audit_fields(self) -> dict[str, Any]:
+        context = dict(getattr(self, "trajectory_context", {}) or {})
+        model_artifact = context.get("model_artifact_sha256") or getattr(
+            self, "teacher_model_sha256", None
+        )
+        return {
+            "candidate_results_sha256": getattr(
+                self, "candidate_results_sha256", None
+            ),
+            "teacher_model_sha256": getattr(self, "teacher_model_sha256", None),
+            "model_artifact_sha256": model_artifact,
+            "experiment_config_sha256": (
+                context.get("experiment_config_sha256")
+                or getattr(self, "experiment_config_sha256", None)
+            ),
+            "manifest_sha256": context.get("manifest_sha256"),
+            "train600_manifest_sha256": context.get("train600_manifest_sha256"),
+            "trajectory_schedule_id": context.get("trajectory_schedule_id"),
+            "trajectory_variant_id": context.get("trajectory_variant_id"),
+            "trajectory_replica_id": context.get("trajectory_replica_id"),
+            "teacher_temperature": float(
+                getattr(self, "teacher_temperature", 0.0)
+            ),
+            "generation_seed": int(getattr(self, "generation_seed", 0)),
+            "scoring_deferred": bool(getattr(self, "scoring_deferred", False)),
+        }
+
     def _official_run(
         self,
         sample: ModelSample,
         system_prompt: str,
         visual_budget: int,
         stage: str,
-        forced_tool_call: dict[str, Any] | None = None,
+        forced_tool_calls: list[dict[str, Any]] | None = None,
+        *,
+        strict_replay: bool = False,
+        max_turns: int | None = None,
     ) -> dict[str, Any]:
         video = self.index.resolve(sample.video)
         metadata = probe_video(video)
@@ -407,13 +677,34 @@ class FastHybridEvaEvaluator:
             "remaining": max(0, visual_budget),
             "metadata": metadata,
             "trace": [],
+            "strict_expected_calls": (
+                [dict(call["arguments"]) for call in forced_tool_calls]
+                if strict_replay and forced_tool_calls is not None
+                else None
+            ),
+            "strict_replay_violation": None,
         }
         client_token = _ACTIVE_CLIENT.set(self.client)
         calls_token = _ACTIVE_CALLS.set(calls)
         tool_token = _ACTIVE_TOOL_STATE.set(tool_state)
-        forced_token = _ACTIVE_FORCED_TOOL_CALL.set(
-            {"call": forced_tool_call, "used": False}
-            if forced_tool_call is not None
+        stage_token = _ACTIVE_STAGE.set(stage)
+        generation_token = _ACTIVE_GENERATION.set(
+            {
+                "temperature": float(getattr(self, "teacher_temperature", 0.0)),
+                "seed": int(getattr(self, "generation_seed", 0)),
+            }
+        )
+        forced_token = _ACTIVE_FORCED_TOOL_CALLS.set(
+            {
+                "calls": list(forced_tool_calls),
+                "index": 0,
+                "source": (
+                    "deterministic_fixed_evidence_replay"
+                    if strict_replay
+                    else "deterministic_confirmation_schedule"
+                ),
+            }
+            if forced_tool_calls is not None
             else None
         )
         try:
@@ -431,7 +722,7 @@ class FastHybridEvaEvaluator:
                     self.model,
                     {"video_root": str(video.parent)},
                     _JsonTokenizer(),
-                    self.max_turns,
+                    max_turns if max_turns is not None else self.max_turns,
                     "seconds",
                     self.max_call_visual_tokens,
                     720,
@@ -439,7 +730,9 @@ class FastHybridEvaEvaluator:
                 )
             )
         finally:
-            _ACTIVE_FORCED_TOOL_CALL.reset(forced_token)
+            _ACTIVE_FORCED_TOOL_CALLS.reset(forced_token)
+            _ACTIVE_GENERATION.reset(generation_token)
+            _ACTIVE_STAGE.reset(stage_token)
             _ACTIVE_TOOL_STATE.reset(tool_token)
             _ACTIVE_CALLS.reset(calls_token)
             _ACTIVE_CLIENT.reset(client_token)
@@ -459,6 +752,13 @@ class FastHybridEvaEvaluator:
         trace = []
         for call in tool_state["trace"]:
             trace.append({"stage": stage, **call})
+        serialized_messages = record.get("messages")
+        try:
+            messages = json.loads(serialized_messages or "[]")
+        except (TypeError, json.JSONDecodeError):
+            messages = []
+        if not isinstance(messages, list):
+            messages = []
         return {
             "prediction": prediction,
             "raw_response": calls[-1].get("content", "") if calls else "",
@@ -468,9 +768,19 @@ class FastHybridEvaEvaluator:
             "latency_s": sum(float(call.get("latency_s", 0.0)) for call in calls),
             "visual_tokens": visual_budget - int(tool_state["remaining"]),
             "tool_calls": trace,
+            "request_trace": calls,
+            "messages": messages,
+            "prompt_sha256": _canonical_sha256(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": _question(sample)},
+                ]
+            ),
+            "stage": stage,
             "call_records": calls,
             "stop_reason": record.get("stop_reason"),
             "error": record.get("error"),
+            "strict_replay_violation": tool_state.get("strict_replay_violation"),
         }
 
     def fast_hybrid_eva(
@@ -500,7 +810,7 @@ class FastHybridEvaEvaluator:
                 _confirmation_system(verifier, candidate, self.version),
                 remaining,
                 "change_confirmation",
-                forced_confirmation,
+                [forced_confirmation] if forced_confirmation is not None else None,
             )
             change_allowed = bool(
                 first["tool_calls"]
@@ -515,12 +825,75 @@ class FastHybridEvaEvaluator:
             final = candidate
 
         all_runs = [first] + ([confirmation] if confirmation is not None else [])
+        run_stop_reasons = {
+            str(run.get("stage") or "unknown"): run.get("stop_reason")
+            for run in all_runs
+        }
+        run_errors = {
+            str(run.get("stage") or "unknown"): str(run["error"])
+            for run in all_runs
+            if run.get("error")
+        }
+        required_run_failures: list[str] = []
+        for run in all_runs:
+            run_stage = str(run.get("stage") or "unknown")
+            if run.get("error"):
+                required_run_failures.append(f"{run_stage}: {run['error']}")
+            if run.get("prediction") not in model_sample.option_letters:
+                required_run_failures.append(
+                    f"{run_stage}: no valid final answer "
+                    f"(stop_reason={run.get('stop_reason')})"
+                )
+            if not run.get("tool_calls"):
+                required_run_failures.append(
+                    f"{run_stage}: no successful frame_select "
+                    f"(stop_reason={run.get('stop_reason')})"
+                )
+        confirmation_required = bool(
+            candidate and verifier and verifier != candidate
+        )
+        if confirmation_required and confirmation is None:
+            required_run_failures.append(
+                "change_confirmation: required confirmation was not run"
+            )
         usage = {
             key: sum(int(run["usage"][key]) for run in all_runs)
             for key in ("prompt_tokens", "completion_tokens", "total_tokens")
         }
         tool_calls = [call for run in all_runs for call in run["tool_calls"]]
-        fallback = verifier not in model_sample.option_letters
+        request_trace = [
+            request for run in all_runs for request in run.get("request_trace", [])
+        ]
+        conversation_traces = [
+            {"stage": run.get("stage"), "messages": run.get("messages", [])}
+            for run in all_runs
+        ]
+        messages = [
+            {"stage": run.get("stage"), **message}
+            for run in all_runs
+            for message in run.get("messages", [])
+            if isinstance(message, dict)
+        ]
+        prompt_hashes = {
+            str(run.get("stage")): str(run.get("prompt_sha256"))
+            for run in all_runs
+            if run.get("stage") and run.get("prompt_sha256")
+        }
+        fallback = bool(
+            candidate and final == candidate and verifier != candidate
+        )
+        aggregated_error = (
+            "; ".join(dict.fromkeys(required_run_failures))
+            if required_run_failures
+            else None
+        )
+        confirmation_failed = bool(
+            confirmation is not None
+            and any(
+                failure.startswith("change_confirmation:")
+                for failure in required_run_failures
+            )
+        )
         return {
             "backend": "fast_hybrid_eva",
             "agent_version": self.version,
@@ -549,13 +922,24 @@ class FastHybridEvaEvaluator:
             ),
             "change_gate_triggered": bool(candidate and verifier != candidate),
             "change_rejection_reason": (
-                None if change_allowed or verifier == candidate else "independent_confirmation_failed"
+                None
+                if change_allowed or verifier == candidate
+                else "verification_failed"
+                if verifier not in model_sample.option_letters
+                else "confirmation_not_run"
+                if confirmation is None
+                else "confirmation_failed"
+                if confirmation_failed
+                else "independent_confirmation_disagreed"
             ),
             "raw_response": first["raw_response"],
             "confirmation_raw_response": (
                 confirmation["raw_response"] if confirmation else ""
             ),
             "finish_reason": first["finish_reason"],
+            "run_stop_reasons": run_stop_reasons,
+            "run_errors": run_errors,
+            "required_run_failures": required_run_failures,
             "rounds": sum(int(run["rounds"]) for run in all_runs),
             "turn_count": sum(int(run["rounds"]) for run in all_runs),
             "visual_tokens": sum(int(run["visual_tokens"]) for run in all_runs),
@@ -563,14 +947,123 @@ class FastHybridEvaEvaluator:
             **usage,
             "latency_s": sum(float(run["latency_s"]) for run in all_runs),
             "tool_calls": tool_calls,
+            "request_trace": request_trace,
+            "conversation_traces": conversation_traces,
+            "messages": messages,
             "observed_intervals": [
                 [call["start_time"], call["end_time"]] for call in tool_calls
             ],
             "official_eva_commit": OFFICIAL_EVA_COMMIT,
             "official_eva_eval_sha256": _sha256(_official_dir() / "eval-eva.py"),
             "official_eva_frame_tool": frame_tool_identity(),
-            "candidate_results_sha256": self.candidate_results_sha256,
+            **self.static_audit_fields(),
+            "prompt_hashes": prompt_hashes,
+            "prompt_sha256": _canonical_sha256(prompt_hashes),
+            "teacher_identity_sha256": _canonical_sha256(
+                {
+                    "model": getattr(self, "model", ""),
+                    "model_artifact_sha256": self.static_audit_fields()[
+                        "model_artifact_sha256"
+                    ],
+                    "official_eva_commit": OFFICIAL_EVA_COMMIT,
+                }
+            ),
+            "config_sha256": (
+                getattr(self, "experiment_config_sha256", None)
+                or self.run_fingerprint()
+            ),
+            "trajectory_schema_version": "fast_hybrid_eva_unscored_v1",
             "annotation_leak_check": "passed",
             "annotation_leak_reason": "model_sample_excludes_private_scoring_fields",
-            "error": first.get("error"),
+            "error": aggregated_error,
+            "error_type": "required_run_failure" if aggregated_error else None,
+        }
+
+    def replay_fixed_evidence(
+        self,
+        sample: Sample | ModelSample,
+        candidate_answer: str | None,
+        planned_calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Replay frozen intervals through the official EVA loop, then answer once."""
+
+        model_sample = (
+            ModelSample(
+                dataset=sample.dataset,
+                sample_id=sample.sample_id,
+                video=sample.video,
+                question=sample.question,
+                choices=dict(sample.choices),
+                candidate_answer=candidate_answer,
+            )
+            if isinstance(sample, ModelSample)
+            else ModelSample.from_sample(sample, candidate_answer)
+        )
+        calls = _validated_replay_calls(planned_calls)
+        run = self._official_run(
+            model_sample,
+            _fixed_replay_system(model_sample.candidate_answer),
+            self.max_total_visual_tokens,
+            "compression_replay",
+            calls,
+            strict_replay=True,
+            max_turns=max(self.max_turns, len(calls) + 1),
+        )
+        complete_schedule = (
+            len(run["tool_calls"]) == len(calls)
+            and run.get("strict_replay_violation") is None
+        )
+        prediction = run["prediction"] if complete_schedule else None
+        return {
+            "backend": "fast_hybrid_eva_replay",
+            "agent_version": self.version,
+            "prediction": prediction,
+            "final_prediction": prediction,
+            "candidate_answer": model_sample.candidate_answer,
+            "candidate_raw_response": "",
+            "candidate_usage": {},
+            "candidate_latency_s": 0.0,
+            "candidate_rerun": 0,
+            "candidate_changed": bool(
+                model_sample.candidate_answer
+                and prediction
+                and prediction != model_sample.candidate_answer
+            ),
+            "fallback_to_candidate": False,
+            "final_decision_source": "fixed_evidence_replay",
+            "raw_response": run["raw_response"],
+            "finish_reason": run["finish_reason"],
+            "rounds": run["rounds"],
+            "turn_count": run["rounds"],
+            "visual_tokens": run["visual_tokens"],
+            "usage": run["usage"],
+            **run["usage"],
+            "latency_s": run["latency_s"],
+            "tool_calls": run["tool_calls"],
+            "tool_steps": run["tool_calls"],
+            "request_trace": run["request_trace"],
+            "conversation_traces": [
+                {"stage": run["stage"], "messages": run["messages"]}
+            ],
+            "messages": run["messages"],
+            "planned_calls": calls,
+            "planned_calls_completed": complete_schedule,
+            "strict_replay_violation": run.get("strict_replay_violation"),
+            "official_eva_commit": OFFICIAL_EVA_COMMIT,
+            "official_eva_eval_sha256": _sha256(_official_dir() / "eval-eva.py"),
+            "official_eva_frame_tool": frame_tool_identity(),
+            **self.static_audit_fields(),
+            "prompt_hashes": {run["stage"]: run["prompt_sha256"]},
+            "prompt_sha256": run["prompt_sha256"],
+            "trajectory_schema_version": "fast_hybrid_eva_replay_unscored_v1",
+            "annotation_leak_check": "passed",
+            "annotation_leak_reason": "model_sample_excludes_private_scoring_fields",
+            "error": (
+                run.get("error")
+                or (
+                    "fixed evidence schedule was not completed exactly"
+                    if not complete_schedule
+                    else None
+                )
+            ),
         }

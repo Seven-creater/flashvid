@@ -9,13 +9,14 @@ from copy import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .answers import extract_answer_letter, extract_strict_answer_letter
 from .client import OpenAICompatibleClient
 from .datasets import VideoIndex
 from .eva_official import select_frames as official_select_frames
 from .media import estimate_visual_tokens, probe_video
+from .privacy import assert_deferred_result_public
 from .schemas import ModelSample, Sample, ScoringRecord
 
 
@@ -1567,6 +1568,8 @@ def evaluate(
     retry_errors: bool = False,
     candidate_answers: dict[str, str] | None = None,
     candidate_sources: dict[str, str] | None = None,
+    candidate_records: Mapping[str, Mapping[str, Any]] | None = None,
+    defer_scoring: bool = False,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{samples[0].dataset}_{backend}.jsonl"
@@ -1663,16 +1666,30 @@ def evaluate(
                 )
             if expected_run_fingerprint is not None:
                 result["run_fingerprint"] = expected_run_fingerprint
-        scoring = ScoringRecord.from_sample(sample)
-        result.update(
-            {
-                "dataset": scoring.dataset,
-                "sample_id": scoring.sample_id,
-                "video": sample.video,
-                "answer": scoring.answer,
-                "correct": result.get("prediction") == scoring.answer,
-            }
-        )
+        if defer_scoring:
+            # Training trajectories must be persisted before private benchmark
+            # labels are joined.  Fail closed if a backend accidentally copied
+            # scoring metadata into its model-facing result.
+            assert_deferred_result_public(result)
+            result.update(
+                {
+                    "dataset": sample.dataset,
+                    "sample_id": sample.sample_id,
+                    "video": sample.video,
+                    "scoring_deferred": True,
+                }
+            )
+        else:
+            scoring = ScoringRecord.from_sample(sample)
+            result.update(
+                {
+                    "dataset": scoring.dataset,
+                    "sample_id": scoring.sample_id,
+                    "video": sample.video,
+                    "answer": scoring.answer,
+                    "correct": result.get("prediction") == scoring.answer,
+                }
+            )
         result.setdefault("turn_count", result.get("rounds", 0))
         if backend in {"hybrid_frozen", "fast_hybrid_eva", "flashvid_hybrid"}:
             result.setdefault(
@@ -1683,15 +1700,97 @@ def evaluate(
                 ),
             )
             result.setdefault("candidate_rerun", 0)
+            candidate_record = (candidate_records or {}).get(sample.sample_id)
+            if candidate_record is not None:
+                raw_candidate_usage = candidate_record.get("usage")
+                candidate_usage_source = (
+                    raw_candidate_usage
+                    if isinstance(raw_candidate_usage, Mapping)
+                    else candidate_record
+                )
+                candidate_usage = {
+                    key: int(candidate_usage_source.get(key, 0) or 0)
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                }
+                agent_usage_source = result.get("usage")
+                agent_usage_mapping = (
+                    agent_usage_source
+                    if isinstance(agent_usage_source, Mapping)
+                    else result
+                )
+                agent_usage = {
+                    key: int(agent_usage_mapping.get(key, 0) or 0)
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                }
+                if not any(agent_usage.values()) and isinstance(
+                    result.get("request_trace"), list
+                ):
+                    for request in result["request_trace"]:
+                        if not isinstance(request, Mapping):
+                            continue
+                        request_usage = request.get("usage")
+                        if not isinstance(request_usage, Mapping):
+                            continue
+                        for key in agent_usage:
+                            agent_usage[key] += int(request_usage.get(key, 0) or 0)
+                candidate_visual_tokens = int(
+                    candidate_record.get("visual_tokens", 0) or 0
+                )
+                agent_visual_tokens = int(result.get("visual_tokens", 0) or 0)
+                result.update(
+                    {
+                        "candidate_usage": candidate_usage,
+                        "candidate_latency_s": float(
+                            candidate_record.get(
+                                "latency_s", candidate_record.get("elapsed_s", 0.0)
+                            )
+                            or 0.0
+                        ),
+                        "candidate_visual_tokens": candidate_visual_tokens,
+                        "candidate_cost_complete": not bool(
+                            candidate_record.get("error")
+                        ),
+                        "agent_usage": agent_usage,
+                        "agent_visual_tokens": agent_visual_tokens,
+                        "end_to_end_prompt_tokens": (
+                            candidate_usage["prompt_tokens"]
+                            + agent_usage["prompt_tokens"]
+                        ),
+                        "end_to_end_completion_tokens": (
+                            candidate_usage["completion_tokens"]
+                            + agent_usage["completion_tokens"]
+                        ),
+                        "end_to_end_total_tokens": (
+                            candidate_usage["total_tokens"]
+                            + agent_usage["total_tokens"]
+                        ),
+                        "end_to_end_visual_tokens": (
+                            candidate_visual_tokens + agent_visual_tokens
+                        ),
+                        "end_to_end_latency_s": (
+                            float(
+                                candidate_record.get(
+                                    "latency_s",
+                                    candidate_record.get("elapsed_s", 0.0),
+                                )
+                                or 0.0
+                            )
+                            + float(result.get("latency_s", 0.0) or 0.0)
+                        ),
+                    }
+                )
         result.setdefault("gate_reason", result.get("change_rejection_reason"))
-        result.setdefault("question_type", sorted(_question_type_labels(sample.metadata)) or None)
-        result.setdefault(
-            "question_route",
-            result.get("planner_route") or result.get("route") or _question_route(sample.question, sample.metadata),
-        )
+        if not defer_scoring:
+            result.setdefault("question_type", sorted(_question_type_labels(sample.metadata)) or None)
+            result.setdefault(
+                "question_route",
+                result.get("planner_route") or result.get("route") or _question_route(sample.question, sample.metadata),
+            )
         result.setdefault("elapsed_s", time.perf_counter() - started)
         if expected_run_fingerprint is not None:
             result.setdefault("run_fingerprint", expected_run_fingerprint)
+        if defer_scoring:
+            assert_deferred_result_public(result)
         return result
 
     mode = "a" if resume else "w"
@@ -1710,7 +1809,7 @@ def evaluate(
         encoding="utf-8",
     )
     compact.replace(output_path)
-    correct = sum(bool(item.get("correct")) for item in ordered)
+    correct = None if defer_scoring else sum(bool(item.get("correct")) for item in ordered)
     errors = sum(_record_needs_retry(item) for item in ordered)
     summary = {
         "dataset": samples[0].dataset,
@@ -1718,8 +1817,13 @@ def evaluate(
         "total": len(samples),
         "completed": len(ordered),
         "correct": correct,
-        "accuracy": correct / len(ordered) if ordered else None,
+        "accuracy": (
+            None
+            if defer_scoring or not ordered
+            else int(correct) / len(ordered)
+        ),
         "errors": errors,
+        "scoring_deferred": defer_scoring,
         "output": str(output_path),
     }
     (output_dir / f"{samples[0].dataset}_{backend}_summary.json").write_text(

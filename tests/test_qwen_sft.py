@@ -1109,7 +1109,10 @@ def test_qwen9b_training_launcher_hard_gates_model_and_real_loss_mask() -> None:
     assert "fingerprint_model_artifact.py" in text
     assert "verify_swift_loss_mask.py" in text
     assert "--max_length 16384" in text
-    assert "CUDA_VISIBLE_DEVICES:-4,5,6,7" in text
+    assert 'eight_gpu_set="0,1,2,3,4,5,6,7"' in text
+    assert 'four_gpu_set="4,5,6,7"' in text
+    assert "gradient_accumulation_steps=4" in text
+    assert "gradient_accumulation_steps=8" in text
     assert "--smoke requires an explicit independent --output-dir" in text
     assert "--smoke cannot be combined with --resume" in text
     assert "--max_steps 1" in text

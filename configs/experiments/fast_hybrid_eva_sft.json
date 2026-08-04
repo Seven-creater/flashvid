@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "experiment_id": "fast-hybrid-eva-stable-pruned-sft-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/fast_hybrid_eva_sft",
+  "teacher": {
+    "model": "Qwen3.5-9B",
+    "model_path": "/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B",
+    "model_artifact_sha256": "5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60",
+    "agent_version": "fast_hybrid_v2",
+    "official_eva_commit": "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a",
+    "temperature": 0.2,
+    "max_tokens_per_turn": 2048,
+    "base_urls": [
+      "http://127.0.0.1:8200/v1",
+      "http://127.0.0.1:8201/v1"
+    ]
+  },
+  "candidate_protocol": {
+    "model": "Qwen3.5-9B",
+    "enable_thinking": false,
+    "temperature": 0.0,
+    "sampling": "uniform32",
+    "max_tokens": 512,
+    "rerun_inside_agent": false
+  },
+  "datasets": {
+    "lvbench": {
+      "annotations": "/data02/usr/wangqihao/Demo/test/flashvid/data/LVBench_raw_full_root.jsonl",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/06_lvbench",
+      "train_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_train.jsonl",
+      "train_manifest_sha256": "5e0ec526ba3645a0c230943fbed50e0c302a7a519dfb29371f54777875b29cc2",
+      "dev_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_dev.jsonl",
+      "dev_manifest_sha256": "c1fb73c070dac5a99c1d1f66a7b50ccc3475b520c8595f451e30d755e5d357f1",
+      "test_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl",
+      "test_manifest_sha256": "2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb"
+    },
+    "lsdbench": {
+      "annotations": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/test.json",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/07_lsdbench/videos",
+      "train_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_train.jsonl",
+      "train_manifest_sha256": "5bd1d9c6be5bdc44c7a9bd796e2110863b4df8e1b3435d84bcff51ca2d491cd1",
+      "dev_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_dev.jsonl",
+      "dev_manifest_sha256": "c6e1840e055e53fe48fa831ab4b193267af87054155e1b87abcfb12260e31b39",
+      "test_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lsdbench_manifest_42_100.jsonl",
+      "test_manifest_sha256": "37dbd946d8abe870ac4eec7d8d1f787c99c148f43546a97371cb13a8856e68d2"
+    },
+    "cgbench": {
+      "annotations": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/cgbench.json",
+      "video_root": "/data02/pretrained_model/cvr_learn/cvr_data/04_cg-bench/videos_partial",
+      "train_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_train.jsonl",
+      "train_manifest_sha256": "1c7d631c17cfbd578056a2616539bd4e20d24acf1c22ead86ada69197dcaf6c8",
+      "dev_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_dev.jsonl",
+      "dev_manifest_sha256": "fb9239f0243db7abd9b007bd53315abf2fa637540ddf8fee2cee5b9bdec23815",
+      "test_manifest": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/cgbench_manifest_42_100.jsonl",
+      "test_manifest_sha256": "4f60b2876d896741529733841e9497b123c75fee0f5a428c761ac689d8b1b0a6"
+    }
+  },
+  "train600": {
+    "path": "/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/qwen_agent_search/frozen/train600.jsonl",
+    "sha256": "3995454d973aeb6efe6887e821cd5197e0f17a5b9cc32d7c719e6583b487e6c0",
+    "counts": {
+      "lvbench": 200,
+      "lsdbench": 200,
+      "cgbench": 200
+    }
+  },
+  "trajectory_generation": {
+    "visual_budgets": [6000, 12000, 18000, 24000],
+    "generation_seeds": [17, 42, 73],
+    "max_turns": 6,
+    "judge_seeds": [17, 42, 73],
+    "judge_temperature": 0.2,
+    "rescue_visual_budgets": [32000, 48000],
+    "rescue_seeds": [101, 211],
+    "rescue_max_turns": 8,
+    "minimum_frame_select_calls": 1
+  },
+  "pruning": {
+    "order": ["tail_delete", "early_stop", "frame_and_resize"],
+    "frame_and_resize_fractions": [0.75, 0.5, 0.25],
+    "judge_confirmations": 3,
+    "rank_by": ["total_tokens", "visual_tokens", "tool_calls", "latency"]
+  },
+  "sft": {
+    "minimum_stable_total": 300,
+    "minimum_stable_per_dataset": 80,
+    "base_model": "Qwen3.5-9B",
+    "framework": "ms-swift==4.4.2",
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": "all-linear",
+    "freeze_vit": true,
+    "freeze_aligner": true,
+    "max_length": 16384,
+    "packing": false,
+    "effective_batch_size": 32,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "epochs": 3,
+    "enable_thinking": false
+  },
+  "frozen_test_teacher": {
+    "overall_correct": 151,
+    "mean_total_tokens": 17251,
+    "mean_visual_tokens": 15089,
+    "per_dataset_correct": {
+      "lvbench": 45,
+      "lsdbench": 63,
+      "cgbench": 43
+    }
+  }
+}

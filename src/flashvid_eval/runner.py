@@ -1645,11 +1645,12 @@ def evaluate(
                 "decision_source": "candidate_fallback" if fallback else "no_valid_answer",
                 "annotation_leak_check": "not_run",
             }
-            if backend == "flashvid_hybrid" and data_unavailable:
-                # Video resolution fails before any controller or perception
-                # request. Keep the frozen identities for an auditable,
-                # pre-registered source-data exclusion.
-                result.update(evaluator.static_audit_fields())
+            if backend in {"fast_hybrid_eva", "flashvid_hybrid"} and data_unavailable:
+                # Video resolution fails before any model request. Keep the
+                # frozen identities for an auditable source-data exclusion.
+                static_audit_fields = getattr(evaluator, "static_audit_fields", None)
+                if callable(static_audit_fields):
+                    result.update(static_audit_fields())
                 result["annotation_leak_check"] = "passed"
                 result["annotation_leak_reason"] = (
                     "no_model_request_source_video_unavailable"

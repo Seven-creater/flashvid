@@ -373,6 +373,35 @@ def test_retry_errors_retries_candidate_fallback_parse_failure(tmp_path: Path) -
     assert record["trajectory_valid"] is True
 
 
+def test_fast_hybrid_records_missing_source_without_model_leak(tmp_path: Path) -> None:
+    class MissingVideoEvaluator:
+        def run_fingerprint(self) -> str:
+            return "missing-source-test"
+
+        def fast_hybrid_eva(self, sample: Sample, candidate: str | None) -> dict:
+            del sample, candidate
+            raise FileNotFoundError("source video unavailable")
+
+    sample = Sample("lvbench", "missing-1", "missing.mp4", "Q", {"A": "yes", "B": "no"}, "A")
+    output_dir = tmp_path / "missing"
+
+    evaluate(
+        [sample],
+        MissingVideoEvaluator(),
+        "fast_hybrid_eva",
+        output_dir,
+        candidate_answers={},
+        candidate_sources={"missing-1": "none"},
+    )
+
+    record = json.loads((output_dir / "lvbench_fast_hybrid_eva.jsonl").read_text(encoding="utf-8"))
+    assert record["prediction"] is None
+    assert record["data_unavailable"] is True
+    assert record["annotation_leak_check"] == "passed"
+    assert record["candidate_source"] == "none"
+    assert record["candidate_rerun"] == 0
+
+
 def _hybrid_sample(answer: str = "C") -> Sample:
     return Sample(
         "lvbench",

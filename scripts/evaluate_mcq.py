@@ -10,7 +10,7 @@ from pathlib import Path
 
 from flashvid_eval.client import OpenAICompatibleClient
 from flashvid_eval.baseline_diagnostics import DEFAULT_DURATION_BUCKET_EDGES_S
-from flashvid_eval.datasets import load_samples
+from flashvid_eval.datasets import VideoIndex, load_samples
 from flashvid_eval.flashvid_budget import BudgetEndpointPool
 from flashvid_eval.flashvid_hybrid import (
     FlashVIDHybridConfig,
@@ -1175,6 +1175,8 @@ def main() -> None:
                 "fast_hybrid_eva requires --candidate-results with frozen clean Direct output"
             )
         candidate_answers = {}
+        candidate_records: dict[str, dict] = {}
+        unavailable_ids: set[str] = set()
         protocol_violations: list[str] = []
         for line_number, line in enumerate(
             args.candidate_results.read_text(encoding="utf-8").splitlines(),
@@ -1184,8 +1186,17 @@ def main() -> None:
                 continue
             record = json.loads(line)
             sample_id = str(record.get("sample_id"))
-            if sample_id in candidate_answers:
+            if sample_id in candidate_records:
                 raise ValueError(f"duplicate frozen candidate sample_id: {sample_id}")
+            candidate_records[sample_id] = record
+            prediction = str(record.get("prediction") or "").strip().upper()
+            if (
+                not prediction
+                and record.get("data_unavailable") is True
+                and record.get("failure_class") == "data_unavailable"
+            ):
+                unavailable_ids.add(sample_id)
+                continue
             protocol_request = record.get("protocol_request") or {}
             if (
                 record.get("baseline_mode") != "direct"
@@ -1195,7 +1206,6 @@ def main() -> None:
                 or float(protocol_request.get("temperature", -1.0)) != 0.0
             ):
                 protocol_violations.append(f"line {line_number} ({sample_id})")
-            prediction = str(record.get("prediction") or "").strip().upper()
             if prediction:
                 candidate_answers[sample_id] = prediction
         if protocol_violations:
@@ -1204,11 +1214,38 @@ def main() -> None:
                 + ", ".join(protocol_violations[:10])
             )
         sample_by_id = {sample.sample_id: sample for sample in samples}
-        missing = sorted(set(sample_by_id).difference(candidate_answers))
-        if missing:
+        unexpected = sorted(set(candidate_records).difference(sample_by_id))
+        if unexpected:
             raise ValueError(
-                "frozen clean Direct is incomplete for the active manifest: "
-                + ", ".join(missing[:10])
+                "frozen clean Direct contains samples outside the active manifest: "
+                + ", ".join(unexpected[:10])
+            )
+        missing_records = sorted(set(sample_by_id).difference(candidate_records))
+        if missing_records:
+            raise ValueError(
+                "frozen clean Direct is missing active-manifest records: "
+                + ", ".join(missing_records[:10])
+            )
+        unresolved = sorted(
+            set(sample_by_id).difference(candidate_answers).difference(unavailable_ids)
+        )
+        if unresolved:
+            raise ValueError(
+                "frozen clean Direct has unresolved non-data errors: "
+                + ", ".join(unresolved[:10])
+            )
+        video_index = VideoIndex(args.video_root)
+        falsely_unavailable: list[str] = []
+        for sample_id in sorted(unavailable_ids):
+            try:
+                video_index.resolve(sample_by_id[sample_id].video)
+            except FileNotFoundError:
+                continue
+            falsely_unavailable.append(sample_id)
+        if falsely_unavailable:
+            raise ValueError(
+                "frozen clean Direct marks accessible videos unavailable: "
+                + ", ".join(falsely_unavailable[:10])
             )
         invalid = sorted(
             sample_id
@@ -1224,7 +1261,10 @@ def main() -> None:
         candidate_answers = {
             sample_id: candidate_answers[sample_id] for sample_id in sample_by_id
         }
-        candidate_sources = {sample_id: "parsed" for sample_id in candidate_answers}
+        candidate_sources = {
+            sample_id: "parsed" if sample_id in candidate_answers else "none"
+            for sample_id in sample_by_id
+        }
         candidate_hash = _file_sha256(args.candidate_results)
         evaluator = FastHybridEvaEvaluator(
             client,
@@ -1250,6 +1290,7 @@ def main() -> None:
                     "sha256": candidate_hash,
                     "direct_rerun": 0,
                     "parsed": len(candidate_answers),
+                    "source_data_unavailable": len(unavailable_ids),
                 },
                 "agent_version": args.agent_version,
                 "official_eva_commit": OFFICIAL_EVA_COMMIT,

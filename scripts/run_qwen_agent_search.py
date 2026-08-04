@@ -79,7 +79,7 @@ BASELINE_MODES = {
     "permuted_choices",
     "mismatched_video",
 }
-QWEN_REQUEST_TIMEOUT_S = 80
+QWEN_REQUEST_TIMEOUT_S = 3600
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -1815,6 +1815,7 @@ def execute_tasks(
     *,
     endpoint_preflight: bool = True,
     retry_errors: bool = False,
+    request_timeout_s: int | None = None,
 ) -> None:
     assert_safe_execution(tasks)
     if endpoint_preflight:
@@ -1823,6 +1824,11 @@ def execute_tasks(
         raise FileNotFoundError(source_workspace)
     for task in tasks:
         command = list(task.command)
+        if request_timeout_s is not None:
+            if request_timeout_s <= 0:
+                raise ValueError("request_timeout_s must be positive")
+            timeout_index = command.index("--timeout") + 1
+            command[timeout_index] = str(request_timeout_s)
         if retry_errors and "--retry-errors" not in command:
             command.append("--retry-errors")
         subprocess.run(command, cwd=source_workspace, check=True)
@@ -1991,6 +1997,15 @@ def main() -> None:
             "changing the frozen semantic run plan."
         ),
     )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        help=(
+            "Infrastructure-only per-request timeout override. It is intentionally "
+            "excluded from the frozen semantic run plan so a stalled resumable phase "
+            "can be recovered without mixing prompts, models, or sampling settings."
+        ),
+    )
     parser.add_argument("--model-key", choices=("q9", "q4"))
     parser.add_argument(
         "--protocol",
@@ -2131,6 +2146,7 @@ def main() -> None:
                 "task_count": len(tasks),
                 "dry_run": args.dry_run,
                 "retry_errors": args.retry_errors,
+                "request_timeout": args.request_timeout,
             },
             ensure_ascii=False,
             indent=2,
@@ -2161,6 +2177,7 @@ def main() -> None:
         tasks,
         Path(config["source_workspace"]),
         retry_errors=args.retry_errors,
+        request_timeout_s=args.request_timeout,
     )
     if args.phase == "protocol_smoke":
         audit = audit_protocol_smoke(tasks)

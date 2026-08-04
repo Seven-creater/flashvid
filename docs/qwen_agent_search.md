@@ -58,8 +58,9 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 
 若 smoke 被单条瞬时 API/网络错误拦下，先检查该行和服务日志，再用同一命令追加
 `--retry-errors`。恢复标志只补跑错误行，不改变冻结 run plan，也不会重复已完成样本。
-正式任务的单请求超时固定为 80 秒；超过该时间会明确记录基础设施失败并继续，且阶段
-启动器也会在结果文件连续 90 秒没有增长时终止当前可续跑进程。超时不会
+冻结 run-plan 仍记录与旧结果一致的 3600 秒上限；正式启动器通过不进入语义指纹的
+`--request-timeout 80` 设置基础设施恢复上限。超过该时间会明确记录失败并继续，且阶段
+启动器也会在结果文件连续 90 秒没有增长时终止当前可续跑进程。该恢复参数不会
 静默改采样协议或降低帧数。
 
 任务结束后用 `bash scripts/stop_qwen_agent.sh 8200` 停止本项目服务，启动 4B，
@@ -153,6 +154,19 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 ```
 
 每条轨迹同时绑定单库 Train200 SHA 和 Train600 SHA，且由 seed 17/42/73 三个独立 Judge 复核。`build_qwen_agent_sft.py --phase counterfactuals` 对所有稳定正确基础族生成 75%/50%/25% 帧数与前缀删除规格；`run_qwen_counterfactuals.py` 仅重放冻结区间。最终 `--phase select` 只保留 3/3 正确且总 Token 最低的代表轨迹。
+
+基础 12 条轨迹完成后，先用 `collect_qwen_sft_inputs.py` 生成不含反事实的 base bundle。`freeze_qwen_rescue_inputs.py` 离线连接 Train600 标签，只把 12 条均无稳定正确轨迹的 sample ID 写入三个冻结子 manifest，并固定一条 128 帧概览、A3 密集证据分支、uniform128 独立 Direct 与仲裁组成的 `rescue_a4_dense_v1`。模型请求仍由 `ModelSample` 隔断标签。随后用 `launch_qwen_rescue.sh` 运行；救援行的 `variant_id=rescue`，因此不会被误计为第 13 条基础 schedule。最终 bundle 通过 `collect_qwen_sft_inputs.py --rescue-index ...` 同时纳入这些行，稳定正确的救援轨迹也会进入删帧反事实阶段。
+
+```bash
+$PYTHON_BIN scripts/freeze_qwen_rescue_inputs.py \
+  --config configs/experiments/qwen_agent_search.json \
+  --base-bundle results/eval/qwen_agent_search/trajectories/base_bundle.json \
+  --frozen-winner results/eval/qwen_agent_search/frozen/agent_winner.json \
+  --output-dir results/eval/qwen_agent_search/trajectories/rescue/frozen
+
+PYTHON_BIN=$PYTHON_BIN QWEN_STALL_TIMEOUT_S=90 bash scripts/launch_qwen_rescue.sh \
+  results/eval/qwen_agent_search/trajectories/rescue/frozen/rescue_index.json
+```
 
 不要手工拼接轨迹路径或哈希。先把36个基础轨迹任务冻结成一个自校验输入 bundle：
 

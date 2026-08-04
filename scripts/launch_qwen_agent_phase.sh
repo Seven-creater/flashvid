@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PYTHON_BIN=${PYTHON_BIN:-$PROJECT_DIR/.venv/bin/python}
 QWEN_STALL_TIMEOUT_S=${QWEN_STALL_TIMEOUT_S:-90}
+QWEN_REQUEST_TIMEOUT_S=${QWEN_REQUEST_TIMEOUT_S:-80}
 QWEN_WATCH_ROOT=${QWEN_WATCH_ROOT:-$PROJECT_DIR/results/eval/qwen_agent_search}
 
 usage() {
@@ -57,6 +58,7 @@ else
   args+=(--model-key "$MODEL_KEY")
 fi
 args+=("$@")
+args+=(--request-timeout "$QWEN_REQUEST_TIMEOUT_S")
 
 launch_args=("${args[@]}")
 if [[ "$QWEN_STALL_TIMEOUT_S" != "0" ]]; then
@@ -74,4 +76,4 @@ export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 setsid nohup "${launch_args[@]}" >>"$LOG_FILE" 2>&1 < /dev/null &
 pid=$!
 echo "$pid" > "$PID_FILE"
-echo "started phase=$PHASE model=$MODEL_KEY pid=$pid stall_timeout_s=$QWEN_STALL_TIMEOUT_S log=$LOG_FILE"
+echo "started phase=$PHASE model=$MODEL_KEY pid=$pid request_timeout_s=$QWEN_REQUEST_TIMEOUT_S stall_timeout_s=$QWEN_STALL_TIMEOUT_S log=$LOG_FILE"

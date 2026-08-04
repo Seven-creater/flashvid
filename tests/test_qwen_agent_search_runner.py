@@ -306,7 +306,7 @@ def test_protocol_audit_enumerates_models_protocols_and_datasets(tmp_path: Path)
     assert all(task.command[0] == sys.executable for task in tasks)
     assert all("--model-artifact-sha256" in task.command for task in tasks)
     assert all(
-        task.command[task.command.index("--timeout") + 1] == "80"
+        task.command[task.command.index("--timeout") + 1] == "3600"
         for task in tasks
     )
 
@@ -835,6 +835,17 @@ def test_execution_is_sequential_and_rejects_shared_endpoint_models(
         [*task.command, "--retry-errors"] for task in tasks
     ]
     assert all("--retry-errors" not in task.command for task in tasks)
+
+    seen.clear()
+    runner.execute_tasks(
+        tasks,
+        Path(shared["source_workspace"]),
+        endpoint_preflight=False,
+        request_timeout_s=80,
+    )
+    for (command, _), task in zip(seen, tasks):
+        assert command[command.index("--timeout") + 1] == "80"
+        assert task.command[task.command.index("--timeout") + 1] == "3600"
 
 
 def test_endpoint_preflight_requires_exact_served_model(

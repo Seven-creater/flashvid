@@ -1259,7 +1259,9 @@ def main() -> None:
                 + ", ".join(invalid[:10])
             )
         candidate_answers = {
-            sample_id: candidate_answers[sample_id] for sample_id in sample_by_id
+            sample_id: candidate_answers[sample_id]
+            for sample_id in sample_by_id
+            if sample_id in candidate_answers
         }
         candidate_sources = {
             sample_id: "parsed" if sample_id in candidate_answers else "none"

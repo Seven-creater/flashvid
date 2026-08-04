@@ -105,7 +105,8 @@ fi
   --expected-manifest-sha256 "$SUBSET_SHA" --sample 2 --seed 42 \
   --output-dir "$PATCH_DIR" --concurrency 2 --timeout 90 \
   --experiment-config-sha256 "$QWEN_CONFIG_SHA" --baseline-mode direct \
-  --qwen-protocol no_think_greedy --direct-sampling uniform32 --resume
+  --qwen-protocol no_think_greedy --direct-sampling uniform32 \
+  --resume --retry-errors
 
 PATCH="$PATCH_DIR/$PATCH_NAME"
 test -f "$PATCH"

@@ -126,6 +126,11 @@ $PYTHON_BIN scripts/select_qwen_agent_dev_winner.py \
   --winner-output results/eval/qwen_agent_search/frozen/q9_agent_winner.json
 ```
 
+从 `q9_dev_selection.json` 读取每个 `accepted=true` 阶段的 `stage` 与
+`variant_id`，在 4B 服务上用 `agent_dev q4 --framework <stage>
+--search-variant <variant_id>` 运行完全相同的三 seed 配置。4B 结果只作模型规模对照，
+不反向改变 9B Teacher winner，也不在固定 300 条上挑配置。
+
 选择器强制 A0→A4 顺序、三个 seed、平均至少多 2 题且至少两个 seed 获胜。A5 禁用；没有框架通过 Direct 门槛时不会生成 winner。
 
 ## 4. Teacher、轨迹与 SFT

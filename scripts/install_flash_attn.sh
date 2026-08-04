@@ -7,6 +7,7 @@ CUDA_HOME="${CUDA_HOME:-${PROJECT_DIR}/.venv/lib/python3.12/site-packages/nvidia
 STATE_DIR="${STATE_DIR:-${PROJECT_DIR}/.runtime/flash_attn_install}"
 REPORT="${REPORT:-${STATE_DIR}/installed.json}"
 VERSION="${FLASH_ATTN_VERSION:-2.8.3.post1}"
+PYPI_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
 # flash-attn uses its own architecture variable and otherwise compiles kernels
 # for 80, 90, 100 and 120.  This server's RTX A6000 GPUs use the Ampere sm80
 # kernel family; callers may still override the value for another machine.
@@ -26,9 +27,13 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export CC=/usr/bin/gcc
 export CXX=/usr/bin/g++
 export MAX_JOBS="${MAX_JOBS:-8}"
+export PIP_CONFIG_FILE=/dev/null
+export PIP_INDEX_URL
 export PIP_CACHE_DIR="${PROJECT_DIR}/.cache/pip"
+unset PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_NO_INDEX
 
-"$SWIFT_PYTHON" -m pip install --no-build-isolation "flash-attn==${VERSION}"
+"$SWIFT_PYTHON" -m pip install --index-url "$PYPI_INDEX_URL" \
+  --no-build-isolation "flash-attn==${VERSION}"
 "$SWIFT_PYTHON" - "$REPORT" "$VERSION" "$FLASH_ATTN_CUDA_ARCHS" <<'PY'
 import importlib.metadata
 import json

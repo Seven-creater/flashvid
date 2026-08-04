@@ -7,12 +7,21 @@ DATA_PARALLEL_SIZE=${2:-8}
 PORT=${3:-8001}
 ALLOWED_LOCAL_MEDIA_PATH=${ALLOWED_LOCAL_MEDIA_PATH:-/data02/pretrained_model/cvr_learn}
 
+if [[ ! -d "$MODEL_PATH" || ! -f "$MODEL_PATH/config.json" ]]; then
+  echo "MODEL_PATH must be an existing local model directory with config.json; Hugging Face IDs are forbidden: $MODEL_PATH" >&2
+  exit 2
+fi
+MODEL_PATH=$(cd "$MODEL_PATH" && pwd -P)
+
 # This launcher never searches for or stops another service. Call the
 # ownership-aware stop helper for this project explicitly before changing GPU
 # layouts; a busy GPU or port is treated as an external scheduling constraint.
 
 mkdir -p "$PROJECT_DIR/.cache" "$PROJECT_DIR/logs"
 export HF_HOME="$PROJECT_DIR/.cache/huggingface"
+export HF_ENDPOINT="https://hf-mirror.com"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 export TRANSFORMERS_CACHE="$PROJECT_DIR/.cache/transformers"
 export VLLM_CACHE_ROOT="$PROJECT_DIR/.cache/vllm"
 export XDG_CACHE_HOME="$PROJECT_DIR/.cache"

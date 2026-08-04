@@ -3,6 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import urllib.request
+from urllib.parse import urlsplit
+
+
+def validate_media_reference(value: str, *, allow_remote: bool) -> None:
+    if urlsplit(value).scheme.lower() in {"http", "https"} and not allow_remote:
+        raise ValueError(
+            "remote HTTP(S) media is disabled by default; use a local file URI "
+            "or pass --allow-remote-media explicitly"
+        )
 
 
 def main() -> None:
@@ -16,8 +25,19 @@ def main() -> None:
         help="Video URL; repeat the flag to exercise multi-video requests.",
     )
     media.add_argument("--image-url")
+    parser.add_argument("--allow-remote-media", action="store_true")
     parser.add_argument("--prompt", default="Describe this video concisely.")
     args = parser.parse_args()
+
+    try:
+        media_references = [
+            *(args.video_url or []),
+            *([args.image_url] if args.image_url else []),
+        ]
+        for value in media_references:
+            validate_media_reference(value, allow_remote=args.allow_remote_media)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     content = []
     if args.video_url:

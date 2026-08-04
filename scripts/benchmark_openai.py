@@ -6,8 +6,17 @@ import json
 from pathlib import Path
 import statistics
 import time
+from urllib.parse import urlsplit
 
 import aiohttp
+
+
+def validate_media_reference(value: str, *, allow_remote: bool) -> None:
+    if urlsplit(value).scheme.lower() in {"http", "https"} and not allow_remote:
+        raise ValueError(
+            "remote HTTP(S) media is disabled by default; use a local file URI "
+            "or pass --allow-remote-media explicitly"
+        )
 
 
 async def run_one(
@@ -101,6 +110,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="qwen3.5-4b-flashvid")
     parser.add_argument("--video-url", required=True)
+    parser.add_argument("--allow-remote-media", action="store_true")
     parser.add_argument("--prompt", default="Describe this video concisely.")
     parser.add_argument("--requests", type=int, default=64)
     parser.add_argument("--concurrency", type=int, default=16)
@@ -108,6 +118,13 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    try:
+        validate_media_reference(
+            args.video_url,
+            allow_remote=args.allow_remote_media,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     report = asyncio.run(benchmark(args))
     rendered = json.dumps(report, ensure_ascii=False, indent=2)
     print(rendered)
@@ -118,4 +135,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

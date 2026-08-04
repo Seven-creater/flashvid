@@ -17,8 +17,6 @@ MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-32768}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
 ALLOW_SHARED_GPUS=${ALLOW_SHARED_GPUS:-0}
 VLLM_BIN=${VLLM_BIN:-$PROJECT_DIR/.venv/bin/vllm}
-VLLM_ENV_DIR=$(cd "$(dirname "$VLLM_BIN")/.." && pwd)
-CUDA_COMPAT_DIR=${CUDA_COMPAT_DIR:-$VLLM_ENV_DIR/cuda-compat}
 PID_FILE="$PROJECT_DIR/logs/qwen_agent_${PORT}.pid"
 LORA_PATH=${LORA_PATH:-}
 LORA_SERVED_NAME=${LORA_SERVED_NAME:-}
@@ -26,10 +24,18 @@ MAX_LORA_RANK=${MAX_LORA_RANK:-16}
 
 mkdir -p "$PROJECT_DIR/.cache" "$PROJECT_DIR/logs"
 
+if [[ ! -d "$MODEL_PATH" || ! -f "$MODEL_PATH/config.json" ]]; then
+  echo "MODEL_PATH must be an existing local model directory with config.json; Hugging Face IDs are forbidden: $MODEL_PATH" >&2
+  exit 2
+fi
+MODEL_PATH=$(cd "$MODEL_PATH" && pwd -P)
+
 if [[ ! -x "$VLLM_BIN" ]]; then
   echo "vLLM executable not found: $VLLM_BIN" >&2
   exit 2
 fi
+VLLM_ENV_DIR=$(cd "$(dirname "$VLLM_BIN")/.." && pwd)
+CUDA_COMPAT_DIR=${CUDA_COMPAT_DIR:-$VLLM_ENV_DIR/cuda-compat}
 if [[ -n "$LORA_PATH" || -n "$LORA_SERVED_NAME" ]]; then
   [[ -n "$LORA_PATH" && -n "$LORA_SERVED_NAME" ]] || {
     echo "LORA_PATH and LORA_SERVED_NAME must be set together" >&2
@@ -71,8 +77,9 @@ fi
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 export HF_HOME="$PROJECT_DIR/.cache/huggingface"
-export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export HF_ENDPOINT="https://hf-mirror.com"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 export TRANSFORMERS_CACHE="$PROJECT_DIR/.cache/transformers"
 export VLLM_CACHE_ROOT="$PROJECT_DIR/.cache/vllm"
 export XDG_CACHE_HOME="$PROJECT_DIR/.cache"

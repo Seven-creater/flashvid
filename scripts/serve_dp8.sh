@@ -6,7 +6,16 @@ RATIO="${1:-0.10}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_DIR}/models/Qwen3.5-4B}"
 PORT="${PORT:-8000}"
 
+if [[ ! -d "$MODEL_DIR" || ! -f "$MODEL_DIR/config.json" ]]; then
+  echo "MODEL_DIR must be an existing local model directory with config.json; Hugging Face IDs are forbidden: $MODEL_DIR" >&2
+  exit 2
+fi
+MODEL_DIR=$(cd "$MODEL_DIR" && pwd -P)
+
 export HF_HOME="${PROJECT_DIR}/.cache/huggingface"
+export HF_ENDPOINT="https://hf-mirror.com"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 export VLLM_CACHE_ROOT="${PROJECT_DIR}/.cache/vllm"
 export TORCH_HOME="${PROJECT_DIR}/.cache/torch"
 export XDG_CACHE_HOME="${PROJECT_DIR}/.cache"

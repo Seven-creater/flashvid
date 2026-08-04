@@ -12,6 +12,7 @@ from typing import Any
 
 
 IGNORED_NAMES = frozenset({"READY.txt"})
+IGNORED_DIRECTORIES = frozenset({".cache"})
 
 
 def sha256_file(path: Path) -> str:
@@ -29,7 +30,12 @@ def fingerprint_model(root: Path) -> dict[str, Any]:
     files = [
         path
         for path in sorted(resolved.rglob("*"))
-        if path.is_file() and path.name not in IGNORED_NAMES
+        if path.is_file()
+        and path.name not in IGNORED_NAMES
+        and not any(
+            part in IGNORED_DIRECTORIES
+            for part in path.relative_to(resolved).parts
+        )
     ]
     if not files or not any(path.suffix == ".safetensors" for path in files):
         raise ValueError(f"model artifact contains no safetensors weights: {resolved}")

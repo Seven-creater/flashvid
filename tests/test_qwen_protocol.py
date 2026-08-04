@@ -7,6 +7,7 @@ from flashvid_eval.client import ChatResult, OpenAICompatibleClient
 from flashvid_eval.qwen_protocol import (
     NO_THINK_PROTOCOL,
     THINK_PROTOCOL,
+    mcq_answer_response_format,
     next_length_retry_max_tokens,
     parse_strict_json_mcq_answer,
 )
@@ -35,14 +36,17 @@ def test_client_captures_reasoning_finish_reason_and_explicit_request_fields(
         return io.BytesIO(json.dumps(response).encode("utf-8"))
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    response_format = mcq_answer_response_format(list("ABCD"))
     result = OpenAICompatibleClient("http://localhost:8000/v1").chat(
         "Qwen",
         [{"role": "user", "content": "Q"}],
         max_tokens=512,
+        response_format=response_format,
         chat_template_kwargs={"enable_thinking": False},
         sampling_params={"top_p": 0.8},
         mm_processor_kwargs={"num_frames": 32},
         media_io_kwargs={"video_load_backend": "opencv"},
+        extra_body={"return_token_ids": True},
     )
 
     assert result.content == '{"answer":"B"}'
@@ -52,6 +56,8 @@ def test_client_captures_reasoning_finish_reason_and_explicit_request_fields(
     assert captured["top_p"] == 0.8
     assert captured["mm_processor_kwargs"] == {"num_frames": 32}
     assert captured["media_io_kwargs"] == {"video_load_backend": "opencv"}
+    assert captured["response_format"] == response_format
+    assert captured["return_token_ids"] is True
 
 
 def test_chat_result_new_fields_are_backward_compatible() -> None:
@@ -73,7 +79,8 @@ def test_protocols_expose_thinking_and_length_retry_policy() -> None:
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     }
-    assert THINK_PROTOCOL.request_kwargs()["max_tokens"] == 8192
+    assert THINK_PROTOCOL.protocol_id == "think_v2_32768"
+    assert THINK_PROTOCOL.request_kwargs()["max_tokens"] == 32768
     assert THINK_PROTOCOL.request_kwargs()["sampling_params"]["top_p"] == 0.95
     assert THINK_PROTOCOL.request_kwargs()["chat_template_kwargs"] == {
         "enable_thinking": True
@@ -81,25 +88,37 @@ def test_protocols_expose_thinking_and_length_retry_policy() -> None:
     assert "response_format" not in THINK_PROTOCOL.request_kwargs()
     assert "response_format" not in THINK_PROTOCOL.request_kwargs(json_mode=True)
     truncated = ChatResult("", {}, {}, 0.0, finish_reason="length")
-    assert next_length_retry_max_tokens(THINK_PROTOCOL, truncated, 8192) == 32768
     assert next_length_retry_max_tokens(THINK_PROTOCOL, truncated, 32768) is None
     assert next_length_retry_max_tokens(NO_THINK_PROTOCOL, truncated, 512) is None
-    assert next_length_retry_max_tokens(
-        THINK_PROTOCOL,
-        truncated,
-        8192,
-        prompt_tokens=120_000,
-        max_model_len=131_072,
-        reserve_tokens=16,
-    ) == 11_056
-    assert next_length_retry_max_tokens(
-        THINK_PROTOCOL,
-        truncated,
-        8192,
-        prompt_tokens=123_000,
-        max_model_len=131_072,
-        reserve_tokens=16,
-    ) is None
+
+
+def test_mcq_answer_response_format_is_strict_and_sample_specific() -> None:
+    response_format = mcq_answer_response_format(list("ABCDEFGH"))
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "mcq_answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "enum": list("ABCDEFGH")},
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def test_mcq_answer_response_format_rejects_invalid_labels() -> None:
+    for labels in ([], ["A", "A"], ["AA"], ["1"]):
+        try:
+            mcq_answer_response_format(labels)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid labels accepted: {labels}")
 
 
 def test_client_accepts_legacy_reasoning_content(monkeypatch) -> None:
@@ -128,6 +147,7 @@ def test_client_accepts_legacy_reasoning_content(monkeypatch) -> None:
 def test_strict_json_answer_parser_rejects_prose_fences_and_extra_fields() -> None:
     valid = list("ABCD")
     assert parse_strict_json_mcq_answer('{"answer":"B"}', valid) == "B"
+    assert parse_strict_json_mcq_answer('{"answer":"Cello"}', valid) is None
     assert parse_strict_json_mcq_answer('{"answer":"b"}', valid) == "B"
     assert parse_strict_json_mcq_answer('Answer: B', valid) is None
     assert parse_strict_json_mcq_answer('```json\n{"answer":"B"}\n```', valid) is None

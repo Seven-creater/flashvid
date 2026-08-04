@@ -32,8 +32,28 @@ def test_qwen_search_preflight_freezes_counts_hashes_and_video_splits(tmp_path: 
         )
         dataset[split] = {"path": str(path), "sha256": _sha256(path)}
     config = tmp_path / "config.json"
+    model = tmp_path / "model"
+    model.mkdir()
+    tokenizer = model / "tokenizer_config.json"
+    tokenizer.write_text(
+        json.dumps(
+            {
+                "added_tokens_decoder": {
+                    "248053": {"content": "<|vision_start|>"},
+                    "248054": {"content": "<|vision_end|>"},
+                    "248056": {"content": "<|image_pad|>"},
+                    "248057": {"content": "<|video_pad|>"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_payload = {
+        "datasets": {"demo": dataset},
+        "models": {"q9": {"path": str(model)}},
+    }
     config.write_text(
-        json.dumps({"datasets": {"demo": dataset}}),
+        json.dumps(config_payload),
         encoding="utf-8",
     )
     script = Path(__file__).resolve().parents[1] / "scripts" / "preflight_qwen_agent_search.py"
@@ -51,10 +71,14 @@ def test_qwen_search_preflight_freezes_counts_hashes_and_video_splits(tmp_path: 
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["passed"] is True
+    report = json.loads(result.stdout)
+    assert report["passed"] is True
+    assert report["models"]["q9"]["validated_special_token_ids"][
+        "<|video_pad|>"
+    ] == 248057
 
     dataset["dev"]["sha256"] = "0" * 64
-    config.write_text(json.dumps({"datasets": {"demo": dataset}}), encoding="utf-8")
+    config.write_text(json.dumps(config_payload), encoding="utf-8")
     failed = subprocess.run(
         [sys.executable, str(script), "--config", str(config)],
         check=False,

@@ -64,7 +64,12 @@ class QueueClient:
         }
         self.calls.append(call)
         serialized = json.dumps(messages, ensure_ascii=False)
-        visual = 77 if '"video_url"' in serialized else None
+        visual_kind: str | None = None
+        visual: int | None = None
+        if '"video_url"' in serialized:
+            visual_kind, visual = "video", 77
+        elif '"image_url"' in serialized:
+            visual_kind, visual = "image", 55
         usage: dict[str, Any] = {
             "prompt_tokens": 10,
             "completion_tokens": 3,
@@ -72,7 +77,9 @@ class QueueClient:
             "completion_tokens_details": {"reasoning_tokens": 2},
         }
         if visual is not None:
-            usage["prompt_tokens_details"] = {"multimodal_tokens": {"video": visual}}
+            usage["prompt_tokens_details"] = {
+                "multimodal_tokens": {str(visual_kind): visual}
+            }
         raw = {
             "choices": [
                 {
@@ -582,10 +589,8 @@ def test_a4_keeps_branches_independent_and_accounts_confirmation(tmp_path: Path)
     }
     assert client.calls[0]["media_io_kwargs"] == {
         "video": {
-            "num_frames": -1,
-            "fps": pytest.approx(64 / 240),
-            "min_frames": 64,
-            "max_frames": 64,
+            "num_frames": 64,
+            "fps": -1,
         }
     }
     assert result["branch_costs"]["arbiter"]["tool_call_count"] == 1
@@ -675,7 +680,7 @@ def test_inference_protocol_is_forwarded_and_reasoning_is_audited(tmp_path: Path
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     }
-    assert client.calls[0]["extra_body"] is None
+    assert client.calls[0]["extra_body"] == {"return_token_ids": True}
     assert result["request_trace"][0]["reasoning_content"] == "private fake reasoning"
     assert result["request_trace"][0]["enable_thinking"] is True
 

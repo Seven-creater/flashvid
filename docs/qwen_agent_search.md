@@ -36,14 +36,26 @@ CUDA_DEVICES=4,5,6,7 VLLM_BIN=$VLLM_BIN \
   Qwen3.5-9B 8200 4
 ```
 
-运行 q9 协议审计：
+先运行 q9 的三库各10条协议 smoke。smoke 只检查服务、实际抽帧、严格答案解析、
+thinking 分离、截断和 Token 记账，不据此调整准确率：
+
+```bash
+PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
+  configs/experiments/qwen_agent_search.json protocol_smoke q9
+```
+
+当前冻结的 thinking 协议从首轮即统一使用 `max_tokens=32768`，不得混入旧的
+8192→32768 重试结果。no-thinking 最终答案请求必须使用按本题实际选项字母生成的
+JSON Schema；thinking 和 Agent 工具规划请求不得套用该答案 Schema。smoke 完整通过后，
+再运行 q9 协议审计：
 
 ```bash
 PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
   configs/experiments/qwen_agent_search.json protocol_audit q9
 ```
 
-任务结束后用 `bash scripts/stop_qwen_agent.sh 8200` 停止本项目服务，启动 4B，再以 `q4` 运行相同阶段。两者完成后冻结协议：
+任务结束后用 `bash scripts/stop_qwen_agent.sh 8200` 停止本项目服务，启动 4B，
+依次以 `q4` 运行 `protocol_smoke` 和 `protocol_audit`。两者完成后冻结协议：
 
 ```bash
 $PYTHON_BIN scripts/select_qwen_protocol_dev.py \

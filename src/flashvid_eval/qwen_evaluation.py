@@ -6,7 +6,7 @@ import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
@@ -28,9 +28,11 @@ from .privacy import (
 )
 from .qwen_protocol import (
     QwenInferenceProtocol,
+    mcq_answer_response_format,
     next_length_retry_max_tokens,
     parse_strict_json_mcq_answer,
 )
+from .qwen_token_accounting import enrich_usage_with_qwen_prompt_tokens
 from .schemas import ModelSample, Sample, ScoringRecord
 
 
@@ -46,6 +48,7 @@ def _canonical_hash(payload: Mapping[str, Any]) -> str:
 
 def _question_prompt(question: str, choices: Mapping[str, str], *, video: bool) -> str:
     options = "\n".join(f"{letter}. {text}" for letter, text in choices.items())
+    valid_letters = ", ".join(choices)
     evidence = (
         "Use the supplied video as the visual evidence."
         if video
@@ -53,14 +56,17 @@ def _question_prompt(question: str, choices: Mapping[str, str], *, video: bool) 
     )
     return (
         f"{evidence}\nQuestion: {question}\n{options}\n"
-        'Return exactly one JSON object with no prose or extra keys: {"answer":"X"}'
+        "X must be one of ["
+        f"{valid_letters}"
+        ']. Return exactly one JSON object with no prose or extra keys: {"answer":"X"}'
     )
 
 
-BASELINE_PROMPT_ID = "qwen_mcq_strict_json_v1"
+BASELINE_PROMPT_ID = "qwen_mcq_strict_json_v2"
 BASELINE_PROMPT_TEMPLATE_SHA256 = hashlib.sha256(
     (
         "evidence_instruction\nQuestion: {question}\n{letter}. {choice}\n"
+        "X must be one of [{valid_letters}]. "
         'Return exactly one JSON object with no prose or extra keys: {"answer":"X"}'
     ).encode("utf-8")
 ).hexdigest()
@@ -235,7 +241,7 @@ class QwenBaselineRunner:
         )
         return _canonical_hash(
             {
-                "runner": "qwen_baseline_v3",
+                "runner": "qwen_baseline_v4",
                 "model": self.model,
                 "mode": self.config.mode,
                 "protocol": asdict(self.config.protocol),
@@ -266,6 +272,7 @@ class QwenBaselineRunner:
         messages: list[dict[str, Any]],
         *,
         generation_seed: int,
+        valid_letters: Sequence[str],
         mm_processor_kwargs: dict[str, Any] | None = None,
         media_io_kwargs: dict[str, Any] | None = None,
     ) -> tuple[ChatResult, list[dict[str, Any]], float]:
@@ -274,6 +281,9 @@ class QwenBaselineRunner:
         latency = 0.0
         while True:
             kwargs = self.config.protocol.request_kwargs(max_tokens=requested)
+            if not self.config.protocol.enable_thinking:
+                kwargs["response_format"] = mcq_answer_response_format(valid_letters)
+            kwargs["extra_body"] = {"return_token_ids": True}
             assert_annotation_free_request(
                 {
                     "messages": messages,
@@ -291,6 +301,14 @@ class QwenBaselineRunner:
                 media_io_kwargs=media_io_kwargs,
                 **kwargs,
             )
+            if isinstance(result.raw.get("prompt_token_ids"), list):
+                result = replace(
+                    result,
+                    usage=enrich_usage_with_qwen_prompt_tokens(
+                        result.usage,
+                        result.raw,
+                    ),
+                )
             latency += result.latency_s
             attempts.append(
                 {
@@ -365,12 +383,7 @@ class QwenBaselineRunner:
             duration = float(metadata["duration"])
             mm_processor_kwargs = spec.mm_processor_kwargs()
             media_io_kwargs = spec.media_io_kwargs(duration)
-            if spec.num_frames is not None:
-                sampled_frames = spec.num_frames
-            else:
-                sampled_frames = max(4, int(duration * float(spec.fps)))
-                if spec.max_frames is not None:
-                    sampled_frames = min(sampled_frames, spec.max_frames)
+            sampled_frames = spec.requested_num_frames(duration)
 
         if self.config.mode == "choices_only":
             prompt = format_choices_only(choices)
@@ -381,6 +394,7 @@ class QwenBaselineRunner:
         result, attempts, latency = self._chat(
             messages,
             generation_seed=generation_seed,
+            valid_letters=tuple(choices),
             mm_processor_kwargs=mm_processor_kwargs,
             media_io_kwargs=media_io_kwargs,
         )
@@ -394,6 +408,17 @@ class QwenBaselineRunner:
             else displayed_prediction
         )
         usage = dict(result.usage)
+        prompt_token_accounting = usage.get("qwen_prompt_token_accounting")
+        sampled_frames_actual = (
+            int(prompt_token_accounting["processed_video_frame_slots"])
+            if video is not None
+            and isinstance(prompt_token_accounting, Mapping)
+            and isinstance(
+                prompt_token_accounting.get("processed_video_frame_slots"),
+                int,
+            )
+            else None
+        )
         final_prompt_tokens = _token_int(usage.get("prompt_tokens")) or 0
         final_completion_tokens = _token_int(usage.get("completion_tokens")) or 0
         final_total_tokens = (
@@ -504,9 +529,13 @@ class QwenBaselineRunner:
             "mm_processor_kwargs": mm_processor_kwargs,
             "media_io_kwargs": media_io_kwargs,
             "sampled_frames_estimated": sampled_frames,
-            "sampled_frames_actual": None,
+            "sampled_frames_actual": sampled_frames_actual,
             "sampled_frames_source": (
-                "estimated_from_request" if sampled_frames is not None else None
+                "vllm_returned_prompt_token_ids_qwen_temporal_patch2"
+                if sampled_frames_actual is not None
+                else "estimated_from_request"
+                if sampled_frames is not None
+                else None
             ),
             "option_permutation_seed": self.config.option_permutation_seed,
             "displayed_to_original": (
@@ -514,7 +543,15 @@ class QwenBaselineRunner:
             ),
             "protocol_id": self.config.protocol.protocol_id,
             "enable_thinking": self.config.protocol.enable_thinking,
-            "protocol_request": self.config.protocol.request_kwargs(),
+            "protocol_request": {
+                **self.config.protocol.request_kwargs(),
+                **(
+                    {"response_format": mcq_answer_response_format(tuple(choices))}
+                    if not self.config.protocol.enable_thinking
+                    else {}
+                ),
+                "extra_body": {"return_token_ids": True},
+            },
             "prompt_id": BASELINE_PROMPT_ID,
             "prompt_template_sha256": BASELINE_PROMPT_TEMPLATE_SHA256,
             "input_prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),

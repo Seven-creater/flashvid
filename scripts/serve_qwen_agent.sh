@@ -98,6 +98,7 @@ exec "$VLLM_BIN" serve "$MODEL_PATH" \
   --max-num-seqs "$MAX_NUM_SEQS" \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   --reasoning-parser qwen3 \
+  --enable-prompt-tokens-details \
   --media-io-kwargs '{"video":{"num_frames":-1}}' \
   --limit-mm-per-prompt '{"image":9999,"video":1}' \
   --allowed-local-media-path "$ALLOWED_LOCAL_MEDIA_PATH" \

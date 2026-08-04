@@ -13,7 +13,11 @@ from flashvid_eval.qwen_evaluation import (
     direct_sampling_spec,
     evaluate_qwen_runner,
 )
-from flashvid_eval.qwen_protocol import NO_THINK_PROTOCOL, THINK_PROTOCOL
+from flashvid_eval.qwen_protocol import (
+    NO_THINK_PROTOCOL,
+    THINK_PROTOCOL,
+    QwenInferenceProtocol,
+)
 from flashvid_eval.schemas import ModelSample, Sample
 
 
@@ -25,6 +29,14 @@ class FakeClient:
     def chat(self, model, messages, **kwargs):
         self.calls.append({"model": model, "messages": messages, **kwargs})
         return self.results.pop(0)
+
+
+RETRY_THINK_PROTOCOL = QwenInferenceProtocol(
+    protocol_id="test_think_retry",
+    enable_thinking=True,
+    max_tokens=8192,
+    length_retry_max_tokens=32768,
+)
 
 
 def _sample() -> Sample:
@@ -54,6 +66,12 @@ def test_text_baseline_is_annotation_free_and_strict_json(tmp_path: Path) -> Non
     assert result["prediction"] == "B"
     assert result["visual_tokens"] == 0
     assert result["annotation_leak_check"] == "passed"
+    response_format = client.calls[0]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["schema"]["properties"]["answer"][
+        "enum"
+    ] == list("ABCD")
+    assert client.calls[0]["extra_body"] == {"return_token_ids": True}
 
 
 def test_choices_only_runner_sends_no_question_or_video(tmp_path: Path) -> None:
@@ -92,13 +110,10 @@ def test_permuted_choices_runner_maps_displayed_answer_back(tmp_path: Path) -> N
     assert result["prediction"] == "B"
 
 
-def test_thinking_length_retry_records_both_attempts(tmp_path: Path) -> None:
-    client = FakeClient(
-        [
-            ChatResult("", {"completion_tokens": 8192}, {}, 1.0, finish_reason="length"),
-            ChatResult('{"answer":"A"}', {"completion_tokens": 2}, {}, 2.0, finish_reason="stop"),
-        ]
-    )
+def test_frozen_thinking_protocol_starts_at_32768_without_retry(tmp_path: Path) -> None:
+    client = FakeClient([
+        ChatResult('{"answer":"A"}', {"completion_tokens": 2}, {}, 2.0, finish_reason="stop")
+    ])
     runner = QwenBaselineRunner(
         client,
         "Qwen",
@@ -106,12 +121,12 @@ def test_thinking_length_retry_records_both_attempts(tmp_path: Path) -> None:
         QwenBaselineConfig("question_choices", THINK_PROTOCOL),
     )
     result = runner.run(ModelSample.from_sample(_sample(), None))
-    assert [call["max_tokens"] for call in client.calls] == [8192, 32768]
+    assert [call["max_tokens"] for call in client.calls] == [32768]
     assert all("response_format" not in call for call in client.calls)
-    assert result["length_retry_used"] is True
-    assert result["latency_s"] == 3
-    assert result["completion_tokens"] == 8194
-    assert result["total_tokens"] == 8194
+    assert result["length_retry_used"] is False
+    assert result["latency_s"] == 2
+    assert result["completion_tokens"] == 2
+    assert result["total_tokens"] == 2
     assert result["reasoning_tokens"] is None
 
 
@@ -150,7 +165,7 @@ def test_retry_usage_is_cumulative_and_nested_multimodal_tokens_are_parsed(
         tmp_path,
         QwenBaselineConfig(
             "direct",
-            THINK_PROTOCOL,
+            RETRY_THINK_PROTOCOL,
             direct_sampling=direct_sampling_spec("uniform32"),
             max_model_len=131_072,
         ),
@@ -168,13 +183,50 @@ def test_retry_usage_is_cumulative_and_nested_multimodal_tokens_are_parsed(
     assert client.calls[0]["mm_processor_kwargs"] == {"do_sample_frames": False}
     assert client.calls[0]["media_io_kwargs"] == {
         "video": {
-            "num_frames": -1,
-            "fps": 3.2,
-            "min_frames": 32,
-            "max_frames": 32,
+            "num_frames": 32,
+            "fps": -1,
         }
     }
     assert _visual_tokens(first_usage) == 500
+
+
+def test_direct_uses_returned_prompt_ids_for_exact_visual_accounting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "v.mp4").write_bytes(b"fake")
+    monkeypatch.setattr(
+        "flashvid_eval.qwen_evaluation.probe_video",
+        lambda path: {"duration": 10.0, "width": 640, "height": 360},
+    )
+    prompt_ids = [1, 248053, 248057, 248054, 248053, 248057, 248054, 2]
+    client = FakeClient(
+        [
+            ChatResult(
+                '{"answer":"B"}',
+                {"prompt_tokens": len(prompt_ids), "completion_tokens": 1},
+                {"prompt_token_ids": prompt_ids},
+                0.1,
+                finish_reason="stop",
+            )
+        ]
+    )
+    runner = QwenBaselineRunner(
+        client,
+        "Qwen",
+        tmp_path,
+        QwenBaselineConfig(
+            "direct",
+            NO_THINK_PROTOCOL,
+            direct_sampling=direct_sampling_spec("uniform32"),
+        ),
+    )
+    result = runner.run(ModelSample.from_sample(_sample(), None))
+    assert result["visual_tokens"] == 2
+    assert result["visual_token_breakdown"] == {"image": 0, "video": 2}
+    assert result["visual_usage_complete"] is True
+    assert result["sampled_frames_actual"] == 4
+    assert result["sampled_frames_source"].startswith("vllm_returned_prompt_token_ids")
 
 
 def test_retry_respects_context_headroom(tmp_path: Path) -> None:
@@ -195,7 +247,7 @@ def test_retry_respects_context_headroom(tmp_path: Path) -> None:
         tmp_path,
         QwenBaselineConfig(
             "question_choices",
-            THINK_PROTOCOL,
+            RETRY_THINK_PROTOCOL,
             max_model_len=131_072,
         ),
     )
@@ -270,7 +322,7 @@ def test_generation_seed_is_stable_per_sample_and_in_fingerprint(tmp_path: Path)
     assert first["content"] == '{"answer":"B"}'
 
 
-def test_baseline_fingerprint_uses_v3_sampling_schema(
+def test_baseline_fingerprint_uses_v4_sampling_and_answer_schema(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -288,7 +340,7 @@ def test_baseline_fingerprint_uses_v3_sampling_schema(
         QwenBaselineConfig("question_choices", NO_THINK_PROTOCOL),
     )
     assert runner.run_fingerprint() == "fingerprint"
-    assert captured["runner"] == "qwen_baseline_v3"
+    assert captured["runner"] == "qwen_baseline_v4"
 
 
 def test_evaluation_joins_private_answer_only_after_runner_returns(tmp_path: Path) -> None:

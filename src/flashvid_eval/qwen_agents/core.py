@@ -18,6 +18,7 @@ from flashvid_eval.eva_official import frame_tool_identity
 from flashvid_eval.eva_official import select_frames as official_select_frames
 from flashvid_eval.media import estimate_visual_tokens, probe_video
 from flashvid_eval.privacy import AnnotationLeakError, assert_annotation_free_request
+from flashvid_eval.qwen_token_accounting import enrich_usage_with_qwen_prompt_tokens
 from flashvid_eval.schemas import ModelSample
 
 
@@ -336,16 +337,26 @@ class AgentTrace:
             requests = [item for item in self.request_trace if item.branch == branch]
             tools = [item for item in self.tool_steps if item.branch == branch]
             branch_reasoning = [_reasoning_tokens(item.usage) for item in requests]
-            actual_visual = [_api_visual_tokens(item.usage) for item in requests]
-            known_actual = sum(value for value in actual_visual if value is not None)
+            visual_requests = [
+                item for item in requests if _messages_have_visual_media(item.messages)
+            ]
+            actual_visual = [_api_visual_tokens(item.usage) for item in visual_requests]
             estimated = sum(item.visual_tokens for item in tools)
-            has_direct_video = any(_messages_have_video(item.messages) for item in requests)
-            branch_complete = not has_direct_video or all(value is not None for value in actual_visual)
+            branch_complete = all(value is not None for value in actual_visual)
             branch_visual: int | None
-            if has_direct_video:
-                branch_visual = known_actual + estimated if branch_complete else None
+            if visual_requests:
+                branch_visual = (
+                    sum(value for value in actual_visual if value is not None)
+                    if branch_complete
+                    else None
+                )
+            elif tools:
+                # A frame tool call without a corresponding multimodal model
+                # request is not a complete end-to-end visual measurement.
+                branch_complete = False
+                branch_visual = None
             else:
-                branch_visual = estimated
+                branch_visual = 0
             complete = complete and branch_complete
             if branch_visual is not None:
                 visual_total += branch_visual
@@ -362,6 +373,7 @@ class AgentTrace:
                     else None
                 ),
                 "visual_tokens": branch_visual,
+                "estimated_visual_tokens": estimated,
                 "visual_token_accounting_complete": branch_complete,
                 "total_tokens": sum(_total_tokens(item.usage) for item in requests),
                 "latency_s": sum(item.latency_s for item in requests)
@@ -682,7 +694,16 @@ class BaseQwenAgent:
                 sampling_params=self.protocol.sampling_params(),
                 mm_processor_kwargs=mm_processor_kwargs,
                 media_io_kwargs=media_io_kwargs,
+                extra_body={"return_token_ids": True},
             )
+            if isinstance(result.raw.get("prompt_token_ids"), list):
+                result = replace(
+                    result,
+                    usage=enrich_usage_with_qwen_prompt_tokens(
+                        result.usage,
+                        result.raw,
+                    ),
+                )
             raw_choice = ((result.raw.get("choices") or [{}])[0]) if result.raw else {}
             raw_message = raw_choice.get("message") or {}
             reasoning = (
@@ -927,9 +948,9 @@ def _api_visual_tokens(usage: Mapping[str, Any]) -> int | None:
     return None
 
 
-def _messages_have_video(messages: list[dict[str, Any]]) -> bool:
+def _messages_have_visual_media(messages: list[dict[str, Any]]) -> bool:
     serialized = json.dumps(messages, ensure_ascii=False, default=str)
-    return '"video_url"' in serialized
+    return '"video_url"' in serialized or '"image_url"' in serialized
 
 
 def safe_session_id(sample: ModelSample, strategy: str) -> str:

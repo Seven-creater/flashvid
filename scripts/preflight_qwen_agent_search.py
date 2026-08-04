@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from flashvid_eval.qwen_token_accounting import QWEN_SPECIAL_TOKEN_IDS
+
 
 EXPECTED_SPLIT_COUNTS = {"train": 200, "dev": 50, "final": 100}
 FORBIDDEN_IMPORT = re.compile(
@@ -42,6 +44,7 @@ def audit(config_path: Path, source_root: Path) -> dict[str, Any]:
         "config": str(config_path.resolve()),
         "config_sha256": sha256(config_path),
         "datasets": {},
+        "models": {},
         "forbidden_imports": [],
         "passed": True,
     }
@@ -80,6 +83,30 @@ def audit(config_path: Path, source_root: Path) -> dict[str, Any]:
             if left_videos & right_videos:
                 raise RuntimeError(f"{dataset} video overlap: {left}/{right}")
         report["datasets"][dataset] = split_report
+
+    for model_key, model_config in config["models"].items():
+        model_path = Path(model_config["path"])
+        tokenizer_path = model_path / "tokenizer_config.json"
+        if not tokenizer_path.is_file():
+            raise FileNotFoundError(tokenizer_path)
+        tokenizer = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+        decoder = tokenizer.get("added_tokens_decoder")
+        if not isinstance(decoder, dict):
+            raise RuntimeError(f"{model_key} tokenizer has no added_tokens_decoder")
+        validated: dict[str, int] = {}
+        for token, token_id in QWEN_SPECIAL_TOKEN_IDS.items():
+            item = decoder.get(str(token_id))
+            if not isinstance(item, dict) or item.get("content") != token:
+                raise RuntimeError(
+                    f"{model_key} tokenizer special token mismatch: {token_id} != {token}"
+                )
+            validated[token] = token_id
+        report["models"][model_key] = {
+            "path": str(model_path),
+            "tokenizer_config": str(tokenizer_path),
+            "tokenizer_config_sha256": sha256(tokenizer_path),
+            "validated_special_token_ids": validated,
+        }
 
     source_paths = [source_root / "src" / "flashvid_eval" / "qwen_agents"]
     source_paths.extend(

@@ -18,6 +18,7 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "run_qwen_agent_search.py"
 SERVICE_LAUNCHER = (
     Path(__file__).parents[1] / "scripts" / "launch_qwen_agent_service.sh"
 )
+SERVICE_SCRIPT = Path(__file__).parents[1] / "scripts" / "serve_qwen_agent.sh"
 SPEC = importlib.util.spec_from_file_location("run_qwen_agent_search", SCRIPT)
 assert SPEC and SPEC.loader
 runner = importlib.util.module_from_spec(SPEC)
@@ -28,6 +29,9 @@ SPEC.loader.exec_module(runner)
 def test_service_launcher_does_not_depend_on_a_git_executable_bit() -> None:
     content = SERVICE_LAUNCHER.read_text(encoding="utf-8")
     assert 'setsid nohup bash "$PROJECT_DIR/scripts/serve_qwen_agent.sh"' in content
+    assert "--enable-prompt-tokens-details" in SERVICE_SCRIPT.read_text(
+        encoding="utf-8"
+    )
 
 
 def _write(path: Path, content: str) -> dict[str, str]:
@@ -326,9 +330,11 @@ def test_protocol_smoke_audit_blocks_any_thinking_length_retry(tmp_path: Path) -
                 "media_items": 1,
                 "sampling_id": "uniform64",
                 "sampled_frames_estimated": 64,
+                "sampled_frames_actual": 64,
                 "visual_usage_complete": True,
+                "visual_tokens": 1024,
                 "request_attempts": [
-                    {"max_tokens": 8192, "finish_reason": "stop"}
+                    {"max_tokens": 32768, "finish_reason": "stop"}
                 ],
                 "length_retry_used": False,
             }
@@ -355,6 +361,7 @@ def test_protocol_smoke_audit_blocks_any_thinking_length_retry(tmp_path: Path) -
     audit = runner.audit_protocol_smoke(tasks)
     assert audit["status"] == "blocked"
     assert len(audit["thinking_length_truncations"]) == 1
+    assert audit["thinking_length_truncations"][0]["kind"] == "legacy_mixed_budget"
     assert "32768" in audit["required_action"]
 
 

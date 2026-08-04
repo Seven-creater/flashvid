@@ -68,10 +68,10 @@ NO_THINK_PROTOCOL = QwenInferenceProtocol(
 )
 
 THINK_PROTOCOL = QwenInferenceProtocol(
-    protocol_id="think_v1",
+    protocol_id="think_v2_32768",
     enable_thinking=True,
-    max_tokens=8192,
-    length_retry_max_tokens=32768,
+    max_tokens=32768,
+    length_retry_max_tokens=None,
     temperature=1.0,
     top_p=0.95,
     top_k=20,
@@ -84,6 +84,38 @@ QWEN_PROTOCOLS = {
     "no_think": NO_THINK_PROTOCOL,
     "think": THINK_PROTOCOL,
 }
+
+
+def mcq_answer_response_format(valid_letters: Iterable[str]) -> dict[str, Any]:
+    """Build a strict per-sample schema for a final no-thinking MCQ answer."""
+
+    letters: list[str] = []
+    for raw in valid_letters:
+        if not isinstance(raw, str):
+            raise ValueError("MCQ option labels must be strings")
+        letter = raw.strip().upper()
+        if len(letter) != 1 or not letter.isascii() or not letter.isalpha():
+            raise ValueError(f"invalid MCQ option label: {raw!r}")
+        if letter in letters:
+            raise ValueError(f"duplicate MCQ option label: {letter}")
+        letters.append(letter)
+    if not letters:
+        raise ValueError("at least one MCQ option label is required")
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "mcq_answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "answer": {"type": "string", "enum": letters},
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def parse_strict_json_mcq_answer(

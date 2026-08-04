@@ -26,11 +26,14 @@ def _ordered_choices(choices: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
 def format_choices_only(choices: Mapping[str, str]) -> str:
     """Build the deterministic hard-guess control without a question or media."""
 
-    options = "\n".join(f"{letter}. {text}" for letter, text in _ordered_choices(choices))
+    ordered = _ordered_choices(choices)
+    options = "\n".join(f"{letter}. {text}" for letter, text in ordered)
+    valid_letters = ", ".join(letter for letter, _ in ordered)
     return (
         "The question and video are intentionally unavailable. Guess the most "
         "likely answer using only the option texts below.\n"
         f"{options}\n"
+        f"X must be one of [{valid_letters}]. "
         'Return exactly one JSON object: {"answer":"X"}'
     )
 
@@ -173,30 +176,28 @@ class DirectSamplingSpec:
         # against the already sampled array and can go out of bounds.
         return {"do_sample_frames": False}
 
-    def media_io_kwargs(self, duration_s: float) -> dict[str, dict[str, int | float]]:
+    def requested_num_frames(self, duration_s: float) -> int:
         if not math.isfinite(duration_s) or duration_s <= 0:
             raise ValueError("video duration must be positive and finite")
-        video: dict[str, int | float] = {"num_frames": -1}
         if self.num_frames is not None:
-            # Qwen3-VL's vLLM loader is FPS-driven. Pinning min/max to N and
-            # choosing N/duration yields an exact N-frame uniform decode (or
-            # every source frame for clips shorter than N frames).
-            video.update(
-                {
-                    "fps": self.num_frames / duration_s,
-                    "min_frames": self.num_frames,
-                    "max_frames": self.num_frames,
-                }
-            )
-        else:
-            video.update(
-                {
-                    "fps": float(self.fps),
-                    "min_frames": 4,
-                    "max_frames": int(self.max_frames or 768),
-                }
-            )
-        return {"video": video}
+            return int(self.num_frames)
+        frames = max(4, int(math.floor(duration_s * float(self.fps))))
+        frames = min(frames, int(self.max_frames or 768))
+        # Qwen3.5 groups video frames in temporal patches of two.  An explicit
+        # even request avoids an undocumented duplicate padding frame.
+        return max(4, frames - (frames % 2))
+
+    def media_io_kwargs(self, duration_s: float) -> dict[str, dict[str, int | float]]:
+        # vLLM's generic video loader honors num_frames/fps, but not the
+        # Qwen processor's min_frames/max_frames kwargs.  Resolve every policy
+        # to one explicit even frame count before the request so 32/64/128 and
+        # capped 2-FPS runs cannot silently drift.
+        return {
+            "video": {
+                "num_frames": self.requested_num_frames(duration_s),
+                "fps": -1,
+            }
+        }
 
 
 DIRECT_SAMPLING_SPECS = {

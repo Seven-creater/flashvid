@@ -87,8 +87,7 @@
     },
     "think": {
       "enable_thinking": true,
-      "max_tokens": 8192,
-      "length_retry_max_tokens": 32768,
+      "max_tokens": 32768,
       "temperature": 1.0,
       "top_p": 0.95,
       "top_k": 20,

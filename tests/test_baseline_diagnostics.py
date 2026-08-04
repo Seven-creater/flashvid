@@ -81,23 +81,21 @@ def test_direct_sampling_specs_are_mutually_exclusive() -> None:
     }
     assert DIRECT_SAMPLING_SPECS["uniform64"].media_io_kwargs(100.0) == {
         "video": {
-            "num_frames": -1,
-            "fps": 0.64,
-            "min_frames": 64,
-            "max_frames": 64,
+            "num_frames": 64,
+            "fps": -1,
         }
     }
     assert DIRECT_SAMPLING_SPECS["uniform128"].media_io_kwargs(64.0)["video"][
-        "fps"
-    ] == 2.0
+        "num_frames"
+    ] == 128
     assert DIRECT_SAMPLING_SPECS["fps2"].media_io_kwargs(100.0) == {
         "video": {
-            "num_frames": -1,
-            "fps": 2.0,
-            "min_frames": 4,
-            "max_frames": 768,
+            "num_frames": 200,
+            "fps": -1,
         }
     }
+    assert DIRECT_SAMPLING_SPECS["fps2"].requested_num_frames(1000.0) == 768
+    assert DIRECT_SAMPLING_SPECS["fps2"].requested_num_frames(10.9) == 20
     with pytest.raises(ValueError, match="duration"):
         DIRECT_SAMPLING_SPECS["uniform32"].media_io_kwargs(0)
     with pytest.raises(ValueError, match="exactly one"):

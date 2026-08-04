@@ -23,6 +23,10 @@ DEFAULT_ANNOTATION_SENTINELS = (
     "SECRET_ANNOTATION_SENTINEL",
 )
 
+_PUBLIC_ANSWER_SCHEMA_PARENT = (
+    "$request.request_kwargs.response_format.json_schema.schema.properties"
+)
+
 
 class AnnotationLeakError(ValueError):
     """A model-bound payload contains benchmark-private annotation data."""
@@ -50,7 +54,10 @@ def assert_annotation_free_request(
         if isinstance(value, Mapping):
             for raw_key, child in value.items():
                 key = str(raw_key).strip().lower()
-                if key in FORBIDDEN_ANNOTATION_KEYS:
+                is_public_answer_schema = (
+                    key == "answer" and path == _PUBLIC_ANSWER_SCHEMA_PARENT
+                )
+                if key in FORBIDDEN_ANNOTATION_KEYS and not is_public_answer_schema:
                     raise AnnotationLeakError(
                         f"forbidden annotation key at {path}.{key}"
                     )

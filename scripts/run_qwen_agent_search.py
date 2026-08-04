@@ -64,8 +64,7 @@ FROZEN_PROTOCOL_SPECS = {
     },
     "think": {
         "enable_thinking": True,
-        "max_tokens": 8192,
-        "length_retry_max_tokens": 32768,
+        "max_tokens": 32768,
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 20,
@@ -1837,8 +1836,26 @@ def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
                 )
             )
             if protocol == "think" and had_length:
+                legacy_mixed_budget = bool(row.get("length_retry_used")) or (
+                    isinstance(attempts, list)
+                    and any(
+                        isinstance(attempt, Mapping)
+                        and attempt.get("finish_reason") == "length"
+                        and isinstance(attempt.get("max_tokens"), int)
+                        and int(attempt["max_tokens"]) < 32768
+                        for attempt in attempts
+                    )
+                )
                 length_truncations.append(
-                    {"task_id": task.task_id, "sample_id": sample_id}
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "kind": (
+                            "legacy_mixed_budget"
+                            if legacy_mixed_budget
+                            else "length_at_32768"
+                        ),
+                    }
                 )
             failure = next(
                 (
@@ -1867,8 +1884,12 @@ def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
                 failure = "sampling_id_mismatch"
             if failure is None and row.get("sampled_frames_estimated") != 64:
                 failure = "sampled_frame_request_mismatch"
+            if failure is None and row.get("sampled_frames_actual") != 64:
+                failure = "sampled_frame_execution_mismatch"
             if failure is None and row.get("visual_usage_complete") is not True:
                 failure = "visual_token_accounting_incomplete"
+            if failure is None and not isinstance(row.get("visual_tokens"), int):
+                failure = "visual_token_count_missing"
             if failure is not None:
                 issues.append(
                     {
@@ -1879,14 +1900,21 @@ def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
                 )
     status = "passed" if not issues and not length_truncations else "blocked"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "task_count": len(tasks),
         "row_count": row_count,
         "engineering_issues": issues,
         "thinking_length_truncations": length_truncations,
         "required_action": (
-            "set the frozen think protocol max_tokens to 32768 and rerun the entire protocol smoke"
+            (
+                "discard the legacy mixed 8192-to-32768 run and rerun the entire smoke with a frozen 32768-token thinking protocol"
+                if any(
+                    item.get("kind") == "legacy_mixed_budget"
+                    for item in length_truncations
+                )
+                else "thinking reached finish_reason=length at the frozen 32768-token limit; inspect context headroom before rerunning the entire smoke"
+            )
             if length_truncations
             else None
         ),

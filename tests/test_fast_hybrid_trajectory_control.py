@@ -164,6 +164,24 @@ def test_positive_requires_visual_evidence_and_all_three_judges() -> None:
     }
     assert positive_rejection_reason(correct_candidate_fallback, "B") is None
 
+    incomplete_total = {**row, "end_to_end_total_tokens_complete": False}
+    assert (
+        positive_rejection_reason(incomplete_total, "B")
+        == "end_to_end_total_cost_incomplete"
+    )
+
+    incomplete_visual = {**row, "end_to_end_visual_tokens_complete": False}
+    assert (
+        positive_rejection_reason(incomplete_visual, "B")
+        == "end_to_end_visual_cost_incomplete"
+    )
+
+    invalid_cost = {**row, "end_to_end_total_tokens": float("nan")}
+    assert (
+        positive_rejection_reason(invalid_cost, "B")
+        == "end_to_end_cost_invalid"
+    )
+
 
 def test_prejudge_filters_offline_without_serializing_labels() -> None:
     spec = build_base_run_specs(
@@ -273,6 +291,21 @@ def test_offline_join_selects_lowest_cost_and_removes_labels() -> None:
     assert "answer" not in outcome.selected[0]
     assert "question_type" not in outcome.selected[0]
     assert outcome.gate["passed"] is False
+
+
+def test_offline_join_rejects_incomplete_cost_without_aborting() -> None:
+    incomplete = _trajectory(trajectory_id="lvbench:l1:incomplete:0")
+    incomplete["end_to_end_total_tokens_complete"] = False
+    complete = _trajectory(trajectory_id="lvbench:l1:complete:0")
+
+    outcome = select_lowest_cost_positives(
+        [incomplete, complete], {("lvbench", "l1"): "B"}
+    )
+
+    assert [row["trajectory_id"] for row in outcome.selected] == [
+        "lvbench:l1:complete:0"
+    ]
+    assert outcome.rejected == {"end_to_end_total_cost_incomplete": 1}
 
 
 def test_no_positive_sample_gets_exactly_four_deterministic_rescues() -> None:

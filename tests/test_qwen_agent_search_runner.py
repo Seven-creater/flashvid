@@ -306,7 +306,7 @@ def test_protocol_audit_enumerates_models_protocols_and_datasets(tmp_path: Path)
     assert all(task.command[0] == sys.executable for task in tasks)
     assert all("--model-artifact-sha256" in task.command for task in tasks)
     assert all(
-        task.command[task.command.index("--timeout") + 1] == "3600"
+        task.command[task.command.index("--timeout") + 1] == "90"
         for task in tasks
     )
 

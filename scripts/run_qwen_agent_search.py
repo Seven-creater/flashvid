@@ -79,7 +79,7 @@ BASELINE_MODES = {
     "permuted_choices",
     "mismatched_video",
 }
-QWEN_REQUEST_TIMEOUT_S = 3600
+QWEN_REQUEST_TIMEOUT_S = 90
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 

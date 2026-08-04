@@ -13,6 +13,8 @@ import contextvars
 import hashlib
 import importlib.util
 import json
+import math
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -36,6 +38,9 @@ _ACTIVE_CALLS: contextvars.ContextVar[list[dict[str, Any]]] = contextvars.Contex
 )
 _ACTIVE_TOOL_STATE: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
     "fast_hybrid_eva_tool_state"
+)
+_ACTIVE_FORCED_TOOL_CALL: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("fast_hybrid_eva_forced_tool_call", default=None)
 )
 _MODULE_LOCK = threading.Lock()
 _OFFICIAL_MODULE: Any | None = None
@@ -77,6 +82,28 @@ class _OfficialAsyncCompletions:
     async def create(self, **kwargs: Any) -> Any:
         client = _ACTIVE_CLIENT.get()
         call_log = _ACTIVE_CALLS.get()
+        forced = _ACTIVE_FORCED_TOOL_CALL.get()
+        if forced is not None and not forced["used"]:
+            forced["used"] = True
+            content = (
+                "<tool_call>"
+                + json.dumps(forced["call"], separators=(",", ":"))
+                + "</tool_call>"
+            )
+            call_log.append(
+                {
+                    "attempt": 0,
+                    "content": content,
+                    "reasoning_content": "",
+                    "finish_reason": "forced_official_confirmation_tool_call",
+                    "usage": {},
+                    "latency_s": 0.0,
+                }
+            )
+            return SimpleNamespace(
+                usage=SimpleNamespace(total_tokens=0),
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            )
         last_error: Exception | None = None
         for attempt in range(2):
             try:
@@ -266,6 +293,58 @@ def _confirmation_system(first: str, other: str, version: str) -> str:
     )
 
 
+_QUESTION_TIMESTAMP = re.compile(
+    r"(?<!\d)(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)(?!\d)"
+)
+
+
+def _timestamp_seconds(match: re.Match[str]) -> float:
+    return float(
+        int(match.group(1) or 0) * 3600
+        + int(match.group(2)) * 60
+        + int(match.group(3))
+    )
+
+
+def _v2_confirmation_call(
+    sample: ModelSample, first: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Create the pre-registered dense re-observation for a proposed change."""
+
+    calls = list(first.get("tool_calls") or [])
+    if not calls:
+        return None
+    observed = calls[-1]
+    start = float(observed["start_time"])
+    end = float(observed["end_time"])
+    timestamps = list(_QUESTION_TIMESTAMP.finditer(sample.question))
+    if timestamps:
+        first_second = _timestamp_seconds(timestamps[0])
+        if len(timestamps) > 1:
+            second = _timestamp_seconds(timestamps[1])
+            start, end = min(first_second, second), max(first_second, second)
+        else:
+            start, end = first_second - 1.0, first_second + 1.0
+        start = max(0.0, start - 1.0)
+        end += 1.0
+        nframes = min(96, max(8, int(math.ceil((end - start) * 4.0))))
+    else:
+        # Cover the visible before/after context around the verifier's own
+        # decisive interval; the official visual-budget fallback may reduce it.
+        start = max(0.0, start - 5.0)
+        end += 5.0
+        nframes = min(128, max(16, int(math.ceil(end - start))))
+    return {
+        "tool": "frame_select",
+        "arguments": {
+            "start_time": start,
+            "end_time": end,
+            "nframes": nframes,
+            "resize": max(0.75, float(observed.get("resize", 1.0) or 1.0)),
+        },
+    }
+
+
 class FastHybridEvaEvaluator:
     """Accuracy-first frozen-candidate Hybrid backed by official EVA ``single``."""
 
@@ -319,6 +398,7 @@ class FastHybridEvaEvaluator:
         system_prompt: str,
         visual_budget: int,
         stage: str,
+        forced_tool_call: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         video = self.index.resolve(sample.video)
         metadata = probe_video(video)
@@ -331,6 +411,11 @@ class FastHybridEvaEvaluator:
         client_token = _ACTIVE_CLIENT.set(self.client)
         calls_token = _ACTIVE_CALLS.set(calls)
         tool_token = _ACTIVE_TOOL_STATE.set(tool_state)
+        forced_token = _ACTIVE_FORCED_TOOL_CALL.set(
+            {"call": forced_tool_call, "used": False}
+            if forced_tool_call is not None
+            else None
+        )
         try:
             item = {
                 "prompt": [
@@ -354,6 +439,7 @@ class FastHybridEvaEvaluator:
                 )
             )
         finally:
+            _ACTIVE_FORCED_TOOL_CALL.reset(forced_token)
             _ACTIVE_TOOL_STATE.reset(tool_token)
             _ACTIVE_CALLS.reset(calls_token)
             _ACTIVE_CLIENT.reset(client_token)
@@ -404,11 +490,17 @@ class FastHybridEvaEvaluator:
         change_allowed = False
         remaining = max(0, self.max_total_visual_tokens - int(first["visual_tokens"]))
         if candidate and verifier and verifier != candidate and remaining > 0:
+            forced_confirmation = (
+                _v2_confirmation_call(model_sample, first)
+                if self.version == "fast_hybrid_v2"
+                else None
+            )
             confirmation = self._official_run(
                 model_sample,
                 _confirmation_system(verifier, candidate, self.version),
                 remaining,
                 "change_confirmation",
+                forced_confirmation,
             )
             change_allowed = bool(
                 first["tool_calls"]

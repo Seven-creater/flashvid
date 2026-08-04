@@ -54,12 +54,23 @@ def _evaluator(records: list[dict]) -> tuple[FastHybridEvaEvaluator, list[str]]:
     evaluator.candidate_results_sha256 = "a" * 64
     prompts: list[str] = []
 
-    def fake_run(self, sample, system_prompt, visual_budget, stage):
+    forced_calls: list[dict | None] = []
+
+    def fake_run(
+        self,
+        sample,
+        system_prompt,
+        visual_budget,
+        stage,
+        forced_tool_call=None,
+    ):
         del self, sample, visual_budget, stage
         prompts.append(system_prompt)
+        forced_calls.append(forced_tool_call)
         return records.pop(0)
 
     evaluator._official_run = MethodType(fake_run, evaluator)
+    evaluator._forced_calls = forced_calls
     return evaluator, prompts
 
 
@@ -119,6 +130,31 @@ def test_fast_hybrid_rejects_unconfirmed_change() -> None:
     assert result["candidate_changed"] is False
     assert result["change_gate_triggered"] is True
     assert result["change_rejection_reason"] == "independent_confirmation_failed"
+
+
+def test_fast_hybrid_v2_forces_dense_official_confirmation_call() -> None:
+    evaluator, _ = _evaluator([_run_record("C"), _run_record("C")])
+    evaluator.version = "fast_hybrid_v2"
+    sample = Sample(
+        "lsdbench",
+        "timed",
+        "timed.mp4",
+        "What happens from 04:40-04:46?",
+        {"A": "first", "B": "second", "C": "third"},
+        "C",
+    )
+
+    result = evaluator.fast_hybrid_eva(sample, "B")
+
+    forced = evaluator._forced_calls[1]
+    assert result["prediction"] == "C"
+    assert forced["tool"] == "frame_select"
+    assert forced["arguments"] == {
+        "start_time": 279.0,
+        "end_time": 287.0,
+        "nframes": 32,
+        "resize": 1.0,
+    }
 
 
 def test_fast_hybrid_falls_back_when_verifier_has_no_answer() -> None:

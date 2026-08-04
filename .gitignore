@@ -15,6 +15,7 @@ cache/
 artifacts/
 results/
 logs/
+run/
 .cache/
 configs/*.env.sh
 *.partial

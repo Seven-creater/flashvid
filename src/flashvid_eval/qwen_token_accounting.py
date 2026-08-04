@@ -11,7 +11,6 @@ QWEN_VISION_START_TOKEN_ID = 248053
 QWEN_VISION_END_TOKEN_ID = 248054
 QWEN_IMAGE_PAD_TOKEN_ID = 248056
 QWEN_VIDEO_PAD_TOKEN_ID = 248057
-QWEN_VIDEO_TEMPORAL_PATCH_SIZE = 2
 QWEN_SPECIAL_TOKEN_IDS = {
     "<|vision_start|>": QWEN_VISION_START_TOKEN_ID,
     "<|vision_end|>": QWEN_VISION_END_TOKEN_ID,
@@ -75,12 +74,8 @@ def qwen_prompt_token_accounting(
         "vision_segment_count": vision_start,
         "image_tokens": image_tokens,
         "video_tokens": video_tokens,
-        "visual_tokens": image_tokens + video_tokens,
+        "visual_pad_tokens": image_tokens + video_tokens,
         "media_kind": media_kind,
-        "processed_video_frame_slots": (
-            vision_start * QWEN_VIDEO_TEMPORAL_PATCH_SIZE if video_tokens else 0
-        ),
-        "video_temporal_patch_size": QWEN_VIDEO_TEMPORAL_PATCH_SIZE,
     }
 
 
@@ -100,18 +95,38 @@ def enrich_usage_with_qwen_prompt_tokens(
     else:
         details = deepcopy(dict(details))
     returned = details.get("multimodal_tokens")
-    exact = {
+    pad_tokens = {
         "image": int(audit["image_tokens"]),
         "video": int(audit["video_tokens"]),
     }
+    if audit["media_kind"] != "none" and not isinstance(returned, Mapping):
+        raise PromptTokenAccountingError(
+            "response is missing service multimodal token details"
+        )
+    service_tokens: dict[str, int] = {}
     if isinstance(returned, Mapping):
-        for kind, value in exact.items():
-            existing = returned.get(kind)
-            if existing is not None and int(existing) != value:
+        for kind, raw_value in returned.items():
+            if (
+                isinstance(raw_value, bool)
+                or not isinstance(raw_value, int)
+                or raw_value < 0
+            ):
                 raise PromptTokenAccountingError(
-                    f"service {kind} token detail conflicts with returned token IDs"
+                    f"service {kind} multimodal token detail is invalid"
                 )
-    details["multimodal_tokens"] = exact
+            service_tokens[str(kind)] = int(raw_value)
+        for kind, value in pad_tokens.items():
+            if value and service_tokens.get(kind, 0) <= 0:
+                raise PromptTokenAccountingError(
+                    f"service is missing positive {kind} multimodal token detail"
+                )
+    # The service's multimodal total includes more than the repeated Qwen pad
+    # IDs (for example video boundary/metadata tokens), so the two values are
+    # complementary audit signals rather than quantities that must be equal.
+    details["qwen_multimodal_pad_tokens"] = pad_tokens
     result["prompt_tokens_details"] = details
+    audit["service_multimodal_tokens"] = service_tokens
+    audit["service_visual_tokens"] = sum(service_tokens.values())
+    audit["visual_token_source"] = "vllm_prompt_tokens_details_v1"
     result["qwen_prompt_token_accounting"] = audit
     return result

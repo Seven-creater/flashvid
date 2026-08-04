@@ -204,7 +204,13 @@ def test_direct_uses_returned_prompt_ids_for_exact_visual_accounting(
         [
             ChatResult(
                 '{"answer":"B"}',
-                {"prompt_tokens": len(prompt_ids), "completion_tokens": 1},
+                {
+                    "prompt_tokens": len(prompt_ids),
+                    "completion_tokens": 1,
+                    "prompt_tokens_details": {
+                        "multimodal_tokens": {"video": 6}
+                    },
+                },
                 {"prompt_token_ids": prompt_ids},
                 0.1,
                 finish_reason="stop",
@@ -222,11 +228,11 @@ def test_direct_uses_returned_prompt_ids_for_exact_visual_accounting(
         ),
     )
     result = runner.run(ModelSample.from_sample(_sample(), None))
-    assert result["visual_tokens"] == 2
-    assert result["visual_token_breakdown"] == {"image": 0, "video": 2}
+    assert result["visual_tokens"] == 6
+    assert result["visual_token_breakdown"] == {"video": 6}
     assert result["visual_usage_complete"] is True
-    assert result["sampled_frames_actual"] == 4
-    assert result["sampled_frames_source"].startswith("vllm_returned_prompt_token_ids")
+    assert result["sampled_frames_actual"] == 32
+    assert result["sampled_frames_source"].startswith("vllm_explicit_num_frames")
 
 
 def test_retry_respects_context_headroom(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from flashvid_eval.qwen_dev_selection import (
     canonical_sha256,
     file_sha256,
     load_dev_runs,
+    _row_failed,
     write_frozen_json,
 )
 
@@ -144,21 +145,37 @@ def _task(
     rows = []
     for index in range(3):
         correct = index < correct_count
-        rows.append(
-            {
-                "dataset": dataset,
-                "sample_id": f"{dataset}-{index}",
-                "model": model,
-                "strategy": strategy,
-                "prediction": "A" if correct else "B",
-                "answer": "A",
-                "correct": correct,
-                "total_tokens": tokens,
-                "annotation_leak_check": "failed" if leak and index == 0 else "passed",
-                "candidate_rerun": 0,
-                "run_fingerprint": fingerprint,
-            }
-        )
+        row = {
+            "dataset": dataset,
+            "sample_id": f"{dataset}-{index}",
+            "model": model,
+            "strategy": strategy,
+            "prediction": "A" if correct else "B",
+            "answer": "A",
+            "correct": correct,
+            "total_tokens": tokens,
+            "annotation_leak_check": "failed" if leak and index == 0 else "passed",
+            "candidate_rerun": 0,
+            "run_fingerprint": fingerprint,
+        }
+        if mode is not None:
+            row["baseline_mode"] = mode
+        if mode == "direct":
+            assert sampling is not None
+            sampled_frames = {
+                "uniform32": 32,
+                "uniform64": 64,
+                "uniform128": 128,
+                "fps2": 768,
+            }[sampling]
+            row.update(
+                {
+                    "sampled_frames_estimated": sampled_frames,
+                    "sampled_frames_actual": sampled_frames,
+                    "visual_usage_complete": True,
+                }
+            )
+        rows.append(row)
     result = output_dir / f"{dataset}_result.jsonl"
     result.write_text(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
@@ -226,6 +243,45 @@ def _plan(
     path = tmp_path / "plans" / f"{phase}_{framework or 'all'}_{variant or 'all'}.json"
     _write_json(path, payload)
     return path
+
+
+@pytest.mark.parametrize(
+    "invalid_fields",
+    (
+        {"sampled_frames_actual": 63},
+        {"sampled_frames_actual": None},
+        {"sampled_frames_estimated": None},
+        {"visual_usage_complete": False},
+        {"visual_usage_complete": None},
+    ),
+)
+def test_direct_row_requires_executed_frame_match_and_complete_visual_usage(
+    invalid_fields: dict[str, object],
+) -> None:
+    row = {
+        "baseline_mode": "direct",
+        "prediction": "A",
+        "sampled_frames_estimated": 64,
+        "sampled_frames_actual": 64,
+        "visual_usage_complete": True,
+    }
+    assert _row_failed(row) is False
+    assert _row_failed({**row, **invalid_fields}) is True
+
+
+def test_non_direct_row_does_not_require_direct_media_accounting() -> None:
+    assert (
+        _row_failed(
+            {
+                "strategy": "a1_storyboard_zoom",
+                "prediction": "A",
+                "sampled_frames_estimated": 64,
+                "sampled_frames_actual": None,
+                "visual_usage_complete": False,
+            }
+        )
+        is False
+    )
 
 
 def _complete_matrix(tmp_path: Path, *, leak_stage: str | None = None) -> tuple[dict, list[Path]]:
@@ -392,12 +448,12 @@ def test_protocol_selection_rejects_mixed_thinking_output_budgets(
         config, load_dev_runs(plans, canonical_sha256(config))
     )
     assert report["status"] == "blocked"
-    assert "protocol_requires_uniform_32768_rerun:q9" in report["blocking_errors"]
+    assert "protocol_frozen_32768_length_truncation:q9" in report["blocking_errors"]
     points = report["protocol_selection"]["q9"]["points"]
     think = next(point for point in points if ":think:" in point["point_id"])
     assert think["initial_length_truncations"] == 1
     assert think["eligible"] is False
-    assert "requires_uniform_32768_rerun" in think["rejection_reasons"]
+    assert "frozen_32768_length_truncation" in think["rejection_reasons"]
 
 
 def test_leaking_candidate_is_rejected_without_corrupting_incumbent(tmp_path: Path) -> None:

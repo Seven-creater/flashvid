@@ -331,6 +331,18 @@ def load_dev_runs(
 
 
 def _row_failed(row: Mapping[str, Any]) -> bool:
+    direct_media_accounting_failed = False
+    if row.get("baseline_mode") == "direct":
+        estimated_frames = row.get("sampled_frames_estimated")
+        actual_frames = row.get("sampled_frames_actual")
+        direct_media_accounting_failed = bool(
+            not isinstance(estimated_frames, int)
+            or isinstance(estimated_frames, bool)
+            or not isinstance(actual_frames, int)
+            or isinstance(actual_frames, bool)
+            or actual_frames != estimated_frames
+            or row.get("visual_usage_complete") is not True
+        )
     return bool(
         row.get("error")
         or row.get("error_type")
@@ -340,6 +352,7 @@ def _row_failed(row: Mapping[str, Any]) -> bool:
         or row.get("control_unavailable")
         or row.get("prediction") is None
         or row.get("finish_reason") == "length"
+        or direct_media_accounting_failed
     )
 
 
@@ -537,12 +550,12 @@ def _select_protocols(
             )
             points[protocol].summary["initial_length_truncations"] = length_truncations
             if protocol == "think" and length_truncations:
-                reason = "requires_uniform_32768_rerun"
+                reason = "frozen_32768_length_truncation"
                 points[protocol].summary["eligible"] = False
                 if reason not in points[protocol].summary["rejection_reasons"]:
                     points[protocol].summary["rejection_reasons"].append(reason)
                 blocking.append(
-                    f"protocol_requires_uniform_32768_rerun:{model_key}"
+                    f"protocol_frozen_32768_length_truncation:{model_key}"
                 )
             if points[protocol].summary["missing_datasets"]:
                 blocking.append(f"incomplete_protocol_audit:{model_key}:{protocol}")

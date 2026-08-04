@@ -61,6 +61,37 @@ def test_annotation_guard_allows_only_the_public_answer_schema_property() -> Non
         )
 
 
+@pytest.mark.parametrize(
+    "answer_schema",
+    (
+        {"const": "B"},
+        {"type": "string", "enum": ["A", "B"], "description": "B is correct"},
+        {"type": "string", "enum": ["A", "B"], "metadata": {"value": "B"}},
+        {"type": "string", "enum": ["B"]},
+        {"type": "string", "enum": ["A", "A"]},
+        {"type": "string", "enum": ["A", "correct=B"]},
+        {"type": "number", "enum": ["A", "B"]},
+    ),
+)
+def test_annotation_guard_rejects_unsafe_public_answer_schema(
+    answer_schema: dict[str, object],
+) -> None:
+    with pytest.raises(AnnotationLeakError, match="forbidden annotation key"):
+        assert_annotation_free_request(
+            {
+                "request_kwargs": {
+                    "response_format": {
+                        "json_schema": {
+                            "schema": {
+                                "properties": {"answer": answer_schema}
+                            }
+                        }
+                    }
+                }
+            }
+        )
+
+
 def test_deferred_result_guard_rejects_labels_but_allows_model_predictions() -> None:
     assert_deferred_result_public(
         {

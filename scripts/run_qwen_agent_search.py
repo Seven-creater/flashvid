@@ -492,6 +492,38 @@ def validate_inputs(config: Mapping[str, Any], *, check_files: bool = True) -> N
         raise RuntimeError("frozen Train600 does not match the three Train200 manifests")
 
 
+def load_passed_preflight(
+    path: Path,
+    config: Mapping[str, Any],
+    config_hash: str,
+) -> Artifact:
+    if not path.is_file():
+        raise FileNotFoundError(f"required preflight artifact is missing: {path}")
+    payload = _mapping(
+        json.loads(path.read_text(encoding="utf-8")),
+        "preflight artifact",
+    )
+    if payload.get("schema_version") != 1 or payload.get("passed") is not True:
+        raise RuntimeError("preflight artifact is not a passed schema-v1 report")
+    if _sha(payload.get("config_sha256"), "preflight config_sha256") != config_hash:
+        raise RuntimeError("preflight artifact was generated for a different config")
+    models = _mapping(payload.get("models"), "preflight models")
+    for model_key, model_config in config["models"].items():
+        model_report = _mapping(
+            models.get(model_key),
+            f"preflight models.{model_key}",
+        )
+        actual = _sha(
+            model_report.get("artifact_sha256"),
+            f"preflight models.{model_key}.artifact_sha256",
+        )
+        if actual != str(model_config["artifact_sha256"]).lower():
+            raise RuntimeError(
+                f"preflight model artifact differs from config: {model_key}"
+            )
+    return Artifact(path.resolve(), file_sha256(path))
+
+
 def _artifact(payload: Any, label: str, base: Path, *, check_files: bool) -> Artifact:
     item = _mapping(payload, label)
     path = Path(_nonempty(item.get("path"), f"{label}.path"))
@@ -1646,6 +1678,7 @@ def build_run_plan(
     framework_filter: str | None,
     search_variant_id: str | None,
     final_model_group: str | None,
+    preflight: Artifact | None = None,
 ) -> dict[str, Any]:
     config_hash = canonical_sha256(config)
     payload: dict[str, Any] = {
@@ -1659,6 +1692,11 @@ def build_run_plan(
         "final_model_group": final_model_group,
         "config_path": str(config_path.resolve()),
         "config_sha256": config_hash,
+        "preflight": (
+            {"path": str(preflight.path), "sha256": preflight.sha256}
+            if preflight is not None
+            else None
+        ),
         "frozen_winner": (
             {
                 "path": str(frozen_winner.source_path),
@@ -1928,6 +1966,11 @@ def shell_line(command: Iterable[str]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the frozen Qwen-only Agent experiment matrix.")
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--preflight-artifact",
+        type=Path,
+        help="Passed preflight report; defaults to RESULT_ROOT/frozen/preflight.json.",
+    )
     parser.add_argument("--phase", choices=sorted(PHASES), required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -1987,9 +2030,13 @@ def main() -> None:
         parser.error("agent_dev requires --search-variant")
 
     config = load_config(args.config)
-    check_files = not args.allow_missing_inputs
-    validate_inputs(config, check_files=check_files)
     config_hash = canonical_sha256(config)
+    check_files = not args.allow_missing_inputs
+    preflight_path = args.preflight_artifact or (
+        Path(config["result_root"]) / "frozen" / "preflight.json"
+    )
+    preflight = load_passed_preflight(preflight_path, config, config_hash)
+    validate_inputs(config, check_files=check_files)
     winner = None
     if args.frozen_winner_config is not None:
         winner = load_frozen_winner(
@@ -2051,6 +2098,7 @@ def main() -> None:
         framework_filter=args.framework,
         search_variant_id=args.search_variant,
         final_model_group=args.final_model_group,
+        preflight=preflight,
     )
     print(
         json.dumps(

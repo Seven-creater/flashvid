@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.fingerprint_model_artifact import fingerprint_model
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -48,9 +50,16 @@ def test_qwen_search_preflight_freezes_counts_hashes_and_video_splits(tmp_path: 
         ),
         encoding="utf-8",
     )
+    (model / "model.safetensors").write_bytes(b"weights")
+    model_artifact_sha256 = fingerprint_model(model)["artifact_sha256"]
     config_payload = {
         "datasets": {"demo": dataset},
-        "models": {"q9": {"path": str(model)}},
+        "models": {
+            "q9": {
+                "path": str(model),
+                "artifact_sha256": model_artifact_sha256,
+            }
+        },
     }
     config.write_text(
         json.dumps(config_payload),
@@ -72,7 +81,17 @@ def test_qwen_search_preflight_freezes_counts_hashes_and_video_splits(tmp_path: 
     )
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
+    assert report["schema_version"] == 1
     assert report["passed"] is True
+    assert report["config_sha256"] == hashlib.sha256(
+        json.dumps(
+            config_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert report["models"]["q9"]["artifact_sha256"] == model_artifact_sha256
     assert report["models"]["q9"]["validated_special_token_ids"][
         "<|video_pad|>"
     ] == 248057
@@ -87,3 +106,48 @@ def test_qwen_search_preflight_freezes_counts_hashes_and_video_splits(tmp_path: 
     )
     assert failed.returncode != 0
     assert "manifest hash mismatch" in failed.stderr
+
+
+def test_qwen_search_preflight_rejects_model_artifact_mismatch(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (model / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "added_tokens_decoder": {
+                    "248053": {"content": "<|vision_start|>"},
+                    "248054": {"content": "<|vision_end|>"},
+                    "248056": {"content": "<|image_pad|>"},
+                    "248057": {"content": "<|video_pad|>"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "datasets": {},
+                "models": {
+                    "q9": {
+                        "path": str(model),
+                        "artifact_sha256": "0" * 64,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    script = Path(__file__).resolve().parents[1] / "scripts" / "preflight_qwen_agent_search.py"
+    failed = subprocess.run(
+        [sys.executable, str(script), "--config", str(config)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert "model artifact SHA-256 mismatch" in failed.stderr

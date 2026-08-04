@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from flashvid_eval.qwen_token_accounting import QWEN_SPECIAL_TOKEN_IDS
+from fingerprint_model_artifact import fingerprint_model
 
 
 EXPECTED_SPLIT_COUNTS = {"train": 200, "dev": 50, "final": 100}
@@ -26,6 +27,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_sha256(payload: Any) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def load_manifest(path: Path) -> list[dict[str, Any]]:
     rows = [
         json.loads(line)
@@ -41,8 +52,10 @@ def load_manifest(path: Path) -> list[dict[str, Any]]:
 def audit(config_path: Path, source_root: Path) -> dict[str, Any]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     report: dict[str, Any] = {
+        "schema_version": 1,
         "config": str(config_path.resolve()),
-        "config_sha256": sha256(config_path),
+        "config_sha256": canonical_sha256(config),
+        "config_file_sha256": sha256(config_path),
         "datasets": {},
         "models": {},
         "forbidden_imports": [],
@@ -86,6 +99,14 @@ def audit(config_path: Path, source_root: Path) -> dict[str, Any]:
 
     for model_key, model_config in config["models"].items():
         model_path = Path(model_config["path"])
+        fingerprint = fingerprint_model(model_path)
+        expected_artifact_sha256 = str(model_config["artifact_sha256"]).lower()
+        actual_artifact_sha256 = str(fingerprint["artifact_sha256"]).lower()
+        if actual_artifact_sha256 != expected_artifact_sha256:
+            raise RuntimeError(
+                f"{model_key} model artifact SHA-256 mismatch: "
+                f"expected {expected_artifact_sha256}, got {actual_artifact_sha256}"
+            )
         tokenizer_path = model_path / "tokenizer_config.json"
         if not tokenizer_path.is_file():
             raise FileNotFoundError(tokenizer_path)
@@ -103,6 +124,9 @@ def audit(config_path: Path, source_root: Path) -> dict[str, Any]:
             validated[token] = token_id
         report["models"][model_key] = {
             "path": str(model_path),
+            "artifact_sha256": actual_artifact_sha256,
+            "file_count": int(fingerprint["file_count"]),
+            "total_bytes": int(fingerprint["total_bytes"]),
             "tokenizer_config": str(tokenizer_path),
             "tokenizer_config_sha256": sha256(tokenizer_path),
             "validated_special_token_ids": validated,

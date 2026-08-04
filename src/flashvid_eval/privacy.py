@@ -32,6 +32,26 @@ class AnnotationLeakError(ValueError):
     """A model-bound payload contains benchmark-private annotation data."""
 
 
+def _is_safe_public_answer_schema(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"type", "enum"}:
+        return False
+    if value["type"] != "string":
+        return False
+    choices = value["enum"]
+    if not isinstance(choices, list) or len(choices) < 2:
+        return False
+    if any(
+        not isinstance(choice, str)
+        or len(choice) != 1
+        or not choice.isascii()
+        or not choice.isalpha()
+        or choice != choice.upper()
+        for choice in choices
+    ):
+        return False
+    return len(set(choices)) == len(choices)
+
+
 def assert_annotation_free_request(
     payload: Any,
     *,
@@ -56,6 +76,7 @@ def assert_annotation_free_request(
                 key = str(raw_key).strip().lower()
                 is_public_answer_schema = (
                     key == "answer" and path == _PUBLIC_ANSWER_SCHEMA_PARENT
+                    and _is_safe_public_answer_schema(child)
                 )
                 if key in FORBIDDEN_ANNOTATION_KEYS and not is_public_answer_schema:
                     raise AnnotationLeakError(

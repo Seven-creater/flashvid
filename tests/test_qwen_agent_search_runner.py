@@ -189,6 +189,26 @@ def _config_file(tmp_path: Path, config: dict) -> Path:
     return path
 
 
+def _preflight_artifact(
+    tmp_path: Path,
+    config: dict,
+    **updates: object,
+) -> Path:
+    payload = {
+        "schema_version": 1,
+        "config_sha256": runner.canonical_sha256(config),
+        "passed": True,
+        "models": {
+            key: {"artifact_sha256": value["artifact_sha256"]}
+            for key, value in config["models"].items()
+        },
+        **updates,
+    }
+    path = tmp_path / "preflight.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _winner(tmp_path: Path, config: dict, strategy: str = "a3_hierarchical_search") -> Path:
     config_hash = runner.canonical_sha256(config)
     agent_path = Path(config["source_workspace"]) / "configs" / "agents" / f"{strategy}.json"
@@ -819,9 +839,63 @@ def test_endpoint_preflight_requires_exact_served_model(
         runner.preflight_endpoints(tasks)
 
 
+def test_every_phase_requires_passed_preflight_for_exact_config(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    valid = _preflight_artifact(tmp_path, config)
+    artifact = runner.load_passed_preflight(
+        valid,
+        config,
+        runner.canonical_sha256(config),
+    )
+    assert artifact.path == valid.resolve()
+
+    failed = _preflight_artifact(tmp_path, config, passed=False)
+    with pytest.raises(RuntimeError, match="not a passed"):
+        runner.load_passed_preflight(
+            failed,
+            config,
+            runner.canonical_sha256(config),
+        )
+
+    wrong_config = _preflight_artifact(
+        tmp_path,
+        config,
+        config_sha256="f" * 64,
+    )
+    with pytest.raises(RuntimeError, match="different config"):
+        runner.load_passed_preflight(
+            wrong_config,
+            config,
+            runner.canonical_sha256(config),
+        )
+
+    models = {
+        key: {"artifact_sha256": value["artifact_sha256"]}
+        for key, value in config["models"].items()
+    }
+    models["q9"] = {"artifact_sha256": "0" * 64}
+    wrong_model = _preflight_artifact(tmp_path, config, models=models)
+    with pytest.raises(RuntimeError, match="model artifact differs"):
+        runner.load_passed_preflight(
+            wrong_model,
+            config,
+            runner.canonical_sha256(config),
+        )
+
+    with pytest.raises(FileNotFoundError, match="required preflight artifact"):
+        runner.load_passed_preflight(
+            tmp_path / "missing-preflight.json",
+            config,
+            runner.canonical_sha256(config),
+        )
+
+
 def test_cli_dry_run_writes_no_plan(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config_path = _config_file(tmp_path, config)
+    preflight_path = _preflight_artifact(tmp_path, config)
     plan_path = Path(config["result_root"]) / "run_plans" / "protocol_audit_q9.json"
     completed = subprocess.run(
         [
@@ -829,6 +903,8 @@ def test_cli_dry_run_writes_no_plan(tmp_path: Path) -> None:
             str(SCRIPT),
             "--config",
             str(config_path),
+            "--preflight-artifact",
+            str(preflight_path),
             "--phase",
             "protocol_audit",
             "--model-key",

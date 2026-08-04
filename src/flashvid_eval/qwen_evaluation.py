@@ -410,12 +410,14 @@ class QwenBaselineRunner:
         usage = dict(result.usage)
         prompt_token_accounting = usage.get("qwen_prompt_token_accounting")
         sampled_frames_actual = (
-            int(prompt_token_accounting["processed_video_frame_slots"])
+            int(sampled_frames)
             if video is not None
+            and sampled_frames is not None
             and isinstance(prompt_token_accounting, Mapping)
+            and prompt_token_accounting.get("media_kind") == "video"
             and isinstance(
-                prompt_token_accounting.get("processed_video_frame_slots"),
-                int,
+                prompt_token_accounting.get("service_multimodal_tokens"),
+                Mapping,
             )
             else None
         )
@@ -531,7 +533,7 @@ class QwenBaselineRunner:
             "sampled_frames_estimated": sampled_frames,
             "sampled_frames_actual": sampled_frames_actual,
             "sampled_frames_source": (
-                "vllm_returned_prompt_token_ids_qwen_temporal_patch2"
+                "vllm_explicit_num_frames_and_successful_video_accounting_v1"
                 if sampled_frames_actual is not None
                 else "estimated_from_request"
                 if sampled_frames is not None

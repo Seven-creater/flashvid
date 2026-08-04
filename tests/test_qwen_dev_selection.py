@@ -160,6 +160,14 @@ def _task(
             "candidate_rerun": 0,
             "run_fingerprint": fingerprint,
         }
+        if strategy is not None:
+            row.update(
+                {
+                    "visual_token_accounting_complete": True,
+                    "visual_tokens": max(0, tokens // 2),
+                    "branch_failures": [],
+                }
+            )
         if mode is not None:
             row["baseline_mode"] = mode
         if mode == "direct":
@@ -280,10 +288,37 @@ def test_non_direct_row_does_not_require_direct_media_accounting() -> None:
                 "sampled_frames_estimated": 64,
                 "sampled_frames_actual": None,
                 "visual_usage_complete": False,
+                "visual_token_accounting_complete": True,
+                "visual_tokens": 128,
             }
         )
         is False
     )
+
+
+def test_agent_row_with_internal_length_truncation_is_failed() -> None:
+    row = {
+        "strategy": "a0_eva_clean",
+        "prediction": "A",
+        "request_trace": [{"finish_reason": "length"}],
+    }
+    assert _row_failed(row) is True
+
+
+def test_agent_row_requires_visual_accounting_and_no_hidden_branch_failure() -> None:
+    valid = {
+        "strategy": "a4_independent_arbitration",
+        "prediction": "A",
+        "visual_token_accounting_complete": True,
+        "visual_tokens": 128,
+        "branch_failures": [],
+    }
+    assert _row_failed(valid) is False
+    assert _row_failed({**valid, "visual_token_accounting_complete": False}) is True
+    assert _row_failed({**valid, "visual_tokens": None}) is True
+    assert _row_failed(
+        {**valid, "branch_failures": [{"branch": "evidence", "reason": "invalid"}]}
+    ) is True
 
 
 def _complete_matrix(

@@ -42,14 +42,15 @@ _A3_ROOT_NODES = 8
 _A3_BRANCH_NODES = 2
 
 
-def _tool_instruction(max_calls: int = 1) -> str:
+def _tool_instruction(max_calls: int = 1, *, max_frames: int = 128) -> str:
     suffix = "call" if max_calls == 1 else f"up to {max_calls} calls"
     return (
         "If more visual evidence is needed, return only official EVA tool markup with "
         f"{suffix}: <tool_call>{{\"tool\":\"frame_select\",\"arguments\":"
         "{\"start_time\":0.0,\"end_time\":30.0,\"nframes\":16,"
         "\"resize\":0.75,\"evidence_request\":\"what to verify\"}}}</tool_call>. "
-        "Use exactly one of nframes or fps."
+        f"Use exactly one of nframes or fps. nframes must not exceed {max_frames}; "
+        "fps requests are automatically bounded to the same frame limit."
     )
 
 
@@ -63,6 +64,34 @@ def _metadata_text(metadata: Mapping[str, float | int]) -> str:
 def _canonical_tool_call(request: FrameRequest) -> str:
     payload = {"tool": "frame_select", "arguments": request.to_tool_arguments()}
     return f"<tool_call>{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}</tool_call>"
+
+
+def _drop_observed_tool_media(messages: list[dict[str, Any]]) -> None:
+    """Keep textual tool history while preventing old frames from being resent."""
+
+    for message in messages:
+        if message.get("role") != "tool" or not isinstance(message.get("content"), list):
+            continue
+        content = message["content"]
+        media_count = sum(
+            isinstance(item, Mapping) and item.get("type") in {"image_url", "video_url"}
+            for item in content
+        )
+        if not media_count:
+            continue
+        message["content"] = [
+            item
+            for item in content
+            if not (
+                isinstance(item, Mapping)
+                and item.get("type") in {"image_url", "video_url"}
+            )
+        ] + [
+            {
+                "type": "text",
+                "text": f"[{media_count} previously observed frame images omitted from history]",
+            }
+        ]
 
 
 def _fallback_intervals(duration: float, count: int, window_s: float) -> list[tuple[float, float]]:
@@ -307,7 +336,9 @@ class EvaCleanStrategy(EvidenceAgentBase):
                     "You are a Qwen-only long-video agent. Inspect the video through frame_select. "
                     "After each tool result, write a concise <evidence> block containing only visible "
                     "facts, then either request a new non-duplicate interval or answer. "
-                    f"{_metadata_text(metadata)} {_tool_instruction()} {_ANSWER_INSTRUCTION}"
+                    f"{_metadata_text(metadata)} "
+                    f"{_tool_instruction(max_frames=self.config.max_frames_per_call)} "
+                    f"{_ANSWER_INSTRUCTION}"
                 ),
             },
             {"role": "user", "content": sample_question(sample)},
@@ -348,6 +379,9 @@ class EvaCleanStrategy(EvidenceAgentBase):
                     else None
                 ),
             )
+            # The response below is the textual memory of the current visual
+            # observation. Older images must not accumulate in later requests.
+            _drop_observed_tool_media(messages)
             messages.append({"role": "assistant", "content": result.content})
             if last_observations:
                 for observation in last_observations:
@@ -361,7 +395,10 @@ class EvaCleanStrategy(EvidenceAgentBase):
                     )
                 last_observations = []
             answer = parse_answer_json(result.content, sample.option_letters)
-            calls = parse_frame_tool_calls(result.content, limit=self.config.max_intervals)
+            # A0's official tool prompt permits one call per turn. Keeping the
+            # parser aligned with that contract also caps media in the next API
+            # request at max_frames_per_call.
+            calls = parse_frame_tool_calls(result.content, limit=1)
             if answer is not None and not calls:
                 trace.prediction = trace.final_prediction = answer
                 trace.raw_response = result.content
@@ -738,6 +775,10 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
             media_io_kwargs=direct_sampling.media_io_kwargs(direct_duration),
         )
         direct_answer = parse_answer_json(direct_result.content, sample.option_letters)
+        if direct_answer is None:
+            trace.branch_failures.append(
+                {"branch": "direct", "reason": "invalid_answer_json"}
+            )
 
         evidence_trace = self.evidence_agent.run(sample)
         for item in evidence_trace.request_trace:
@@ -746,6 +787,23 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
             trace.tool_steps.append(replace(item, branch=f"evidence/{item.branch}"))
         trace.evidence_memory.extend(evidence_trace.evidence_memory)
         evidence_answer = evidence_trace.final_prediction
+        if (
+            evidence_trace.error
+            or evidence_answer is None
+            or not evidence_trace.visual_token_accounting_complete
+            or evidence_trace.branch_failures
+        ):
+            trace.branch_failures.append(
+                {
+                    "branch": "evidence",
+                    "reason": evidence_trace.error_type or "incomplete_evidence_branch",
+                    "detail": evidence_trace.error,
+                    "nested": evidence_trace.branch_failures,
+                }
+            )
+        if evidence_trace.annotation_leak_check != "passed":
+            trace.annotation_leak_check = evidence_trace.annotation_leak_check
+            trace.failure_class = evidence_trace.failure_class or "annotation_leak"
 
         if direct_answer is not None and direct_answer == evidence_answer:
             trace.prediction = trace.final_prediction = direct_answer
@@ -772,7 +830,8 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
                 "content": (
                     "You are an independent arbiter. The two answers are hypotheses, not labels. "
                     "Use timestamped evidence to choose one. If one visual detail must be confirmed, "
-                    f"request one interval with official EVA markup. {_tool_instruction()} "
+                    "request one interval with official EVA markup. "
+                    f"{_tool_instruction(max_frames=self.config.max_frames_per_call)} "
                     f"Otherwise {_ANSWER_INSTRUCTION}"
                 ),
             },
@@ -831,6 +890,9 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
         else:
             trace.raw_response = arbiter.content
         if answer is None:
+            trace.branch_failures.append(
+                {"branch": "arbiter", "reason": "invalid_answer_json"}
+            )
             trace.prediction = trace.final_prediction = direct_answer
             trace.fallback_used = True
             return

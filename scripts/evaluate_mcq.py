@@ -979,8 +979,21 @@ def main() -> None:
             presence_penalty=qwen_protocol.presence_penalty,
             repetition_penalty=qwen_protocol.repetition_penalty,
             seed=args.seed,
-            planner_max_tokens=qwen_protocol.max_tokens,
-            observer_max_tokens=qwen_protocol.max_tokens,
+            # Direct MCQ output is deliberately short, but Agent planner and
+            # observer turns contain structured tool/evidence payloads.  A
+            # shared 512-token cap truncated otherwise valid Agent turns in
+            # smoke.  Keep the final judge at the frozen Direct budget while
+            # giving non-thinking planning turns enough room to terminate.
+            planner_max_tokens=(
+                max(2048, qwen_protocol.max_tokens)
+                if not qwen_protocol.enable_thinking
+                else qwen_protocol.max_tokens
+            ),
+            observer_max_tokens=(
+                max(2048, qwen_protocol.max_tokens)
+                if not qwen_protocol.enable_thinking
+                else qwen_protocol.max_tokens
+            ),
             judge_max_tokens=qwen_protocol.max_tokens,
             direct_max_tokens=qwen_protocol.max_tokens,
             length_retry_max_tokens=qwen_protocol.length_retry_max_tokens,

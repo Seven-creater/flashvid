@@ -1171,11 +1171,13 @@ def build_tasks(
     }:
         if protocol_filter is None:
             raise ValueError(f"{phase} requires an explicit frozen --protocol selection")
-    if phase == "agent_dev":
+    if phase in {"agent_smoke", "agent_dev"}:
         if framework_filter is None:
-            raise ValueError("agent_dev requires --framework so A0-A4 run one promotion stage at a time")
+            raise ValueError(
+                f"{phase} requires --framework so A0-A4 run one promotion stage at a time"
+            )
         if search_variant_id is None:
-            raise ValueError("agent_dev requires --search-variant")
+            raise ValueError(f"{phase} requires --search-variant")
     if phase == "final_matrix" and (
         model_filter is not None
         or protocol_filter is not None
@@ -1336,16 +1338,12 @@ def build_tasks(
                         base_agent_config = _agent_config(
                             config, framework, check_files=check_files
                         )
-                        variants: list[SearchVariant | None]
-                        if phase == "agent_dev":
-                            assert search_variant_id is not None
-                            variants = (
-                                list(search_variants(config))
-                                if search_variant_id == "all"
-                                else [select_search_variant(config, search_variant_id)]
-                            )
-                        else:
-                            variants = [None]
+                        assert search_variant_id is not None
+                        variants: list[SearchVariant | None] = (
+                            list(search_variants(config))
+                            if search_variant_id == "all"
+                            else [select_search_variant(config, search_variant_id)]
+                        )
                         for variant in variants:
                             agent_config = (
                                 materialize_agent_variant(
@@ -1684,6 +1682,7 @@ def build_run_plan(
     search_variant_id: str | None,
     final_model_group: str | None,
     preflight: Artifact | None = None,
+    agent_smoke_gate: Artifact | None = None,
 ) -> dict[str, Any]:
     config_hash = canonical_sha256(config)
     payload: dict[str, Any] = {
@@ -1700,6 +1699,11 @@ def build_run_plan(
         "preflight": (
             {"path": str(preflight.path), "sha256": preflight.sha256}
             if preflight is not None
+            else None
+        ),
+        "agent_smoke_gate": (
+            {"path": str(agent_smoke_gate.path), "sha256": agent_smoke_gate.sha256}
+            if agent_smoke_gate is not None
             else None
         ),
         "frozen_winner": (
@@ -1974,6 +1978,236 @@ def audit_protocol_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
     }
 
 
+def audit_agent_smoke(tasks: list[TaskSpec]) -> dict[str, Any]:
+    """Reject incomplete Agent turns before an expensive Dev search starts."""
+
+    issues: list[dict[str, str]] = []
+    length_truncations: list[dict[str, str]] = []
+    sources: list[dict[str, Any]] = []
+    row_count = 0
+    for task in tasks:
+        result_files = sorted(Path(task.output_dir).glob(f"{task.dataset}_*.jsonl"))
+        if len(result_files) != 1:
+            issues.append(
+                {
+                    "task_id": task.task_id,
+                    "sample_id": "",
+                    "reason": f"expected_one_result_jsonl_found_{len(result_files)}",
+                }
+            )
+            continue
+        rows = [
+            json.loads(line)
+            for line in result_files[0].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        protocol_index = task.command.index("--qwen-protocol") + 1
+        run_fingerprints = {str(row.get("run_fingerprint") or "") for row in rows}
+        if len(run_fingerprints) != 1 or "" in run_fingerprints:
+            issues.append(
+                {
+                    "task_id": task.task_id,
+                    "sample_id": "",
+                    "reason": "run_fingerprint_missing_or_mixed",
+                }
+            )
+        sources.append(
+            {
+                "task_id": task.task_id,
+                "dataset": task.dataset,
+                "model": task.model,
+                "protocol": task.command[protocol_index],
+                "manifest_sha256": task.manifest_sha256,
+                "agent_config_sha256": task.agent_config_sha256,
+                "run_fingerprint": (
+                    next(iter(run_fingerprints))
+                    if len(run_fingerprints) == 1 and "" not in run_fingerprints
+                    else None
+                ),
+                "result": str(result_files[0].resolve()),
+                "result_sha256": file_sha256(result_files[0]),
+            }
+        )
+        manifest_rows = [
+            json.loads(line)
+            for line in Path(task.manifest).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        manifest_ids = {str(row.get("sample_id") or "") for row in manifest_rows}
+        result_ids = {str(row.get("sample_id") or "") for row in rows}
+        if len(rows) != len(manifest_rows) or result_ids != manifest_ids:
+            issues.append(
+                {
+                    "task_id": task.task_id,
+                    "sample_id": "",
+                    "reason": "missing_duplicate_or_extra_sample_id",
+                }
+            )
+        seen: set[str] = set()
+        for row in rows:
+            row_count += 1
+            sample_id = str(row.get("sample_id") or "")
+            if not sample_id or sample_id in seen:
+                issues.append(
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "reason": "missing_or_duplicate_sample_id",
+                    }
+                )
+            seen.add(sample_id)
+            request_trace = row.get("request_trace")
+            if not isinstance(request_trace, list) or not request_trace:
+                issues.append(
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "reason": "request_trace_missing",
+                    }
+                )
+            elif any(
+                isinstance(request, Mapping)
+                and request.get("finish_reason") == "length"
+                for request in request_trace
+            ):
+                length_truncations.append(
+                    {"task_id": task.task_id, "sample_id": sample_id}
+                )
+            failure = next(
+                (
+                    key
+                    for key in (
+                        "error",
+                        "error_type",
+                        "parse_error",
+                        "model_parse_failure",
+                        "data_unavailable",
+                        "control_unavailable",
+                    )
+                    if row.get(key)
+                ),
+                None,
+            )
+            if failure is None and row.get("prediction") is None:
+                failure = "prediction_missing"
+            if failure is None and row.get("annotation_leak_check") != "passed":
+                failure = "annotation_leak_check_not_passed"
+            if failure is None and int(row.get("candidate_rerun") or 0) != 0:
+                failure = "candidate_rerun_nonzero"
+            if failure is None and row.get("branch_failures"):
+                failure = "branch_failure"
+            if failure is None and not row.get("tool_steps"):
+                failure = "frame_tool_not_used"
+            if failure is None and row.get("visual_token_accounting_complete") is not True:
+                failure = "visual_token_accounting_incomplete"
+            if failure is None and not isinstance(row.get("visual_tokens"), int):
+                failure = "visual_token_count_missing"
+            if failure is not None:
+                issues.append(
+                    {
+                        "task_id": task.task_id,
+                        "sample_id": sample_id,
+                        "reason": str(failure),
+                    }
+                )
+    return {
+        "schema_version": 1,
+        "status": "passed" if not issues and not length_truncations else "blocked",
+        "task_count": len(tasks),
+        "row_count": row_count,
+        "engineering_issues": issues,
+        "length_truncations": length_truncations,
+        "sources": sorted(sources, key=lambda item: (item["task_id"], item["dataset"])),
+        "implementation_sha256": {
+            relative: file_sha256(Path(__file__).resolve().parents[1] / relative)
+            for relative in (
+                "scripts/evaluate_mcq.py",
+                "src/flashvid_eval/qwen_agents/core.py",
+                "src/flashvid_eval/qwen_agents/strategies.py",
+            )
+        },
+        "required_action": (
+            "increase the frozen Agent planner/observer output limit and rerun the entire smoke"
+            if length_truncations
+            else None
+        ),
+    }
+
+
+def _agent_smoke_audit_path(
+    config: Mapping[str, Any],
+    *,
+    model_key: str,
+    protocol: str,
+    framework: str,
+    search_variant: str,
+) -> Path:
+    name = _safe_id(f"{model_key}_{protocol}_{framework}_{search_variant}")
+    return Path(config["result_root"]) / "frozen" / "agent_smoke_audits" / f"{name}.json"
+
+
+def _agent_smoke_audit_payload(
+    audit: Mapping[str, Any],
+    *,
+    config_sha256: str,
+    smoke_plan_sha256: str,
+    model_key: str,
+    protocol: str,
+    framework: str,
+    search_variant: str,
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "status": audit.get("status"),
+        "config_sha256": config_sha256,
+        "smoke_plan_sha256": smoke_plan_sha256,
+        "model_key": model_key,
+        "protocol": protocol,
+        "framework": framework,
+        "search_variant": search_variant,
+        "task_count": audit.get("task_count"),
+        "row_count": audit.get("row_count"),
+        "engineering_issues": audit.get("engineering_issues"),
+        "length_truncations": audit.get("length_truncations"),
+        "sources": audit.get("sources"),
+        "implementation_sha256": audit.get("implementation_sha256"),
+    }
+    payload["audit_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def freeze_agent_smoke_audit(path: Path, payload: Mapping[str, Any]) -> Artifact:
+    if payload.get("status") != "passed":
+        raise RuntimeError("refusing to freeze a failed Agent smoke audit")
+    expected = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text(encoding="utf-8") != expected:
+            raise RuntimeError(f"Agent smoke audit changed: {path}")
+    else:
+        temporary = path.with_suffix(path.suffix + ".partial")
+        temporary.write_text(expected, encoding="utf-8")
+        temporary.replace(path)
+    return Artifact(path.resolve(), file_sha256(path))
+
+
+def load_passed_agent_smoke_audit(path: Path, expected: Mapping[str, Any]) -> Artifact:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"passed Agent smoke audit is required before Dev search: {path}"
+        )
+    payload = _mapping(json.loads(path.read_text(encoding="utf-8")), "Agent smoke audit")
+    claimed = str(payload.get("audit_sha256") or "")
+    actual = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "audit_sha256"}
+    )
+    if claimed != actual:
+        raise RuntimeError(f"Agent smoke audit self-hash is invalid: {path}")
+    if payload != dict(expected) or payload.get("status") != "passed":
+        raise RuntimeError(f"Agent smoke audit no longer matches current inputs: {path}")
+    return Artifact(path.resolve(), file_sha256(path))
+
+
 def shell_line(command: Iterable[str]) -> str:
     return shlex.join(list(command))
 
@@ -2060,10 +2294,10 @@ def main() -> None:
     if args.phase in {"blind_diagnostics", "direct_dev", "agent_smoke", "agent_dev"}:
         if args.protocol is None:
             parser.error(f"{args.phase} requires explicit --protocol selected after audit")
-    if args.phase == "agent_dev" and args.framework is None:
-        parser.error("agent_dev requires --framework")
-    if args.phase == "agent_dev" and args.search_variant is None:
-        parser.error("agent_dev requires --search-variant")
+    if args.phase in {"agent_smoke", "agent_dev"} and args.framework is None:
+        parser.error(f"{args.phase} requires --framework")
+    if args.phase in {"agent_smoke", "agent_dev"} and args.search_variant is None:
+        parser.error(f"{args.phase} requires --search-variant")
 
     config = load_config(args.config)
     config_hash = canonical_sha256(config)
@@ -2104,6 +2338,57 @@ def main() -> None:
             check_files=check_files,
         )
     effective_resume = args.resume or bool(config["execution"].get("resume", False))
+    agent_smoke_gate: Artifact | None = None
+    if args.phase == "agent_dev":
+        assert args.model_key and args.protocol and args.framework and args.search_variant
+        smoke_tasks = build_tasks(
+            config,
+            "agent_smoke",
+            config_hash=config_hash,
+            resume=effective_resume,
+            model_filter=args.model_key,
+            protocol_filter=args.protocol,
+            framework_filter=args.framework,
+            search_variant_id=args.search_variant,
+            check_files=check_files,
+            write_smoke=False,
+            write_variants=False,
+        )
+        smoke_plan = build_run_plan(
+            args.config,
+            config,
+            "agent_smoke",
+            smoke_tasks,
+            frozen_winner=None,
+            frozen_checkpoint=None,
+            frozen_sft_winner=None,
+            model_filter=args.model_key,
+            protocol_filter=args.protocol,
+            framework_filter=args.framework,
+            search_variant_id=args.search_variant,
+            final_model_group=None,
+            preflight=preflight,
+        )
+        smoke_audit = audit_agent_smoke(smoke_tasks)
+        if smoke_audit["status"] != "passed":
+            raise RuntimeError("Agent Dev is blocked because its exact-variant smoke did not pass")
+        smoke_payload = _agent_smoke_audit_payload(
+            smoke_audit,
+            config_sha256=config_hash,
+            smoke_plan_sha256=str(smoke_plan["plan_sha256"]),
+            model_key=args.model_key,
+            protocol=args.protocol,
+            framework=args.framework,
+            search_variant=args.search_variant,
+        )
+        smoke_path = _agent_smoke_audit_path(
+            config,
+            model_key=args.model_key,
+            protocol=args.protocol,
+            framework=args.framework,
+            search_variant=args.search_variant,
+        )
+        agent_smoke_gate = load_passed_agent_smoke_audit(smoke_path, smoke_payload)
     tasks = build_tasks(
         config,
         args.phase,
@@ -2135,6 +2420,7 @@ def main() -> None:
         search_variant_id=args.search_variant,
         final_model_group=args.final_model_group,
         preflight=preflight,
+        agent_smoke_gate=agent_smoke_gate,
     )
     print(
         json.dumps(
@@ -2186,6 +2472,34 @@ def main() -> None:
             raise RuntimeError(
                 "protocol smoke failed; inspect engineering_issues and thinking_length_truncations"
             )
+    elif args.phase == "agent_smoke":
+        audit = audit_agent_smoke(tasks)
+        print(json.dumps(audit, ensure_ascii=False, indent=2))
+        if audit["status"] != "passed":
+            raise RuntimeError(
+                "agent smoke failed; inspect engineering_issues and length_truncations"
+            )
+        assert args.model_key and args.protocol and args.framework and args.search_variant
+        payload = _agent_smoke_audit_payload(
+            audit,
+            config_sha256=config_hash,
+            smoke_plan_sha256=str(plan["plan_sha256"]),
+            model_key=args.model_key,
+            protocol=args.protocol,
+            framework=args.framework,
+            search_variant=args.search_variant,
+        )
+        artifact = freeze_agent_smoke_audit(
+            _agent_smoke_audit_path(
+                config,
+                model_key=args.model_key,
+                protocol=args.protocol,
+                framework=args.framework,
+                search_variant=args.search_variant,
+            ),
+            payload,
+        )
+        print(json.dumps({"passed_agent_smoke_audit": asdict(artifact)}, indent=2))
 
 
 if __name__ == "__main__":

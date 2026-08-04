@@ -296,6 +296,7 @@ class AgentTrace:
     request_trace: list[RequestTrace] = field(default_factory=list)
     tool_steps: list[ToolStep] = field(default_factory=list)
     evidence_memory: list[EvidenceEntry] = field(default_factory=list)
+    branch_failures: list[dict[str, Any]] = field(default_factory=list)
     branch_costs: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -393,6 +394,10 @@ class AgentTrace:
 
 class DuplicateFrameRequestError(ValueError):
     pass
+
+
+class ResponseTruncatedError(RuntimeError):
+    """A model response hit its frozen output budget and is unsafe to consume."""
 
 
 FrameSelector = Callable[
@@ -510,11 +515,11 @@ class FrameTool:
         start = max(0.0, min(float(request.start_time), max(0.0, duration - 0.001)))
         end = max(start + 0.001, min(float(request.end_time), duration))
         if request.nframes is not None:
-            if request.nframes > self.max_frames_per_call:
-                raise ValueError(
-                    f"nframes {request.nframes} exceeds limit {self.max_frames_per_call}"
-                )
-            nframes = request.nframes
+            # Treat the configured limit as an execution budget, not as a
+            # sample-fatal protocol error.  The original request is retained
+            # on FrameObservation/ToolStep while ``resolved_nframes`` records
+            # the bounded value actually sent to the official EVA selector.
+            nframes = min(request.nframes, self.max_frames_per_call)
         else:
             assert request.fps is not None
             nframes = min(
@@ -789,13 +794,21 @@ class BaseQwenAgent:
                 )
             )
             retry_max = self.protocol.length_retry_max_tokens
-            if finish_reason != "length" or retry_max is None or max_tokens >= retry_max:
+            if finish_reason != "length":
                 return result
+            if retry_max is None or max_tokens >= retry_max:
+                raise ResponseTruncatedError(
+                    f"{request_kind} response reached finish_reason=length at "
+                    f"max_tokens={max_tokens}"
+                )
             prompt_tokens = _usage_number(result.usage, "prompt_tokens")
             headroom = self.protocol.server_max_model_len - prompt_tokens - self.protocol.context_safety_tokens
             next_max = min(retry_max, headroom)
             if next_max <= max_tokens:
-                return result
+                raise ResponseTruncatedError(
+                    f"{request_kind} response reached finish_reason=length with no "
+                    "safe context headroom for retry"
+                )
             max_tokens = next_max
             attempt_index += 1
             retry_of_length = True

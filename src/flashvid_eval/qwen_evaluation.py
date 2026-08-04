@@ -659,6 +659,24 @@ def evaluate_qwen_runner(
     def retryable(row: Mapping[str, Any]) -> bool:
         if row.get("parse_error"):
             return True
+        request_trace = row.get("request_trace")
+        if isinstance(request_trace, list) and any(
+            isinstance(item, Mapping) and item.get("finish_reason") == "length"
+            for item in request_trace
+        ):
+            return True
+        if row.get("branch_failures"):
+            return True
+        if row.get("strategy"):
+            visual_tokens = row.get("visual_tokens")
+            if (
+                row.get("visual_token_accounting_complete") is not True
+                or not isinstance(visual_tokens, (int, float))
+                or isinstance(visual_tokens, bool)
+                or not math.isfinite(float(visual_tokens))
+                or float(visual_tokens) < 0
+            ):
+                return True
         return bool(
             row.get("error")
             and not row.get("data_unavailable")

@@ -478,6 +478,20 @@ def _row_failed(row: Mapping[str, Any]) -> bool:
             or actual_frames != estimated_frames
             or row.get("visual_usage_complete") is not True
         )
+    request_trace = row.get("request_trace")
+    agent_length_truncation = isinstance(request_trace, list) and any(
+        isinstance(item, Mapping) and item.get("finish_reason") == "length"
+        for item in request_trace
+    )
+    is_agent = bool(row.get("strategy"))
+    visual_tokens = row.get("visual_tokens")
+    agent_visual_accounting_failed = is_agent and bool(
+        row.get("visual_token_accounting_complete") is not True
+        or not isinstance(visual_tokens, (int, float))
+        or isinstance(visual_tokens, bool)
+        or not math.isfinite(float(visual_tokens))
+        or float(visual_tokens) < 0
+    )
     return bool(
         row.get("error")
         or row.get("error_type")
@@ -487,6 +501,9 @@ def _row_failed(row: Mapping[str, Any]) -> bool:
         or row.get("control_unavailable")
         or row.get("prediction") is None
         or row.get("finish_reason") == "length"
+        or agent_length_truncation
+        or agent_visual_accounting_failed
+        or row.get("branch_failures")
         or direct_media_accounting_failed
     )
 
@@ -495,12 +512,16 @@ def _row_had_length_truncation(row: Mapping[str, Any]) -> bool:
     if bool(row.get("length_retry_used")):
         return True
     attempts = row.get("request_attempts")
-    if not isinstance(attempts, list):
-        return False
-    return any(
+    baseline_length = isinstance(attempts, list) and any(
         isinstance(attempt, Mapping) and attempt.get("finish_reason") == "length"
         for attempt in attempts
     )
+    request_trace = row.get("request_trace")
+    agent_length = isinstance(request_trace, list) and any(
+        isinstance(attempt, Mapping) and attempt.get("finish_reason") == "length"
+        for attempt in request_trace
+    )
+    return baseline_length or agent_length
 
 
 @dataclass
@@ -552,6 +573,15 @@ def _make_point(point_id: str, runs: Sequence[DevRun]) -> Point:
         for value in token_values
     )
     failure_rate = failures / len(rows) if rows else 1.0
+    agent_rows = [row for row in rows.values() if row.get("strategy")]
+    visual_token_accounting_complete = all(
+        row.get("visual_token_accounting_complete") is True
+        and isinstance(row.get("visual_tokens"), (int, float))
+        and not isinstance(row.get("visual_tokens"), bool)
+        and math.isfinite(float(row["visual_tokens"]))
+        and float(row["visual_tokens"]) >= 0
+        for row in agent_rows
+    )
     rejection_reasons: list[str] = []
     if missing_datasets:
         rejection_reasons.append("missing_datasets")
@@ -565,6 +595,8 @@ def _make_point(point_id: str, runs: Sequence[DevRun]) -> Point:
         rejection_reasons.append("candidate_rerun_nonzero")
     if not token_accounting_complete:
         rejection_reasons.append("total_token_accounting_incomplete")
+    if agent_rows and not visual_token_accounting_complete:
+        rejection_reasons.append("visual_token_accounting_incomplete")
     correct = sum(bool(row.get("correct")) for row in rows.values())
     summary = {
         "point_id": point_id,
@@ -589,6 +621,7 @@ def _make_point(point_id: str, runs: Sequence[DevRun]) -> Point:
             else None
         ),
         "token_accounting_complete": token_accounting_complete,
+        "visual_token_accounting_complete": visual_token_accounting_complete,
         "eligible": not rejection_reasons,
         "rejection_reasons": rejection_reasons,
         "sources": [

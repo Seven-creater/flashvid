@@ -1,6 +1,14 @@
 {
   "schema_version": 1,
-  "config_id": "a4_independent_arbitration_default_v1",
+  "config_id": "a4_independent_arbitration_q9_direct_uniform32_v2",
+  "direct_selection_basis": {
+    "model_key": "q9",
+    "protocol": "no_think",
+    "sampling_id": "uniform32",
+    "correct_dev150": 70,
+    "run_plan": "results/eval/qwen_agent_search/run_plans/direct_dev_q9_no_think.json",
+    "run_plan_sha256": "b2fa61d694e324a77b704505acefd67128ed82968a311fdb3c20c6dff82c5c58"
+  },
   "agent": {
     "strategy": "a4_independent_arbitration",
     "overview_frames": 64,
@@ -13,6 +21,6 @@
     "hierarchy_nodes": 8,
     "hierarchy_depth": 3,
     "evidence_strategy": "a3_hierarchical_search",
-    "direct_sampling": "uniform64"
+    "direct_sampling": "uniform32"
   }
 }

@@ -481,15 +481,120 @@ def test_agent_smoke_hashes_first_ten_without_mutating_dev(tmp_path: Path) -> No
         config,
         "agent_smoke",
         protocol_filter="no_think",
+        framework_filter="a0_eva_clean",
+        search_variant_id="all",
         check_files=True,
         write_smoke=False,
         model_filter="q9",
     )
     assert source.read_bytes() == before
-    assert len(tasks) == 3 * 1 * 1 * 5
+    assert len(tasks) == 3 * len(runner.search_variants(config))
     assert all(task.split == "smoke" for task in tasks)
     assert all(task.command[task.command.index("--sample") + 1] == "10" for task in tasks)
     assert not Path(tasks[0].manifest).exists()
+    assert len({task.agent_config_sha256 for task in tasks}) == len(
+        runner.search_variants(config)
+    )
+
+
+def test_agent_smoke_audit_blocks_internal_length_truncation(tmp_path: Path) -> None:
+    config = runner.load_config(_config_file(tmp_path, _config(tmp_path)))
+    tasks = runner.build_tasks(
+        config,
+        "agent_smoke",
+        protocol_filter="no_think",
+        framework_filter="a0_eva_clean",
+        search_variant_id="all",
+        model_filter="q9",
+        check_files=True,
+        write_smoke=True,
+        write_variants=True,
+    )
+    for task in tasks:
+        output = Path(task.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        manifest_rows = [
+            json.loads(line)
+            for line in Path(task.manifest).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        rows = [
+            {
+                "sample_id": str(item["sample_id"]),
+                "prediction": "A",
+                "annotation_leak_check": "passed",
+                "candidate_rerun": 0,
+                "request_trace": [{"finish_reason": "stop"}],
+                "run_fingerprint": "f" * 64,
+                "tool_steps": [{"nframes": 8}],
+                "visual_token_accounting_complete": True,
+                "visual_tokens": 128,
+            }
+            for item in manifest_rows
+        ]
+        (output / f"{task.dataset}_result.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+    assert runner.audit_agent_smoke(tasks)["status"] == "passed"
+
+    first = tasks[0]
+    result = next(Path(first.output_dir).glob(f"{first.dataset}_*.jsonl"))
+    rows = [json.loads(line) for line in result.read_text(encoding="utf-8").splitlines()]
+    rows[0]["request_trace"] = [{"finish_reason": "length"}]
+    result.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    audit = runner.audit_agent_smoke(tasks)
+    assert audit["status"] == "blocked"
+    assert audit["length_truncations"] == [
+        {"task_id": first.task_id, "sample_id": rows[0]["sample_id"]}
+    ]
+
+    rows[0]["request_trace"] = [{"finish_reason": "stop"}]
+    rows[0]["branch_failures"] = [
+        {"branch": "evidence", "reason": "invalid_answer_json"}
+    ]
+    result.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    audit = runner.audit_agent_smoke(tasks)
+    assert audit["status"] == "blocked"
+    assert any(
+        item["reason"] == "branch_failure" for item in audit["engineering_issues"]
+    )
+
+
+def test_agent_smoke_pass_artifact_is_self_hashed_and_input_bound(tmp_path: Path) -> None:
+    audit = {
+        "status": "passed",
+        "task_count": 1,
+        "row_count": 10,
+        "engineering_issues": [],
+        "length_truncations": [],
+        "sources": [{"result": "x.jsonl", "result_sha256": "a" * 64}],
+    }
+    payload = runner._agent_smoke_audit_payload(
+        audit,
+        config_sha256="b" * 64,
+        smoke_plan_sha256="c" * 64,
+        model_key="q9",
+        protocol="no_think",
+        framework="a0_eva_clean",
+        search_variant="all",
+    )
+    path = tmp_path / "passed.json"
+    artifact = runner.freeze_agent_smoke_audit(path, payload)
+
+    assert runner.load_passed_agent_smoke_audit(path, payload) == artifact
+    changed = {**payload, "row_count": 9}
+    changed["audit_sha256"] = runner.canonical_sha256(
+        {key: value for key, value in changed.items() if key != "audit_sha256"}
+    )
+    with pytest.raises(RuntimeError, match="no longer matches"):
+        runner.load_passed_agent_smoke_audit(path, changed)
 
 
 def test_final_requires_and_validates_a_frozen_winner(tmp_path: Path) -> None:

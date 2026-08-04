@@ -239,6 +239,20 @@ def test_frame_tool_caps_fps_caches_and_deduplicates(tmp_path: Path) -> None:
     assert selector_calls[0]["nframes"] == 5
 
 
+def test_frame_tool_caps_explicit_nframes_but_preserves_requested_value(
+    tmp_path: Path,
+) -> None:
+    root = _video_root(tmp_path)
+    tool, selector_calls = _frame_tool(tmp_path, max_frames=5)
+    request = FrameRequest(0, 20, nframes=12, resize=0.5)
+
+    observation = tool.open_session(root / "video.mp4", "explicit-cap").select(request)
+
+    assert observation.request.nframes == 12
+    assert observation.resolved_nframes == 5
+    assert selector_calls[0]["nframes"] == 5
+
+
 def test_frame_cache_key_binds_the_actual_selector_identity(tmp_path: Path) -> None:
     root = _video_root(tmp_path)
     calls: list[str] = []
@@ -328,6 +342,32 @@ def test_a0_eva_clean_uses_official_tools_and_never_leaks_candidate(tmp_path: Pa
     assert "PRIVATE_CANDIDATE" not in serialized
     for forbidden in ("time_range", "clue_intervals", "question_type"):
         assert forbidden not in serialized
+
+
+def test_a0_does_not_resend_old_frame_media_on_later_turns(tmp_path: Path) -> None:
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":4}}</tool_call>'
+    )
+    second_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":4}}</tool_call>'
+    )
+    agent, client, _ = _build(
+        tmp_path,
+        "a0_eva_clean",
+        [first_call, second_call, '{"answer":"B"}'],
+        max_turns=3,
+    )
+
+    result = agent.run(_sample()).to_result_dict()
+
+    assert result["prediction"] == "B"
+    media_counts = [
+        json.dumps(call["messages"], ensure_ascii=False).count('"type": "image_url"')
+        for call in client.calls
+    ]
+    assert media_counts == [0, 4, 4]
 
 
 def test_agent_emits_internal_api_and_frame_progress(
@@ -673,6 +713,33 @@ def test_a4_missing_direct_visual_usage_is_not_reported_as_zero(tmp_path: Path) 
     assert result["branch_costs"]["direct"]["visual_tokens"] is None
 
 
+def test_a4_fallback_keeps_prediction_but_records_failed_evidence_branch(
+    tmp_path: Path,
+) -> None:
+    agent, _, _ = _build(
+        tmp_path,
+        "a4_independent_arbitration",
+        [
+            '{"answer":"A"}',
+            '{"selected_node":1}',
+            '{"observed_facts":["door opens"]}',
+            "invalid evidence answer",
+        ],
+        evidence_strategy="a3_hierarchical_search",
+        hierarchy_nodes=4,
+        hierarchy_depth=1,
+        local_window_s=10.0,
+        local_fps=0.5,
+        max_frames_per_call=16,
+    )
+
+    result = agent.run(_sample()).to_result_dict()
+
+    assert result["prediction"] == "A"
+    assert result["fallback_used"] is True
+    assert result["branch_failures"][0]["branch"] == "evidence"
+
+
 def test_inference_protocol_is_forwarded_and_reasoning_is_audited(tmp_path: Path) -> None:
     root = _video_root(tmp_path)
     tool, _ = _frame_tool(tmp_path)
@@ -755,6 +822,40 @@ def test_length_retry_is_counted_and_respects_context_headroom(tmp_path: Path) -
     assert result["total_tokens"] == 206
     assert [item["retry_of_length"] for item in result["request_trace"]] == [False, True]
     assert result["final_prediction"] == "A"
+
+
+def test_terminal_length_response_is_not_consumed_as_agent_output(tmp_path: Path) -> None:
+    class LengthClient(QueueClient):
+        def chat(self, *args: Any, **kwargs: Any) -> ChatResult:
+            result = super().chat(*args, **kwargs)
+            raw = deepcopy(result.raw)
+            raw["choices"][0]["finish_reason"] = "length"
+            return ChatResult(
+                content=result.content,
+                usage=result.usage,
+                raw=raw,
+                latency_s=result.latency_s,
+                finish_reason="length",
+            )
+
+    root = _video_root(tmp_path)
+    tool, _ = _frame_tool(tmp_path)
+    client = LengthClient(['{"answer":"A"}'])
+    agent = build_strategy(
+        {"strategy": "a0", "max_turns": 1},
+        client=client,
+        model="Qwen3.5-9B",
+        video_root=root,
+        frame_root=tmp_path / "unused",
+        frame_tool=tool,
+        protocol=InferenceProtocol(planner_max_tokens=64),
+    )
+
+    result = agent.run(_sample()).to_result_dict()
+
+    assert result["prediction"] is None
+    assert result["error_type"] == "ResponseTruncatedError"
+    assert result["request_trace"][0]["finish_reason"] == "length"
 
 
 def test_invalid_answer_is_an_auditable_error_not_a_guessed_letter(tmp_path: Path) -> None:

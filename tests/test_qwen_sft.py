@@ -1116,6 +1116,12 @@ def test_qwen9b_training_launcher_hard_gates_model_and_real_loss_mask() -> None:
     assert "--num_train_epochs 3" in text
 
 
+def test_flash_attn_installer_defaults_to_the_server_ampere_architecture() -> None:
+    text = Path("scripts/install_flash_attn.sh").read_text(encoding="utf-8")
+    assert 'FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-80}"' in text
+    assert 'export CUDA_HOME CUDA_PATH="$CUDA_HOME" FLASH_ATTN_CUDA_ARCHS' in text
+
+
 def test_qwen_sft_runbook_uses_frozen_winner_and_builder_output() -> None:
     text = Path("docs/qwen_agent_search.md").read_text(encoding="utf-8")
     assert "frozen/agent_winner.json" not in text

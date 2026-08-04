@@ -7,6 +7,10 @@ CUDA_HOME="${CUDA_HOME:-${PROJECT_DIR}/.venv/lib/python3.12/site-packages/nvidia
 STATE_DIR="${STATE_DIR:-${PROJECT_DIR}/.runtime/flash_attn_install}"
 REPORT="${REPORT:-${STATE_DIR}/installed.json}"
 VERSION="${FLASH_ATTN_VERSION:-2.8.3.post1}"
+# flash-attn uses its own architecture variable and otherwise compiles kernels
+# for 80, 90, 100 and 120.  This server's RTX A6000 GPUs use the Ampere sm80
+# kernel family; callers may still override the value for another machine.
+FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-80}"
 
 mkdir -p "$STATE_DIR" "${PROJECT_DIR}/.cache/pip"
 exec 9>"${STATE_DIR}/install.lock"
@@ -16,7 +20,7 @@ flock -n 9 || { echo "another flash-attn installation is active" >&2; exit 2; }
 [[ -x "${CUDA_HOME}/bin/nvcc" ]] || { echo "CUDA nvcc not found under $CUDA_HOME" >&2; exit 2; }
 [[ -x /usr/bin/gcc && -x /usr/bin/g++ ]] || { echo "system C/C++ compiler is missing" >&2; exit 2; }
 
-export CUDA_HOME CUDA_PATH="$CUDA_HOME"
+export CUDA_HOME CUDA_PATH="$CUDA_HOME" FLASH_ATTN_CUDA_ARCHS
 export PATH="${CUDA_HOME}/bin:/usr/local/bin:/usr/bin:/bin"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export CC=/usr/bin/gcc
@@ -25,7 +29,7 @@ export MAX_JOBS="${MAX_JOBS:-8}"
 export PIP_CACHE_DIR="${PROJECT_DIR}/.cache/pip"
 
 "$SWIFT_PYTHON" -m pip install --no-build-isolation "flash-attn==${VERSION}"
-"$SWIFT_PYTHON" - "$REPORT" "$VERSION" <<'PY'
+"$SWIFT_PYTHON" - "$REPORT" "$VERSION" "$FLASH_ATTN_CUDA_ARCHS" <<'PY'
 import importlib.metadata
 import json
 from pathlib import Path
@@ -36,12 +40,14 @@ from flash_attn import flash_attn_func
 
 installed = importlib.metadata.version("flash-attn")
 expected = sys.argv[2]
+cuda_archs = sys.argv[3]
 if installed != expected or not callable(flash_attn_func):
     raise SystemExit(f"flash-attn verification failed: {installed=}, {expected=}")
 output = Path(sys.argv[1])
 payload = {
     "status": "installed",
     "flash_attn_version": installed,
+    "cuda_archs": cuda_archs,
     "python": sys.executable,
 }
 output.parent.mkdir(parents=True, exist_ok=True)

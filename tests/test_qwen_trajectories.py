@@ -100,6 +100,9 @@ def test_trajectory_runner_adds_three_blind_confirmations_and_identity() -> None
     assert all(item["prediction"] == "B" for item in row["judge_confirmations"])
     assert row["confirmation_status"] == "passed_engineering"
     assert all(call["chat_template_kwargs"] == {"enable_thinking": True} for call in client.calls)
+    assert all(
+        call["response_format"]["type"] == "json_schema" for call in client.calls
+    )
     serialized = str(client.calls)
     assert "candidate_answer" not in serialized
     assert "ground_truth" not in serialized

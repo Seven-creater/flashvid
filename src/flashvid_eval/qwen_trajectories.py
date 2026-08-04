@@ -8,6 +8,7 @@ from typing import Any, Mapping, Protocol
 
 from .client import ChatResult
 from .privacy import AnnotationLeakError, assert_annotation_free_request
+from .qwen_protocol import mcq_answer_response_format
 from .qwen_agents import (
     AgentStrategy,
     AgentTrace,
@@ -30,6 +31,7 @@ class TrajectoryChatClient(Protocol):
         *,
         temperature: float = 0.0,
         seed: int | None = None,
+        response_format: dict[str, Any] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         sampling_params: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
@@ -196,8 +198,14 @@ class QwenTrajectoryRunner:
         ]
         requested = self.protocol.judge_max_tokens
         attempts: list[dict[str, Any]] = []
+        response_format = mcq_answer_response_format(sample.option_letters)
         try:
-            assert_annotation_free_request(messages)
+            assert_annotation_free_request(
+                {
+                    "messages": messages,
+                    "request_kwargs": {"response_format": response_format},
+                }
+            )
             while True:
                 result = self.client.chat(
                     self.model,
@@ -205,6 +213,7 @@ class QwenTrajectoryRunner:
                     max_tokens=requested,
                     temperature=self.protocol.temperature,
                     seed=judge_seed,
+                    response_format=response_format,
                     chat_template_kwargs={
                         "enable_thinking": self.protocol.enable_thinking
                     },
@@ -216,6 +225,7 @@ class QwenTrajectoryRunner:
                         "finish_reason": result.finish_reason,
                         "usage": dict(result.usage),
                         "latency_s": result.latency_s,
+                        "response_format": response_format,
                     }
                 )
                 retry = self.protocol.length_retry_max_tokens

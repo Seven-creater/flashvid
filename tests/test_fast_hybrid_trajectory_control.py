@@ -85,7 +85,9 @@ def _trajectory(
         "visual_tokens": visual_tokens,
         "latency_s": 1.0,
         "end_to_end_total_tokens": total_tokens,
+        "end_to_end_total_tokens_complete": True,
         "end_to_end_visual_tokens": visual_tokens,
+        "end_to_end_visual_tokens_complete": True,
         "end_to_end_latency_s": 1.0,
         "tool_steps": [
             {

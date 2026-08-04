@@ -52,6 +52,10 @@ def _load_dataset(path: Path, dataset: str) -> dict[str, dict[str, Any]]:
         _number(row, "end_to_end_latency_s")
         if row.get("candidate_cost_complete") is not True:
             raise ValueError(f"{path}: {sample_id} has incomplete frozen-candidate cost")
+        if row.get("end_to_end_total_tokens_complete") is not True:
+            raise ValueError(f"{path}: {sample_id} has incomplete total-token cost")
+        if row.get("end_to_end_visual_tokens_complete") is not True:
+            raise ValueError(f"{path}: {sample_id} has incomplete visual-token cost")
         rows[sample_id] = dict(row)
     if len(rows) != 50:
         raise ValueError(f"{path}: expected 50 Dev rows, found {len(rows)}")

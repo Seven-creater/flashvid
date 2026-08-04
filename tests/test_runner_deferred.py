@@ -20,6 +20,14 @@ class _DeferredEvaluator:
             "candidate_answer": candidate,
             "candidate_rerun": 0,
             "annotation_leak_check": "passed",
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+            },
+            "visual_tokens": 0,
+            "visual_usage_complete": True,
+            "agent_total_tokens_complete": True,
             "request_trace": [{"content": "Answer: A", "usage": {"total_tokens": 3}}],
         }
 
@@ -28,6 +36,14 @@ class _LeakingEvaluator(_DeferredEvaluator):
     def fast_hybrid_eva(self, sample: Sample, candidate: str | None) -> dict:
         result = super().fast_hybrid_eva(sample, candidate)
         result["time_range"] = [1, 2]
+        return result
+
+
+class _MissingVisualUsageEvaluator(_DeferredEvaluator):
+    def fast_hybrid_eva(self, sample: Sample, candidate: str | None) -> dict:
+        result = super().fast_hybrid_eva(sample, candidate)
+        result["visual_tokens"] = None
+        result["visual_usage_complete"] = False
         return result
 
 
@@ -83,6 +99,8 @@ def test_deferred_fast_hybrid_result_never_joins_scoring_fields(tmp_path: Path) 
     assert row["end_to_end_visual_tokens"] == 7
     assert row["end_to_end_latency_s"] >= 0.5
     assert row["candidate_cost_complete"] is True
+    assert row["end_to_end_total_tokens_complete"] is True
+    assert row["end_to_end_visual_tokens_complete"] is True
 
 
 def test_candidate_cost_fails_closed_when_visual_accounting_is_incomplete() -> None:
@@ -103,8 +121,38 @@ def test_candidate_cost_fails_closed_when_visual_accounting_is_incomplete() -> N
         }
     )
     assert cost["usage"]["total_tokens"] == 13
-    assert cost["visual_tokens"] == 0
+    assert cost["visual_tokens"] is None
+    assert cost["usage_complete"] is True
+    assert cost["visual_complete"] is False
     assert cost["complete"] is False
+
+
+def test_end_to_end_visual_cost_is_not_zero_filled_when_agent_usage_is_missing(
+    tmp_path: Path,
+) -> None:
+    evaluate(
+        [_sample()],
+        _MissingVisualUsageEvaluator(),
+        "fast_hybrid_eva",
+        tmp_path,
+        candidate_answers={"sample-1": "A"},
+        candidate_records={
+            "sample-1": {
+                "executed_usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 2,
+                    "total_tokens": 13,
+                },
+                "visual_tokens": 7,
+                "visual_usage_complete": True,
+            }
+        },
+        defer_scoring=True,
+    )
+    row = json.loads((tmp_path / "lsdbench_fast_hybrid_eva.jsonl").read_text())
+    assert row["agent_visual_tokens"] is None
+    assert row["end_to_end_visual_tokens"] is None
+    assert row["end_to_end_visual_tokens_complete"] is False
 
 
 def test_deferred_fast_hybrid_fails_closed_on_backend_annotation(tmp_path: Path) -> None:

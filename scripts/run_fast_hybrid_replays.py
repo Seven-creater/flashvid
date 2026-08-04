@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -139,8 +140,27 @@ def _cost_fields(
         key: int((result.get("usage") or {}).get(key, 0) or 0)
         for key in ("prompt_tokens", "completion_tokens", "total_tokens")
     }
-    candidate_visual = int(candidate_cost["visual_tokens"])
-    agent_visual = int(result.get("visual_tokens", 0) or 0)
+    candidate_visual = candidate_cost["visual_tokens"]
+    agent_visual_value = result.get("visual_tokens")
+    agent_visual_complete = result.get("visual_usage_complete") is True
+    if (
+        isinstance(agent_visual_value, bool)
+        or not isinstance(agent_visual_value, (int, float))
+        or not math.isfinite(float(agent_visual_value))
+        or float(agent_visual_value) < 0
+    ):
+        agent_visual = None
+        agent_visual_complete = False
+    else:
+        agent_visual = int(agent_visual_value)
+    end_to_end_visual_complete = bool(
+        candidate_cost["visual_complete"] and agent_visual_complete
+    )
+    end_to_end_visual = (
+        int(candidate_visual) + int(agent_visual)
+        if end_to_end_visual_complete
+        else None
+    )
     candidate_latency = float(
         candidate.get("latency_s", candidate.get("elapsed_s", 0.0)) or 0.0
     )
@@ -148,16 +168,22 @@ def _cost_fields(
         "candidate_usage": candidate_usage,
         "candidate_visual_tokens": candidate_visual,
         "candidate_latency_s": candidate_latency,
+        "candidate_usage_complete": candidate_cost["usage_complete"],
+        "candidate_visual_tokens_complete": candidate_cost["visual_complete"],
         "candidate_cost_complete": candidate_cost["complete"],
         "agent_usage": agent_usage,
         "agent_visual_tokens": agent_visual,
+        "agent_total_tokens_complete": False,
+        "agent_visual_tokens_complete": agent_visual_complete,
         "end_to_end_prompt_tokens": candidate_usage["prompt_tokens"]
         + agent_usage["prompt_tokens"],
         "end_to_end_completion_tokens": candidate_usage["completion_tokens"]
         + agent_usage["completion_tokens"],
         "end_to_end_total_tokens": candidate_usage["total_tokens"]
         + agent_usage["total_tokens"],
-        "end_to_end_visual_tokens": candidate_visual + agent_visual,
+        "end_to_end_total_tokens_complete": False,
+        "end_to_end_visual_tokens": end_to_end_visual,
+        "end_to_end_visual_tokens_complete": end_to_end_visual_complete,
         "end_to_end_latency_s": candidate_latency
         + float(result.get("latency_s", 0.0) or 0.0),
     }

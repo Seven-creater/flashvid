@@ -1597,17 +1597,19 @@ def frozen_candidate_costs(record: Mapping[str, Any]) -> dict[str, Any]:
         or not math.isfinite(float(visual_value))
         or float(visual_value) < 0
     ):
-        visual_tokens = 0
+        visual_tokens = None
         visual_complete = False
     else:
         visual_tokens = int(visual_value)
 
+    usage_complete = bool(usage_complete and not record.get("error"))
+    visual_complete = bool(visual_complete and not record.get("error"))
     return {
         "usage": usage,
         "visual_tokens": visual_tokens,
-        "complete": bool(
-            usage_complete and visual_complete and not record.get("error")
-        ),
+        "usage_complete": usage_complete,
+        "visual_complete": visual_complete,
+        "complete": bool(usage_complete and visual_complete),
     }
 
 
@@ -1763,10 +1765,22 @@ def evaluate(
                     if isinstance(agent_usage_source, Mapping)
                     else result
                 )
-                agent_usage = {
-                    key: int(agent_usage_mapping.get(key, 0) or 0)
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                }
+                agent_total_tokens_complete = (
+                    result.get("agent_total_tokens_complete") is True
+                )
+                agent_usage: dict[str, int] = {}
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    value = agent_usage_mapping.get(key)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or float(value) < 0
+                    ):
+                        agent_total_tokens_complete = False
+                        agent_usage[key] = 0
+                    else:
+                        agent_usage[key] = int(value)
                 if not any(agent_usage.values()) and isinstance(
                     result.get("request_trace"), list
                 ):
@@ -1778,8 +1792,34 @@ def evaluate(
                             continue
                         for key in agent_usage:
                             agent_usage[key] += int(request_usage.get(key, 0) or 0)
-                candidate_visual_tokens = int(candidate_cost["visual_tokens"])
-                agent_visual_tokens = int(result.get("visual_tokens", 0) or 0)
+                candidate_visual_tokens = candidate_cost["visual_tokens"]
+                agent_visual_value = result.get("visual_tokens")
+                agent_visual_tokens_complete = (
+                    result.get("visual_usage_complete") is True
+                )
+                if (
+                    isinstance(agent_visual_value, bool)
+                    or not isinstance(agent_visual_value, (int, float))
+                    or not math.isfinite(float(agent_visual_value))
+                    or float(agent_visual_value) < 0
+                ):
+                    agent_visual_tokens = None
+                    agent_visual_tokens_complete = False
+                else:
+                    agent_visual_tokens = int(agent_visual_value)
+                end_to_end_visual_tokens_complete = bool(
+                    candidate_cost["visual_complete"]
+                    and agent_visual_tokens_complete
+                )
+                end_to_end_visual_tokens = (
+                    int(candidate_visual_tokens) + int(agent_visual_tokens)
+                    if end_to_end_visual_tokens_complete
+                    else None
+                )
+                end_to_end_total_tokens_complete = bool(
+                    candidate_cost["usage_complete"]
+                    and agent_total_tokens_complete
+                )
                 result.update(
                     {
                         "candidate_usage": candidate_usage,
@@ -1790,9 +1830,15 @@ def evaluate(
                             or 0.0
                         ),
                         "candidate_visual_tokens": candidate_visual_tokens,
+                        "candidate_usage_complete": candidate_cost["usage_complete"],
+                        "candidate_visual_tokens_complete": candidate_cost[
+                            "visual_complete"
+                        ],
                         "candidate_cost_complete": candidate_cost["complete"],
                         "agent_usage": agent_usage,
                         "agent_visual_tokens": agent_visual_tokens,
+                        "agent_total_tokens_complete": agent_total_tokens_complete,
+                        "agent_visual_tokens_complete": agent_visual_tokens_complete,
                         "end_to_end_prompt_tokens": (
                             candidate_usage["prompt_tokens"]
                             + agent_usage["prompt_tokens"]
@@ -1805,8 +1851,12 @@ def evaluate(
                             candidate_usage["total_tokens"]
                             + agent_usage["total_tokens"]
                         ),
-                        "end_to_end_visual_tokens": (
-                            candidate_visual_tokens + agent_visual_tokens
+                        "end_to_end_total_tokens_complete": (
+                            end_to_end_total_tokens_complete
+                        ),
+                        "end_to_end_visual_tokens": end_to_end_visual_tokens,
+                        "end_to_end_visual_tokens_complete": (
+                            end_to_end_visual_tokens_complete
                         ),
                         "end_to_end_latency_s": (
                             float(

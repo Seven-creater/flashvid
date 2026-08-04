@@ -68,6 +68,8 @@ def test_replay_cost_uses_cumulative_candidate_usage_and_requires_visual_audit()
     result = {
         "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
         "visual_tokens": 2,
+        "visual_usage_complete": True,
+        "agent_total_tokens_complete": False,
         "latency_s": 0.25,
     }
     candidate = {
@@ -85,10 +87,16 @@ def test_replay_cost_uses_cumulative_candidate_usage_and_requires_visual_audit()
     assert complete["candidate_usage"]["total_tokens"] == 22
     assert complete["end_to_end_total_tokens"] == 26
     assert complete["candidate_cost_complete"] is True
+    assert complete["agent_total_tokens_complete"] is False
+    assert complete["end_to_end_total_tokens_complete"] is False
+    assert complete["end_to_end_visual_tokens"] == 14
+    assert complete["end_to_end_visual_tokens_complete"] is True
 
     candidate["visual_usage_complete"] = False
     incomplete = module._cost_fields(result, candidate)
     assert incomplete["candidate_cost_complete"] is False
+    assert incomplete["end_to_end_visual_tokens"] is None
+    assert incomplete["end_to_end_visual_tokens_complete"] is False
 
 
 def test_ready_specs_reject_parallel_nodes_for_same_sample(tmp_path: Path) -> None:

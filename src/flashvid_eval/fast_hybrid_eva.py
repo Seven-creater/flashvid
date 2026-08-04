@@ -20,7 +20,7 @@ import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 from .client import OpenAICompatibleClient
 from .datasets import VideoIndex
@@ -93,6 +93,97 @@ def _official_commit(path: Path) -> str:
 def _usage_int(usage: dict[str, Any], key: str) -> int:
     value = usage.get(key, 0)
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _token_count(value: Any) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        return None
+    return int(value)
+
+
+def _api_visual_tokens(usage: Mapping[str, Any]) -> int | None:
+    """Read actual multimodal prompt tokens from an OpenAI-compatible usage."""
+
+    for container_name in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(container_name)
+        if not isinstance(details, Mapping):
+            continue
+        multimodal = details.get("multimodal_tokens")
+        if isinstance(multimodal, Mapping) and multimodal:
+            values = [_token_count(value) for value in multimodal.values()]
+            if all(value is not None for value in values):
+                return sum(int(value) for value in values)
+            return None
+        direct = _token_count(multimodal)
+        if direct is not None:
+            return direct
+        values = [
+            _token_count(details.get(key))
+            for key in ("visual_tokens", "video_tokens", "image_tokens")
+            if details.get(key) is not None
+        ]
+        if values and all(value is not None for value in values):
+            return sum(int(value) for value in values)
+    return _token_count(usage.get("visual_tokens"))
+
+
+def _messages_have_visual_media(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        items = content if isinstance(content, list) else [content]
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if item_type in {"image", "image_url", "video", "video_url"}:
+                return True
+            if "image_url" in item or "video_url" in item:
+                return True
+    return False
+
+
+def _actual_visual_usage(calls: list[dict[str, Any]]) -> tuple[int | None, bool]:
+    total = 0
+    for call in calls:
+        if call.get("source") != "model":
+            continue
+        has_media = _messages_have_visual_media(call.get("messages"))
+        if call.get("error"):
+            if has_media:
+                return None, False
+            continue
+        if not has_media:
+            continue
+        usage = call.get("usage")
+        visual = _api_visual_tokens(usage if isinstance(usage, Mapping) else {})
+        if visual is None:
+            return None, False
+        total += visual
+    return total, True
+
+
+def _actual_total_usage_complete(calls: list[dict[str, Any]]) -> bool:
+    model_calls = [
+        call for call in calls if call.get("source") == "model"
+    ]
+    return bool(model_calls) and all(
+        not call.get("error")
+        and isinstance(call.get("usage"), Mapping)
+        and all(
+            _token_count(call["usage"].get(key)) is not None
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+        for call in model_calls
+    )
 
 
 def _canonical_sha256(payload: Any) -> str:
@@ -749,6 +840,8 @@ class FastHybridEvaEvaluator:
                 _usage_int(call.get("usage", {}), "total_tokens") for call in calls
             ),
         }
+        visual_tokens, visual_usage_complete = _actual_visual_usage(calls)
+        visual_budget_estimate = visual_budget - int(tool_state["remaining"])
         trace = []
         for call in tool_state["trace"]:
             trace.append({"stage": stage, **call})
@@ -766,7 +859,12 @@ class FastHybridEvaEvaluator:
             "rounds": int(record.get("num_rounds", len(calls))),
             "usage": usage,
             "latency_s": sum(float(call.get("latency_s", 0.0)) for call in calls),
-            "visual_tokens": visual_budget - int(tool_state["remaining"]),
+            "visual_tokens": visual_tokens,
+            "visual_usage_complete": visual_usage_complete,
+            "visual_budget_estimate": visual_budget_estimate,
+            "agent_total_tokens_complete": bool(
+                not strict_replay and _actual_total_usage_complete(calls)
+            ),
             "tool_calls": trace,
             "request_trace": calls,
             "messages": messages,
@@ -798,7 +896,10 @@ class FastHybridEvaEvaluator:
         final = verifier
         confirmation: dict[str, Any] | None = None
         change_allowed = False
-        remaining = max(0, self.max_total_visual_tokens - int(first["visual_tokens"]))
+        remaining = max(
+            0,
+            self.max_total_visual_tokens - int(first["visual_budget_estimate"]),
+        )
         if candidate and verifier and verifier != candidate and remaining > 0:
             forced_confirmation = (
                 _v2_confirmation_call(model_sample, first)
@@ -894,6 +995,14 @@ class FastHybridEvaEvaluator:
                 for failure in required_run_failures
             )
         )
+        visual_usage_complete = all(
+            run.get("visual_usage_complete") is True for run in all_runs
+        )
+        visual_tokens = (
+            sum(int(run["visual_tokens"]) for run in all_runs)
+            if visual_usage_complete
+            else None
+        )
         return {
             "backend": "fast_hybrid_eva",
             "agent_version": self.version,
@@ -942,7 +1051,14 @@ class FastHybridEvaEvaluator:
             "required_run_failures": required_run_failures,
             "rounds": sum(int(run["rounds"]) for run in all_runs),
             "turn_count": sum(int(run["rounds"]) for run in all_runs),
-            "visual_tokens": sum(int(run["visual_tokens"]) for run in all_runs),
+            "visual_tokens": visual_tokens,
+            "visual_usage_complete": visual_usage_complete,
+            "visual_budget_estimate": sum(
+                int(run["visual_budget_estimate"]) for run in all_runs
+            ),
+            "agent_total_tokens_complete": all(
+                run.get("agent_total_tokens_complete") is True for run in all_runs
+            ),
             "usage": usage,
             **usage,
             "latency_s": sum(float(run["latency_s"]) for run in all_runs),
@@ -1036,6 +1152,9 @@ class FastHybridEvaEvaluator:
             "rounds": run["rounds"],
             "turn_count": run["rounds"],
             "visual_tokens": run["visual_tokens"],
+            "visual_usage_complete": run["visual_usage_complete"],
+            "visual_budget_estimate": run["visual_budget_estimate"],
+            "agent_total_tokens_complete": False,
             "usage": run["usage"],
             **run["usage"],
             "latency_s": run["latency_s"],

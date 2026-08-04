@@ -23,10 +23,11 @@ def test_training_lock_pins_cuda121_and_qwen35_official_stack() -> None:
         "ninja==1.13.0",
         "packaging==25.0",
         "flash-linear-attention==0.4.2",
-        "causal-conv1d==1.6.2.post1",
-        "flash-attn==2.8.3",
+        "fla-core==0.4.2",
     }
     assert expected <= set(lock.splitlines())
+    assert "causal-conv1d==" not in lock
+    assert "flash-attn==" not in lock
 
 
 def test_environment_installer_is_python312_and_venv_isolated() -> None:
@@ -35,11 +36,22 @@ def test_environment_installer_is_python312_and_venv_isolated() -> None:
     assert ".venv-qwen35-sft-cu121" in text
     assert "--system-site-packages" not in text
     assert "include-system-site-packages = false" in text
-    assert 'TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://mirror.sjtu.edu.cn/pytorch-wheels/cu121}"' in text
-    assert '--index-url "$TORCH_INDEX_URL"' in text
+    assert "https://mirrors.aliyun.com/pytorch-wheels/cu121" in text
+    assert "https://pypi.tuna.tsinghua.edu.cn/packages/60/ee/" in text
+    assert 'PYPI_INDEX_URL="${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"' in text
+    assert '[[ "$HF_ENDPOINT" == "https://hf-mirror.com" ]]' in text
+    assert '[[ "$PYPI_INDEX_URL" == "https://pypi.tuna.tsinghua.edu.cn/simple" ]]' in text
+    assert "export PIP_CONFIG_FILE=/dev/null" in text
+    assert "unset PIP_EXTRA_INDEX_URL PIP_FIND_LINKS PIP_NO_INDEX" in text
+    assert "NoRedirect" in text
+    assert '"$1" == "--audit-only"' in text
+    assert "domestic mirror audit passed; no packages were downloaded" in text
+    assert 'allowed_hosts = {"mirrors.aliyun.com", "pypi.tuna.tsinghua.edu.cn"}' in text
+    assert "222be02548c2e74a21a8fbc8e5b8d2eef9f9faee865d70385d2eb1b9aabcbc76" in text
     assert 'HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"' in text
-    assert '"torch==2.5.1"' in text
-    assert "--no-build-isolation -r \"$LOCK_FILE\"" in text
+    assert "c08be006ce4dbe1be81f54938ee8e6fc7968cfba397c8d06c7669e97b8c44c0d" in text
+    assert '"${FLA_WHEEL_URL}#sha256=${FLA_WHEEL_SHA256}"' in text
+    assert "--no-build-isolation" not in text
     assert '"$SWIFT_PYTHON" -m pip check' in text
 
 
@@ -66,6 +78,7 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "--lora_rank 16",
         "--lora_alpha 32",
         "--lora_dropout 0.05",
+        "--attn_impl sdpa",
         "verify_swift_loss_mask.py",
         "preflight_qwen35_9b_lora.py",
         "smoke_one_sample.jsonl",

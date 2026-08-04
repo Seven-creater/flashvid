@@ -288,6 +288,7 @@ NPROC_PER_NODE="$gpu_count" \
   --add_version false \
   --check_model false \
   --torch_dtype bfloat16 \
+  --attn_impl sdpa \
   --target_modules all-linear \
   --freeze_llm false \
   --freeze_vit true \

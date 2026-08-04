@@ -37,6 +37,9 @@ def _run_record(
         },
         "latency_s": 0.5,
         "visual_tokens": 1000 if tool else 0,
+        "visual_usage_complete": True,
+        "visual_budget_estimate": 1000 if tool else 0,
+        "agent_total_tokens_complete": True,
         "tool_calls": (
             [
                 {
@@ -314,13 +317,22 @@ def test_official_run_captures_every_request_and_tool_message(
                 {"model": model, "messages": messages, "kwargs": kwargs}
             )
             content = self.responses.pop(0)
+            usage = {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+            }
+            if any(
+                isinstance(message.get("content"), list)
+                for message in messages
+                if isinstance(message, dict)
+            ):
+                usage["prompt_tokens_details"] = {
+                    "multimodal_tokens": {"image": 7}
+                }
             return ChatResult(
                 content=content,
-                usage={
-                    "prompt_tokens": 10,
-                    "completion_tokens": 2,
-                    "total_tokens": 12,
-                },
+                usage=usage,
                 raw={},
                 latency_s=0.1,
                 finish_reason="stop",
@@ -418,6 +430,10 @@ def test_official_run_captures_every_request_and_tool_message(
     )
     assert all(item["temperature"] == 0.2 for item in result["request_trace"])
     assert all(item["seed"] == 73 for item in result["request_trace"])
+    assert result["visual_tokens"] == 7
+    assert result["visual_usage_complete"] is True
+    assert result["visual_budget_estimate"] == 0
+    assert result["agent_total_tokens_complete"] is True
 
 
 def test_official_adapter_replays_forced_tool_queue_before_model() -> None:
@@ -482,6 +498,27 @@ def test_official_adapter_replays_forced_tool_queue_before_model() -> None:
         "test_replay",
         "model",
     ]
+
+
+def test_actual_visual_usage_fails_closed_when_media_details_are_missing() -> None:
+    media_call = {
+        "source": "model",
+        "messages": [
+            {
+                "role": "tool",
+                "content": [{"type": "image_url", "image_url": {"url": "x"}}],
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+    }
+    assert fast_module._actual_visual_usage([media_call]) == (None, False)
+    media_call["usage"]["input_tokens_details"] = {
+        "multimodal_tokens": {"image": 9, "video": 3}
+    }
+    assert fast_module._actual_visual_usage([media_call]) == (12, True)
+    media_call["error"] = "timeout after submission"
+    assert fast_module._actual_visual_usage([media_call]) == (None, False)
+    assert fast_module._actual_total_usage_complete([media_call]) is False
 
 
 def test_budgeted_tool_trace_saves_absolute_frame_paths(
@@ -623,6 +660,7 @@ def test_fixed_evidence_replay_uses_only_frozen_calls() -> None:
     assert result["prediction"] == "B"
     assert result["fallback_to_candidate"] is False
     assert result["planned_calls_completed"] is True
+    assert result["agent_total_tokens_complete"] is False
     assert evaluator._forced_calls == [
         [
             {

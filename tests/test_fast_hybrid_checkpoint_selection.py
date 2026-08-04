@@ -46,7 +46,9 @@ def _write_run(
                     "candidate_rerun": 0,
                     "candidate_cost_complete": True,
                     "end_to_end_total_tokens": total_tokens,
+                    "end_to_end_total_tokens_complete": True,
                     "end_to_end_visual_tokens": visual_tokens,
+                    "end_to_end_visual_tokens_complete": True,
                     "end_to_end_latency_s": 1.0,
                     "tool_calls": [{}],
                 }
@@ -145,4 +147,33 @@ def test_rejects_changed_prompt_or_candidate(tmp_path: Path) -> None:
         select_fast_hybrid_checkpoint(
             teacher_paths=teacher,
             checkpoints=[CheckpointRun("changed", 1, changed)],
+        )
+
+
+def test_rejects_incomplete_visual_cost_instead_of_zero_filling(tmp_path: Path) -> None:
+    teacher = _write_run(
+        tmp_path,
+        "teacher",
+        correct_by_dataset={dataset: 20 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+    )
+    checkpoint = _write_run(
+        tmp_path,
+        "checkpoint",
+        correct_by_dataset={dataset: 21 for dataset in DATASETS},
+        total_tokens=90,
+        visual_tokens=70,
+    )
+    first_path = checkpoint["lvbench"]
+    rows = [json.loads(line) for line in first_path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["end_to_end_visual_tokens"] = None
+    rows[0]["end_to_end_visual_tokens_complete"] = False
+    first_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="end_to_end_visual_tokens"):
+        select_fast_hybrid_checkpoint(
+            teacher_paths=teacher,
+            checkpoints=[CheckpointRun("checkpoint", 1, checkpoint)],
         )

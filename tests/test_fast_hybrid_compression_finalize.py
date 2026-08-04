@@ -55,7 +55,9 @@ def _base(*, tool_count: int = 1) -> dict:
         "fallback_to_candidate": False,
         "tool_steps": steps,
         "end_to_end_total_tokens": 1_000,
+        "end_to_end_total_tokens_complete": True,
         "end_to_end_visual_tokens": 800,
+        "end_to_end_visual_tokens_complete": True,
         "end_to_end_latency_s": 10.0,
         "_selection_stable": True,
         "_selection_confirmation_count": 3,
@@ -100,6 +102,8 @@ def _replicas(spec: dict, *, costs: tuple[int, int, int] = (110, 100, 120)) -> l
                 "annotation_leak_check": "passed",
                 "candidate_rerun": 0,
                 "candidate_cost_complete": True,
+                "agent_total_tokens_complete": False,
+                "agent_visual_tokens_complete": True,
                 "candidate_answer": "A",
                 "prediction": "B",
                 "final_prediction": "B",
@@ -111,7 +115,9 @@ def _replicas(spec: dict, *, costs: tuple[int, int, int] = (110, 100, 120)) -> l
                 "request_trace": [{"content": "Answer: B"}],
                 "error": None,
                 "end_to_end_total_tokens": cost,
+                "end_to_end_total_tokens_complete": False,
                 "end_to_end_visual_tokens": cost - 10,
+                "end_to_end_visual_tokens_complete": True,
                 "end_to_end_latency_s": float(replica + 1),
             }
         )
@@ -130,7 +136,10 @@ def test_replay_gate_requires_exact_three_and_chooses_median_replica() -> None:
     assert complete.outcomes == {spec["counterfactual_fingerprint"]: "passed"}
     representative = complete.representatives[0]
     assert representative["trajectory_id"] == rows[0]["trajectory_id"]
-    assert representative["_selection_median_end_to_end_total_tokens"] == 110
+    assert representative["_selection_median_end_to_end_visual_tokens"] == 100
+    assert representative["_selection_cost_basis"] == (
+        "actual_end_to_end_visual_tokens_then_tool_calls_latency"
+    )
     assert representative["_selection_stable"] is True
 
 
@@ -144,6 +153,18 @@ def test_replay_gate_rejects_an_observed_schedule_different_from_plan() -> None:
     assert outcome.rejection_reasons[fingerprint] == "schedule_mismatch"
 
 
+def test_replay_representative_ignores_incomplete_total_token_lower_bound() -> None:
+    spec = generate_compression_replay_specs(_base())[0]
+    rows = _replicas(spec)
+    for row, total, visual in zip(rows, (1, 10_000, 5_000), (300, 100, 200)):
+        row["end_to_end_total_tokens"] = total
+        row["end_to_end_visual_tokens"] = visual
+    outcome = analyze_compression_replays([spec], rows, ANSWER)
+    representative = outcome.representatives[0]
+    assert representative["trajectory_id"] == rows[2]["trajectory_id"]
+    assert representative["_selection_median_end_to_end_visual_tokens"] == 200
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
@@ -151,6 +172,14 @@ def test_replay_gate_rejects_an_observed_schedule_different_from_plan() -> None:
         (lambda row: row.update(fallback_to_candidate=True), "fallback"),
         (lambda row: row.update(candidate_rerun=1), "candidate_rerun"),
         (lambda row: row.update(error="API failed"), "engineering_or_parse_error"),
+        (
+            lambda row: row.update(end_to_end_total_tokens_complete=True),
+            "forced_replay_total_cost_not_marked_incomplete",
+        ),
+        (
+            lambda row: row.update(end_to_end_visual_tokens_complete=False),
+            "visual_cost_incomplete",
+        ),
         (lambda row: row.update(tool_steps=[]), "invalid_tool_trace"),
         (
             lambda row: row["tool_steps"][0].update(nframes=1),
@@ -186,7 +215,7 @@ def test_finalizer_releases_at_most_one_node_per_sample() -> None:
     assert after_tail.ready[0]["variant_id"] == "early_stop_after_tail_1"
 
 
-def test_completed_dag_selects_cheapest_end_to_end_stable_replica() -> None:
+def test_completed_dag_selects_cheapest_measured_visual_cost() -> None:
     base = _base(tool_count=1)
     specs = generate_compression_replay_specs(base)
     rows: list[dict] = []
@@ -202,7 +231,9 @@ def test_completed_dag_selects_cheapest_end_to_end_stable_replica() -> None:
     assert winner["variant_id"].endswith("scale_025")
     assert winner["_selection_stable"] is True
     assert winner["_compression_finalized"] is True
-    assert winner["_selection_cost_basis"] == "end_to_end"
+    assert winner["_selection_cost_basis"] == (
+        "actual_end_to_end_visual_tokens_then_tool_calls_latency"
+    )
 
 
 def test_compression_ledger_requires_monotonic_immutable_result_files(

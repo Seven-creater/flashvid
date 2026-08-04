@@ -579,8 +579,25 @@ def _cost_number(row: Mapping[str, Any], key: str) -> float:
 def _end_to_end_cost_key(row: Mapping[str, Any]) -> tuple[float, float, int, float, str]:
     """Rank complete-system cost, including the frozen Direct candidate."""
 
+    if row.get("end_to_end_total_tokens_complete") is not True:
+        raise ValueError("trajectory has incomplete end-to-end total-token cost")
+    if row.get("end_to_end_visual_tokens_complete") is not True:
+        raise ValueError("trajectory has incomplete end-to-end visual-token cost")
     return (
         _cost_number(row, "end_to_end_total_tokens"),
+        _cost_number(row, "end_to_end_visual_tokens"),
+        len(_frame_steps(row)),
+        _cost_number(row, "end_to_end_latency_s"),
+        str(row.get("trajectory_id") or ""),
+    )
+
+
+def _compression_cost_key(row: Mapping[str, Any]) -> tuple[float, int, float, str]:
+    """Rank forced replays only by costs that the replay actually measured."""
+
+    if row.get("end_to_end_visual_tokens_complete") is not True:
+        raise ValueError("compression replay has incomplete visual-token cost")
+    return (
         _cost_number(row, "end_to_end_visual_tokens"),
         len(_frame_steps(row)),
         _cost_number(row, "end_to_end_latency_s"),
@@ -1119,6 +1136,14 @@ def _compression_row_rejection_reason(
         return "candidate_rerun"
     if row.get("candidate_cost_complete") is not True:
         return "candidate_cost_incomplete"
+    if row.get("agent_total_tokens_complete") is not False:
+        return "forced_replay_total_cost_not_marked_incomplete"
+    if row.get("end_to_end_total_tokens_complete") is not False:
+        return "forced_replay_total_cost_not_marked_incomplete"
+    if row.get("agent_visual_tokens_complete") is not True:
+        return "visual_cost_incomplete"
+    if row.get("end_to_end_visual_tokens_complete") is not True:
+        return "visual_cost_incomplete"
     if any(
         row.get(key)
         for key in (
@@ -1154,7 +1179,7 @@ def _compression_row_rejection_reason(
     ):
         return "schedule_mismatch"
     try:
-        _end_to_end_cost_key(row)
+        _compression_cost_key(row)
     except ValueError:
         return "invalid_end_to_end_cost"
     return None
@@ -1253,13 +1278,12 @@ def analyze_compression_replays(
             outcomes[fingerprint] = "failed"
             rejection_reasons[fingerprint] = reason
             continue
-        costs = [_cost_number(row, "end_to_end_total_tokens") for row in rows]
+        costs = [_cost_number(row, "end_to_end_visual_tokens") for row in rows]
         middle = float(median(costs))
         representative = min(
             rows,
             key=lambda row: (
-                abs(_cost_number(row, "end_to_end_total_tokens") - middle),
-                _cost_number(row, "end_to_end_visual_tokens"),
+                abs(_cost_number(row, "end_to_end_visual_tokens") - middle),
                 len(_frame_steps(row)),
                 _cost_number(row, "end_to_end_latency_s"),
                 str(row["trajectory_id"]),
@@ -1269,9 +1293,11 @@ def analyze_compression_replays(
         selected.update(
             {
                 "_selection_source": "compression_replay",
-                "_selection_cost_basis": "end_to_end",
+                "_selection_cost_basis": (
+                    "actual_end_to_end_visual_tokens_then_tool_calls_latency"
+                ),
                 "_selection_family_id": spec["family_id"],
-                "_selection_median_end_to_end_total_tokens": middle,
+                "_selection_median_end_to_end_visual_tokens": middle,
                 "_compression_fingerprint": fingerprint,
             }
         )
@@ -1362,10 +1388,12 @@ def finalize_compression_dags(
             for fingerprint, outcome in group_outcomes.items()
             if outcome == "passed" and fingerprint in representative_by_fingerprint
         ]
-        winner = dict(min(candidates, key=_end_to_end_cost_key))
+        winner = dict(min(candidates, key=_compression_cost_key))
         winner["_selection_stable"] = True
         winner["_selection_confirmation_count"] = len(JUDGE_SEEDS)
-        winner["_selection_cost_basis"] = "end_to_end"
+        winner["_selection_cost_basis"] = (
+            "actual_end_to_end_visual_tokens_then_tool_calls_latency"
+        )
         winner["_compression_finalized"] = True
         selected.append(winner)
 

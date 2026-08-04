@@ -23,8 +23,7 @@ REQUIRED_VERSIONS = {
     "accelerate": "1.14.0",
     "trl": "0.29.1",
     "flash-linear-attention": "0.4.2",
-    "causal-conv1d": "1.6.2.post1",
-    "flash-attn": "2.8.3",
+    "fla-core": "0.4.2",
 }
 MIN_GPU_MEMORY_BYTES = 42 * 1024**3
 
@@ -64,6 +63,28 @@ def _check_versions() -> dict[str, str]:
             )
         installed[distribution] = actual
     return installed
+
+
+def _check_attention_backends() -> dict[str, Any]:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+    if not callable(chunk_gated_delta_rule):
+        raise RuntimeError("flash-linear-attention gated-delta kernel is unavailable")
+
+    optional: dict[str, str | None] = {}
+    for distribution in ("causal-conv1d", "flash-attn"):
+        try:
+            optional[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            optional[distribution] = None
+    return {
+        "linear_attention": "flash-linear-attention",
+        "causal_conv1d": (
+            "extension" if optional["causal-conv1d"] is not None else "transformers_torch_fallback"
+        ),
+        "full_attention": "sdpa",
+        "optional_extensions": optional,
+    }
 
 
 def _check_cuda(expected_gpu_count: int) -> tuple[Any, dict[str, Any]]:
@@ -178,6 +199,7 @@ def main() -> None:
 
     _check_python()
     versions = _check_versions()
+    attention_backends = _check_attention_backends()
     torch_module, cuda = _check_cuda(args.expected_gpu_count)
     model = _check_transformers_model(
         args.model,
@@ -189,6 +211,7 @@ def main() -> None:
         "python": sys.version.split()[0],
         "executable": sys.executable,
         "versions": versions,
+        "attention_backends": attention_backends,
         "cuda": cuda,
         "model": model,
     }

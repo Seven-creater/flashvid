@@ -114,6 +114,9 @@ def test_full_preflight_requests_weight_load_and_one_step() -> None:
     assert "--load-weights-preflight" in wrapper
     assert "--smoke" in wrapper
     assert "torch.cuda.is_available()" in python
+    assert "naive_recurrent_gated_delta_rule" in python
+    assert "FLA numerical smoke" in python
+    assert '"relative_l1": errors' in python
     assert "AutoModelForImageTextToText.from_pretrained" in python
     assert 'device_map="auto"' in python
 

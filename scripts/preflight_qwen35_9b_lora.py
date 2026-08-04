@@ -132,6 +132,136 @@ def _check_cuda(expected_gpu_count: int) -> tuple[Any, dict[str, Any]]:
     }
 
 
+def _relative_l1(torch_module: Any, actual: Any, expected: Any) -> float:
+    actual_float = actual.detach().float()
+    expected_float = expected.detach().float()
+    denominator = expected_float.abs().mean().clamp_min(1e-6)
+    return float(((actual_float - expected_float).abs().mean() / denominator).item())
+
+
+def _check_fla_numerics(torch_module: Any) -> dict[str, Any]:
+    """Compare the fused Qwen3.5 GDN path with FLA's PyTorch reference."""
+    import torch.nn.functional as functional
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule,
+        naive_recurrent_gated_delta_rule,
+    )
+
+    device = torch_module.device("cuda", 0)
+    generator = torch_module.Generator(device=device).manual_seed(20260804)
+    shape_qk = (1, 64, 2, 16)
+    shape_v = (1, 64, 2, 16)
+    shape_gate = (1, 64, 2)
+
+    q_source = torch_module.randn(
+        shape_qk, generator=generator, device=device, dtype=torch_module.float32
+    ) * 0.1
+    k_source = functional.normalize(
+        torch_module.randn(
+            shape_qk, generator=generator, device=device, dtype=torch_module.float32
+        ),
+        p=2,
+        dim=-1,
+    )
+    v_source = torch_module.randn(
+        shape_v, generator=generator, device=device, dtype=torch_module.float32
+    ) * 0.1
+    g_source = functional.logsigmoid(
+        torch_module.randn(
+            shape_gate, generator=generator, device=device, dtype=torch_module.float32
+        )
+        * 0.1
+    )
+    beta_source = torch_module.sigmoid(
+        torch_module.randn(
+            shape_gate, generator=generator, device=device, dtype=torch_module.float32
+        )
+    )
+
+    sources = (q_source, k_source, v_source, g_source, beta_source)
+    fused_inputs = tuple(
+        value.to(torch_module.bfloat16).detach().requires_grad_(True)
+        for value in sources
+    )
+    reference_inputs = tuple(
+        value.detach().float().requires_grad_(True) for value in fused_inputs
+    )
+
+    fused_output, fused_state = chunk_gated_delta_rule(
+        *fused_inputs,
+        output_final_state=True,
+    )
+    reference_output, reference_state = naive_recurrent_gated_delta_rule(
+        reference_inputs[0],
+        reference_inputs[1],
+        reference_inputs[2],
+        reference_inputs[4],
+        reference_inputs[3],
+        output_final_state=True,
+    )
+    if fused_state is None or reference_state is None:
+        raise RuntimeError("FLA numerical smoke did not return final states")
+
+    output_weight = torch_module.randn(
+        fused_output.shape,
+        generator=generator,
+        device=device,
+        dtype=torch_module.float32,
+    )
+    fused_loss = (fused_output.float() * output_weight).mean()
+    fused_loss = fused_loss + 0.01 * fused_state.float().square().mean()
+    reference_loss = (reference_output * output_weight).mean()
+    reference_loss = reference_loss + 0.01 * reference_state.square().mean()
+    fused_loss.backward()
+    reference_loss.backward()
+
+    tensors = {
+        "output": (fused_output, reference_output),
+        "state": (fused_state, reference_state),
+        "q_grad": (fused_inputs[0].grad, reference_inputs[0].grad),
+        "k_grad": (fused_inputs[1].grad, reference_inputs[1].grad),
+        "v_grad": (fused_inputs[2].grad, reference_inputs[2].grad),
+        "g_grad": (fused_inputs[3].grad, reference_inputs[3].grad),
+        "beta_grad": (fused_inputs[4].grad, reference_inputs[4].grad),
+    }
+    limits = {
+        "output": 0.08,
+        "state": 0.08,
+        "q_grad": 0.15,
+        "k_grad": 0.20,
+        "v_grad": 0.15,
+        "g_grad": 0.25,
+        "beta_grad": 0.20,
+    }
+    errors: dict[str, float] = {}
+    for name, (actual, expected) in tensors.items():
+        if actual is None or expected is None:
+            raise RuntimeError(f"FLA numerical smoke produced no {name}")
+        if not bool(torch_module.isfinite(actual).all()) or not bool(
+            torch_module.isfinite(expected).all()
+        ):
+            raise RuntimeError(f"FLA numerical smoke produced NaN or Inf in {name}")
+        error = _relative_l1(torch_module, actual, expected)
+        errors[name] = error
+        if error > limits[name]:
+            raise RuntimeError(
+                f"FLA numerical smoke {name} relative L1 {error:.6f} "
+                f"exceeds {limits[name]:.6f}"
+            )
+
+    del fused_output, fused_state, reference_output, reference_state
+    del fused_inputs, reference_inputs, sources
+    gc.collect()
+    torch_module.cuda.empty_cache()
+    return {
+        "reference": "naive_recurrent_gated_delta_rule",
+        "dtype": "bfloat16",
+        "shape": [1, 64, 2, 16],
+        "relative_l1": errors,
+        "limits": limits,
+    }
+
+
 def _check_transformers_model(
     model_path: Path,
     *,
@@ -205,6 +335,7 @@ def main() -> None:
     versions = _check_versions()
     attention_backends = _check_attention_backends()
     torch_module, cuda = _check_cuda(args.expected_gpu_count)
+    fla_numerics = _check_fla_numerics(torch_module)
     model = _check_transformers_model(
         args.model,
         load_weights=args.load_weights,
@@ -216,6 +347,7 @@ def main() -> None:
         "executable": sys.executable,
         "versions": versions,
         "attention_backends": attention_backends,
+        "fla_numerics": fla_numerics,
         "cuda": cuda,
         "model": model,
     }

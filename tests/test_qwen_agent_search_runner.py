@@ -691,6 +691,25 @@ def test_teacher_and_sft_dev_are_bound_to_frozen_winner_and_adapter(
         "Qwen3.5-9B-sft-epoch1"
     }
     assert all(task.manifest == other.manifest for task, other in zip(teacher_tasks, checkpoint_tasks))
+    for group in ("q9", "q4"):
+        final_tasks = runner.build_tasks(
+            config,
+            "final_matrix",
+            frozen_winner=winner,
+            frozen_sft_winner=None,
+            final_model_group=group,
+            check_files=True,
+        )
+        assert len(final_tasks) == 12
+    with pytest.raises(ValueError, match="gate-passed SFT winner"):
+        runner.build_tasks(
+            config,
+            "final_matrix",
+            frozen_winner=winner,
+            frozen_sft_winner=None,
+            final_model_group="sft9",
+            check_files=True,
+        )
     selection_report = {
         "schema_version": 1,
         "status": "passed",

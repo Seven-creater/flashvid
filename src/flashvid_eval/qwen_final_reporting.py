@@ -148,8 +148,8 @@ def _method_id(task: Mapping[str, Any]) -> str:
 def load_final_matrix(
     plan_paths: Sequence[Path], experiment_config_sha256: str
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    if len(plan_paths) != 3:
-        raise ValueError("final matrix requires exactly q9, q4, and sft9 run plans")
+    if len(plan_paths) not in {2, 3}:
+        raise ValueError("final matrix requires q9/q4 and optionally sft9 run plans")
     groups: set[str] = set()
     methods: dict[str, list[dict[str, Any]]] = defaultdict(list)
     plan_records: list[dict[str, Any]] = []
@@ -160,7 +160,7 @@ def load_final_matrix(
             raise ValueError(f"not a final_matrix plan: {path}")
         group = str(plan.get("final_model_group") or "")
         if group not in {"q9", "q4", "sft9"} or group in groups:
-            raise ValueError("final plans must contain q9/q4/sft9 exactly once")
+            raise ValueError("final plans must contain unique q9/q4/optional-sft9 groups")
         groups.add(group)
         tasks = plan.get("tasks")
         if not isinstance(tasks, list):
@@ -183,6 +183,8 @@ def load_final_matrix(
                 "group": group,
             }
         )
+    if not {"q9", "q4"} <= groups:
+        raise ValueError("final plans must contain q9 and q4 exactly once")
     expected_prefixes = {
         "q9_no_video",
         "q9_eva_clean",
@@ -212,7 +214,6 @@ def build_final_report(
 
     q9_direct = exactly_one("q9_direct_")
     q4_direct = exactly_one("q4_direct_")
-    sft9 = exactly_one("sft9_")
     comparisons = {
         "q9_no_video_vs_direct": paired_method_compare(
             methods["q9_no_video"], methods[q9_direct]
@@ -226,21 +227,26 @@ def build_final_report(
         "q4_direct_vs_untrained_agent": paired_method_compare(
             methods[q4_direct], methods["q4_best_untrained"]
         ),
-        "q9_untrained_vs_sft": paired_method_compare(
-            methods["q9_best_untrained"], methods[sft9]
-        ),
     }
+    sft_matches = [name for name in methods if name.startswith("sft9_")]
+    if len(sft_matches) > 1:
+        raise ValueError(f"expected at most one sft9 method, found {sft_matches}")
+    sft9 = sft_matches[0] if sft_matches else None
+    if sft9 is not None:
+        comparisons["q9_untrained_vs_sft"] = paired_method_compare(
+            methods["q9_best_untrained"], methods[sft9]
+        )
     summaries = {name: summarize_method(rows) for name, rows in sorted(methods.items())}
     teacher = summaries["q9_best_untrained"]
-    student = summaries[sft9]
+    student = summaries[sft9] if sft9 is not None else None
     total_ratio = (
         student["mean_total_tokens"] / teacher["mean_total_tokens"]
-        if teacher["mean_total_tokens"]
+        if student is not None and teacher["mean_total_tokens"]
         else None
     )
     visual_ratio = (
         student["mean_visual_tokens"] / teacher["mean_visual_tokens"]
-        if teacher["mean_visual_tokens"]
+        if student is not None and teacher["mean_visual_tokens"]
         else None
     )
     success = {
@@ -248,10 +254,8 @@ def build_final_report(
             "q9_direct_vs_untrained_agent"
         ]["gain"]
         > 0,
-        "sft_q9_strictly_beats_untrained": comparisons["q9_untrained_vs_sft"][
-            "gain"
-        ]
-        > 0,
+        "sft_q9_strictly_beats_untrained": sft9 is not None
+        and comparisons["q9_untrained_vs_sft"]["gain"] > 0,
         "sft_total_tokens_at_most_70pct": total_ratio is not None
         and total_ratio <= 0.70,
         "sft_visual_tokens_at_most_70pct": visual_ratio is not None
@@ -264,6 +268,7 @@ def build_final_report(
         "provenance": provenance,
         "methods": summaries,
         "comparisons": comparisons,
+        "sft_evaluated": sft9 is not None,
         "sft_token_ratios": {"total": total_ratio, "visual": visual_ratio},
         "success_conditions": success,
         "overall_success": all(success.values()),

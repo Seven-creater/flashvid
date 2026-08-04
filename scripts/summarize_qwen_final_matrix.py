@@ -86,11 +86,12 @@ def _badcases_markdown(
     def one(prefix: str) -> str:
         return next(name for name in methods if name.startswith(prefix))
 
-    pairs = [
+    pairs: list[tuple[str, str]] = [
         (one("q9_direct_"), "q9_best_untrained"),
-        ("q9_best_untrained", one("sft9_")),
         ("q4_no_video", one("q4_direct_")),
     ]
+    if any(name.startswith("sft9_") for name in methods):
+        pairs.insert(1, ("q9_best_untrained", one("sft9_")))
     lines = ["# 固定工程测试集配对坏例", ""]
     for baseline_name, candidate_name in pairs:
         left = {

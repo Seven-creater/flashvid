@@ -1445,10 +1445,10 @@ def build_tasks(
                 )
             )
     elif phase == "final_matrix":
-        if frozen_winner is None or frozen_sft_winner is None:
-            raise ValueError(
-                "final_matrix requires both the frozen untrained winner and a gate-passed SFT winner"
-            )
+        if frozen_winner is None:
+            raise ValueError("final_matrix requires the frozen untrained winner")
+        if final_model_group == "sft9" and frozen_sft_winner is None:
+            raise ValueError("sft9 final_matrix requires a gate-passed SFT winner")
         selection = _mapping(
             json.loads(frozen_winner.selection_report.path.read_text(encoding="utf-8")),
             "final matrix Dev selection report",
@@ -1549,8 +1549,10 @@ def build_tasks(
                             ),
                         )
                     )
-            checkpoint = frozen_sft_winner.checkpoint
             if final_model_group == "sft9":
+                if frozen_sft_winner is None:
+                    raise AssertionError("validated sft9 final matrix lost its winner")
+                checkpoint = frozen_sft_winner.checkpoint
                 tasks.append(
                     _task_command(
                         config,
@@ -2013,10 +2015,14 @@ def main() -> None:
         parser.error("sft_dev requires --sft-checkpoint-config")
     if args.phase != "sft_dev" and args.sft_checkpoint_config is not None:
         parser.error("--sft-checkpoint-config is only valid with sft_dev")
-    if args.phase == "final_matrix" and (
-        args.frozen_sft_winner is None or args.final_model_group is None
+    if args.phase == "final_matrix" and args.final_model_group is None:
+        parser.error("final_matrix requires --final-model-group")
+    if (
+        args.phase == "final_matrix"
+        and args.final_model_group == "sft9"
+        and args.frozen_sft_winner is None
     ):
-        parser.error("final_matrix requires --frozen-sft-winner and --final-model-group")
+        parser.error("sft9 final_matrix requires --frozen-sft-winner")
     if args.phase != "final_matrix" and (
         args.frozen_sft_winner is not None or args.final_model_group is not None
     ):

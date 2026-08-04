@@ -188,15 +188,17 @@ PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
 
 ## 5. 最终固定 300 条
 
-只有 gate-passed `sft_winner.json` 存在后才运行。q9、q4、sft9 必须分别启动正确服务和任务：
+冻结未训练 winner 后即可分别运行 q9、q4 最终矩阵；即使 SFT 没有通过门槛，
+这两组也必须完成并真实报告。只有 sft9 组要求 gate-passed `sft_winner.json`。
+三组必须分别启动正确服务和任务：
 
 ```bash
 PYTHON_BIN=$PYTHON_BIN bash scripts/launch_qwen_agent_phase.sh \
   configs/experiments/qwen_agent_search.json final_matrix q9 \
-  --frozen-winner-config results/eval/qwen_agent_search/frozen/q9_agent_winner.json \
-  --frozen-sft-winner results/eval/qwen_agent_search/frozen/sft_winner.json
+  --frozen-winner-config results/eval/qwen_agent_search/frozen/q9_agent_winner.json
 ```
 
-将 `q9` 分别替换为 `q4` 和 `sft9`，并在每组之间停止旧服务。三组完成后，将三个 `final_matrix_*.json` run plan 传给 `summarize_qwen_final_matrix.py`。
+将 `q9` 替换为 `q4` 即可运行 4B 组。运行 `sft9` 时再额外传入
+`--frozen-sft-winner results/eval/qwen_agent_search/frozen/sft_winner.json`，并在每组之间停止旧服务。三组完成后，将已有的 `final_matrix_*.json` run plan 传给 `summarize_qwen_final_matrix.py`。
 
 最终矩阵固定包含：4B/9B 真无视频、4B/9B 最佳 Direct、4B/9B EVA-clean、同配置 4B/9B 最佳未训练 Agent、最终 SFT-9B。报告输出 raw/accessible/common-valid accuracy、McNemar、改对/改错、完整 Token、延迟和失败分类；未达标时按真实数值报告。

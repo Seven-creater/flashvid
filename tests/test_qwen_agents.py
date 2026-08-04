@@ -56,6 +56,7 @@ class QueueClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "seed": seed,
+            "response_format": deepcopy(response_format),
             "chat_template_kwargs": deepcopy(chat_template_kwargs),
             "sampling_params": deepcopy(sampling_params),
             "mm_processor_kwargs": deepcopy(mm_processor_kwargs),
@@ -285,7 +286,7 @@ def test_official_frame_identity_binds_resolved_script_sha(
 
 def test_strict_json_answer_and_official_tool_parser() -> None:
     assert parse_answer_json('{"answer":"B"}', ("A", "B")) == "B"
-    assert parse_answer_json('```json\n{"answer":"A"}\n```', ("A", "B")) == "A"
+    assert parse_answer_json('```json\n{"answer":"A"}\n```', ("A", "B")) is None
     assert parse_answer_json('Answer: B', ("A", "B")) is None
     assert parse_answer_json('Explanation then {"answer":"B"}', ("A", "B")) is None
     assert parse_answer_json('{"answer":"B","reason":"x"}', ("A", "B")) is None
@@ -387,7 +388,7 @@ def test_a1_storyboard_zoom_records_overview_local_evidence_and_costs(tmp_path: 
         '{"observed_facts":["person sits"],"supports":["B"]}',
         '{"answer":"A"}',
     ]
-    agent, _, _ = _build(
+    agent, client, _ = _build(
         tmp_path,
         "a1_storyboard_zoom",
         responses,
@@ -410,6 +411,7 @@ def test_a1_storyboard_zoom_records_overview_local_evidence_and_costs(tmp_path: 
     assert result["total_tokens"] == 52
     assert result["branch_costs"]["evidence"]["tool_call_count"] == 3
     assert result["branch_costs"]["judge"]["request_count"] == 1
+    assert client.calls[-1]["response_format"]["type"] == "json_schema"
 
 
 def test_a2_multi_clue_prompt_requests_structured_memory(tmp_path: Path) -> None:
@@ -593,6 +595,8 @@ def test_a4_keeps_branches_independent_and_accounts_confirmation(tmp_path: Path)
             "fps": -1,
         }
     }
+    assert client.calls[0]["response_format"]["type"] == "json_schema"
+    assert client.calls[-1]["response_format"]["type"] == "json_schema"
     assert result["branch_costs"]["arbiter"]["tool_call_count"] == 1
     assert any(item["source"] == "arbitration_confirmation" for item in result["evidence_memory"])
 

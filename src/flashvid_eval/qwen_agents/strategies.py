@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from flashvid_eval.schemas import ModelSample
 from flashvid_eval.baseline_diagnostics import DIRECT_SAMPLING_SPECS
+from flashvid_eval.qwen_protocol import mcq_answer_response_format
 
 from .core import (
     AgentConfig,
@@ -286,6 +287,7 @@ class EvidenceAgentBase(BaseQwenAgent):
             branch=branch,
             request_kind="judge",
             seed_offset=seed_offset,
+            response_format=mcq_answer_response_format(sample.option_letters),
         )
         trace.raw_response = result.content
         return parse_answer_json(result.content, sample.option_letters)
@@ -311,13 +313,40 @@ class EvaCleanStrategy(EvidenceAgentBase):
             {"role": "user", "content": sample_question(sample)},
         ]
         last_observations: list[FrameObservation] = []
+        force_final_answer = False
         for turn in range(self.config.max_turns):
+            if (
+                turn == self.config.max_turns - 1
+                and trace.tool_steps
+                and not force_final_answer
+            ):
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "This is the final turn. Use the evidence already observed and return "
+                            "the required one-key answer JSON now."
+                        ),
+                    }
+                )
+                force_final_answer = True
             result = self._chat(
                 trace,
                 messages,
                 branch="evidence",
-                request_kind="planner" if turn == 0 else "observer",
+                request_kind=(
+                    "judge"
+                    if force_final_answer
+                    else "planner"
+                    if turn == 0
+                    else "observer"
+                ),
                 seed_offset=turn,
+                response_format=(
+                    mcq_answer_response_format(sample.option_letters)
+                    if force_final_answer
+                    else None
+                ),
             )
             messages.append({"role": "assistant", "content": result.content})
             if last_observations:
@@ -356,6 +385,7 @@ class EvaCleanStrategy(EvidenceAgentBase):
                         "content": "Return the final answer now as the required one-key JSON object.",
                     }
                 )
+                force_final_answer = True
                 continue
 
             tool_content: list[dict[str, Any]] = [
@@ -703,6 +733,7 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
             direct_messages,
             branch="direct",
             request_kind="direct",
+            response_format=mcq_answer_response_format(sample.option_letters),
             mm_processor_kwargs=direct_sampling.mm_processor_kwargs(),
             media_io_kwargs=direct_sampling.media_io_kwargs(direct_duration),
         )
@@ -793,6 +824,7 @@ class IndependentArbitrationStrategy(EvidenceAgentBase):
                 branch="arbiter",
                 request_kind="judge",
                 seed_offset=1,
+                response_format=mcq_answer_response_format(sample.option_letters),
             )
             trace.raw_response = final.content
             answer = parse_answer_json(final.content, sample.option_letters)

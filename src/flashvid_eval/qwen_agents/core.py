@@ -18,6 +18,7 @@ from flashvid_eval.eva_official import frame_tool_identity
 from flashvid_eval.eva_official import select_frames as official_select_frames
 from flashvid_eval.media import estimate_visual_tokens, probe_video
 from flashvid_eval.privacy import AnnotationLeakError, assert_annotation_free_request
+from flashvid_eval.qwen_protocol import mcq_answer_response_format
 from flashvid_eval.qwen_token_accounting import enrich_usage_with_qwen_prompt_tokens
 from flashvid_eval.schemas import ModelSample
 
@@ -229,6 +230,7 @@ class RequestTrace:
     attempt_index: int
     retry_of_length: bool
     prompt_hash: str
+    response_format: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -667,6 +669,7 @@ class BaseQwenAgent:
         branch: str,
         request_kind: str,
         seed_offset: int = 0,
+        response_format: dict[str, Any] | None = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
         media_io_kwargs: dict[str, Any] | None = None,
     ) -> ChatResult:
@@ -682,6 +685,7 @@ class BaseQwenAgent:
                     "messages": messages,
                     "mm_processor_kwargs": mm_processor_kwargs,
                     "media_io_kwargs": media_io_kwargs,
+                    "request_kwargs": {"response_format": response_format},
                 }
             )
             result = self.client.chat(
@@ -690,6 +694,7 @@ class BaseQwenAgent:
                 max_tokens=max_tokens,
                 temperature=self.protocol.temperature,
                 seed=seed,
+                response_format=response_format,
                 chat_template_kwargs={"enable_thinking": self.protocol.enable_thinking},
                 sampling_params=self.protocol.sampling_params(),
                 mm_processor_kwargs=mm_processor_kwargs,
@@ -736,6 +741,7 @@ class BaseQwenAgent:
                     attempt_index=attempt_index,
                     retry_of_length=retry_of_length,
                     prompt_hash=prompt_hash,
+                    response_format=deepcopy(response_format),
                 )
             )
             retry_max = self.protocol.length_retry_max_tokens
@@ -777,10 +783,6 @@ def sample_question(sample: ModelSample) -> str:
 def parse_answer_json(text: str, valid_letters: tuple[str, ...]) -> str | None:
     valid = {letter.upper() for letter in valid_letters}
     candidate = (text or "").strip()
-    if candidate.startswith("```") and candidate.endswith("```"):
-        lines = candidate.splitlines()
-        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
-            candidate = "\n".join(lines[1:-1]).strip()
     try:
         payload = json.loads(candidate)
     except (TypeError, json.JSONDecodeError):

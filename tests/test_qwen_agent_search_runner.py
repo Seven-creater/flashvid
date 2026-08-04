@@ -28,10 +28,10 @@ SPEC.loader.exec_module(runner)
 
 def test_service_launcher_does_not_depend_on_a_git_executable_bit() -> None:
     content = SERVICE_LAUNCHER.read_text(encoding="utf-8")
+    service_content = SERVICE_SCRIPT.read_text(encoding="utf-8")
     assert 'setsid nohup bash "$PROJECT_DIR/scripts/serve_qwen_agent.sh"' in content
-    assert "--enable-prompt-tokens-details" in SERVICE_SCRIPT.read_text(
-        encoding="utf-8"
-    )
+    assert "--enable-prompt-tokens-details" in service_content
+    assert 'CUDA_COMPAT_DIR=${CUDA_COMPAT_DIR:-$VLLM_ENV_DIR/cuda-compat}' in service_content
 
 
 def _write(path: Path, content: str) -> dict[str, str]:

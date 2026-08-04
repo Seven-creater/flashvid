@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import MethodType
 
 from flashvid_eval.fast_hybrid_eva import (
@@ -10,6 +11,7 @@ from flashvid_eval.fast_hybrid_eva import (
 )
 from flashvid_eval.qwen_protocol import QWEN_PROTOCOLS
 from flashvid_eval.schemas import Sample
+from scripts.summarize_fast_hybrid import _metric
 
 
 def _run_record(prediction: str | None, *, tool: bool = True) -> dict:
@@ -174,3 +176,61 @@ def test_fast_hybrid_falls_back_when_verifier_has_no_answer() -> None:
     assert result["fallback_to_candidate"] is True
     assert result["candidate_rerun"] == 0
     assert result["annotation_leak_check"] == "passed"
+
+
+def test_fast_hybrid_summary_separates_missing_source_from_engineering_error(
+    tmp_path: Path,
+) -> None:
+    direct_path = tmp_path / "direct.jsonl"
+    agent_path = tmp_path / "agent.jsonl"
+    direct_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                {"sample_id": "ok", "prediction": "A", "answer": "B", "correct": False},
+                {
+                    "sample_id": "missing",
+                    "prediction": None,
+                    "answer": "A",
+                    "correct": False,
+                    "error": "missing",
+                    "data_unavailable": True,
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    agent_path.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                {
+                    "sample_id": "ok",
+                    "prediction": "B",
+                    "answer": "B",
+                    "correct": True,
+                    "annotation_leak_check": "passed",
+                },
+                {
+                    "sample_id": "missing",
+                    "prediction": None,
+                    "answer": "A",
+                    "correct": False,
+                    "error": "missing",
+                    "data_unavailable": True,
+                    "annotation_leak_check": "passed",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary, _ = _metric("lvbench", direct_path, agent_path)
+
+    assert summary["source_data_unavailable"] == 1
+    assert summary["engineering_errors"] == 0
+    assert summary["common_valid_samples"] == 1
+    assert summary["gain"] == 1
+    assert summary["passed"] is True

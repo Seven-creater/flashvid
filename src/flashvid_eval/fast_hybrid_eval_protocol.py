@@ -343,6 +343,13 @@ def is_engineering_failure(row: Mapping[str, Any]) -> bool:
         return True
     if row.get("failure_stage") or row.get("trajectory_valid") is False:
         return True
+    if row.get("candidate_cost_complete") is not True:
+        return True
+    if (
+        row.get("end_to_end_total_tokens_complete") is not True
+        or row.get("end_to_end_visual_tokens_complete") is not True
+    ):
+        return True
     if is_model_fallback(row):
         return False
     return bool(row.get("error") or row.get("verifier_error"))

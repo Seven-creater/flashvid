@@ -146,6 +146,7 @@ def test_checkpoint_and_eval_jobs_bind_base_adapter_manifest_and_candidate(
     ]
     assert command[command.index("--teacher-model-artifact-sha256") + 1] == BASE_SHA
     assert "--resume" in command
+    assert "--retry-errors" in command
 
 
 def test_result_audit_rejects_unbound_served_stack(tmp_path: Path) -> None:

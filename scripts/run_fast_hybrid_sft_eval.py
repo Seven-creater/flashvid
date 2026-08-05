@@ -156,7 +156,11 @@ def build_jobs(
             teacher_model_sha256,
         ]
         if resume:
-            command.append("--resume")
+            # A child can exit successfully while still writing per-sample
+            # timeout/error rows.  Resume those rows once before the frozen
+            # matrix audit instead of treating their sparse error schema as a
+            # protocol-field drift.
+            command.extend(("--resume", "--retry-errors"))
         jobs.append(
             BulkJob(
                 job_id=f"{phase}:{run_id}:{dataset}",

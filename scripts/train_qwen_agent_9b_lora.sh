@@ -335,7 +335,7 @@ if [[ "$USE_FSDP2" == "1" ]]; then
   # PEFT's FP32 LoRA masters while all expensive math remains BF16.
   model_load_dtype=float32
   distributed_args=(
-    --fsdp "$PROJECT_DIR/configs/training/fsdp2_lora_full_state.json"
+    --fsdp fsdp2
     --lora_dtype float32
     --fp16 false
     --bf16 true
@@ -394,6 +394,11 @@ NPROC_PER_NODE="$gpu_count" \
   "${distributed_args[@]}" \
   "${training_length_args[@]}" \
   "${resume_args[@]}"
+
+if [[ "$USE_FSDP2" == "1" ]]; then
+  "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/convert_fsdp2_lora_checkpoint.py" \
+    --checkpoint-root "$OUTPUT_DIR" --base-model "$MODEL_PATH"
+fi
 
 if [[ "$smoke" -eq 1 ]]; then
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/verify_qwen35_lora_smoke.py" \

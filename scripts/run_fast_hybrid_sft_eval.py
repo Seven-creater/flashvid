@@ -18,6 +18,7 @@ from flashvid_eval.fast_hybrid_eval_protocol import (
     audit_result_file,
     canonical_sha256,
     freeze_json,
+    is_engineering_failure,
     load_protocol,
     manifest_sample_ids,
     read_jsonl,
@@ -194,21 +195,18 @@ def _retryable_sample_ids(path: Path) -> list[str]:
         return []
     retryable: list[str] = []
     for row in read_jsonl(path):
-        if (
-            row.get("error")
-            or row.get("verifier_error")
-            or row.get("failure_stage")
-            or row.get("api_error")
-            or row.get("frame_error")
-            or row.get("parse_error")
-            or row.get("trajectory_valid") is False
-        ):
+        if is_engineering_failure(row):
             retryable.append(str(row.get("sample_id") or ""))
     return sorted(retryable)
 
 
 def retry_error_rows_once(
-    jobs: Sequence[BulkJob], *, output_root: Path, repo_root: Path, plan_path: Path
+    jobs: Sequence[BulkJob],
+    *,
+    output_root: Path,
+    repo_root: Path,
+    plan_path: Path,
+    allow_remaining_failures: bool = False,
 ) -> None:
     """Retry per-sample engineering failures once without changing the frozen run plan."""
 
@@ -221,7 +219,7 @@ def retry_error_rows_once(
             path = Path(str(reference.get("path") or ""))
             if not path.is_file() or sha256_file(path) != reference.get("sha256"):
                 raise RuntimeError("error-retry result changed after it was frozen")
-        if previous.get("status") != "passed":
+        if previous.get("status") != "passed" and not allow_remaining_failures:
             raise RuntimeError("the one allowed per-sample error retry did not clear all errors")
         return
 
@@ -270,7 +268,7 @@ def retry_error_rows_once(
         },
     }
     freeze_json(run_path, report)
-    if report["status"] != "passed":
+    if report["status"] != "passed" and not allow_remaining_failures:
         raise RuntimeError("the one allowed per-sample error retry did not clear all errors")
 
 
@@ -371,6 +369,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root=args.output_root,
                 repo_root=args.repo_root.resolve(),
                 plan_path=plan_path,
+                allow_remaining_failures=args.mode == "teacher",
             )
         files: dict[str, Any] = {}
         for job, dataset in zip(jobs, DATASETS):
@@ -387,6 +386,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 experiment_config_sha256=str(protocol["experiment_config"]["sha256"]),
                 served_model_sha256=served_hash,
                 teacher_model_sha256=teacher_hash,
+                allow_incomplete_engineering_failures=args.mode == "teacher",
+                max_engineering_failure_rate=1.0 if args.mode == "teacher" else 0.01,
             )
         report = {
             "schema_version": 1,

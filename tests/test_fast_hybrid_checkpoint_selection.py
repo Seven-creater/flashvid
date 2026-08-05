@@ -177,3 +177,47 @@ def test_rejects_incomplete_visual_cost_instead_of_zero_filling(tmp_path: Path) 
             teacher_paths=teacher,
             checkpoints=[CheckpointRun("checkpoint", 1, checkpoint)],
         )
+
+
+def test_teacher_infrastructure_failure_is_excluded_only_from_cost_pairing(
+    tmp_path: Path,
+) -> None:
+    teacher = _write_run(
+        tmp_path,
+        "teacher",
+        correct_by_dataset={dataset: 20 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+    )
+    checkpoint = _write_run(
+        tmp_path,
+        "checkpoint",
+        correct_by_dataset={"lvbench": 21, "lsdbench": 20, "cgbench": 20},
+        total_tokens=90,
+        visual_tokens=70,
+    )
+    first_path = teacher["lvbench"]
+    rows = [json.loads(line) for line in first_path.read_text(encoding="utf-8").splitlines()]
+    rows[49].update(
+        {
+            "error": "TimeoutError: timed out",
+            "annotation_leak_check": "not_run",
+            "end_to_end_total_tokens_complete": False,
+            "end_to_end_visual_tokens": None,
+            "end_to_end_visual_tokens_complete": False,
+        }
+    )
+    for key in ("agent_version", "official_eva_commit", "prompt_hashes"):
+        rows[49].pop(key)
+    first_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    report = select_fast_hybrid_checkpoint(
+        teacher_paths=teacher,
+        checkpoints=[CheckpointRun("checkpoint", 1, checkpoint)],
+    )
+
+    assert report["status"] == "passed"
+    assert report["teacher"]["summary"]["engineering_failures"] == 1
+    assert report["teacher"]["summary"]["cost_samples"] == 149

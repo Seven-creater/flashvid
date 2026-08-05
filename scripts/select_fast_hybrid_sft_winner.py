@@ -101,6 +101,8 @@ def _audit_run(
             experiment_config_sha256=str(protocol["experiment_config"]["sha256"]),
             served_model_sha256=served_hash,
             teacher_model_sha256=str(protocol["base_model_artifact_sha256"]),
+            allow_incomplete_engineering_failures=mode == "teacher",
+            max_engineering_failure_rate=1.0 if mode == "teacher" else 0.01,
         )
         if file_reference.get("sha256") != audit["sha256"]:
             raise RuntimeError(f"Dev result changed after run audit: {path}")

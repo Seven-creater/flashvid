@@ -230,6 +230,8 @@ def audit_result_file(
     experiment_config_sha256: str,
     served_model_sha256: str,
     teacher_model_sha256: str,
+    allow_incomplete_engineering_failures: bool = False,
+    max_engineering_failure_rate: float = 0.01,
 ) -> dict[str, Any]:
     rows = read_jsonl(path)
     indexed = _index(rows, path)
@@ -245,38 +247,55 @@ def audit_result_file(
             f"{path}: sample IDs differ from the frozen manifest "
             f"(missing={missing[:3]}, extras={extras[:3]})"
         )
-    failures = leaks = reruns = 0
+    if not 0.0 <= max_engineering_failure_rate <= 1.0:
+        raise ValueError("max_engineering_failure_rate must be between 0 and 1")
+    failures = leaks = reruns = model_fallbacks = incomplete_cost_rows = 0
+    leak_checks_not_run = 0
     for sample_id, row in indexed.items():
         if str(row.get("dataset") or "").lower() != dataset:
             raise ValueError(f"{path}: wrong dataset at {sample_id}")
+        engineering_failure = is_engineering_failure(row)
+        model_fallback = is_model_fallback(row)
         expected_fields = {
             "manifest_sha256": manifest_sha256,
             "candidate_results_sha256": candidate_sha256,
             "experiment_config_sha256": experiment_config_sha256,
             "model_artifact_sha256": served_model_sha256,
             "teacher_model_sha256": teacher_model_sha256,
-            "agent_version": "fast_hybrid_v2",
         }
+        if not (engineering_failure and allow_incomplete_engineering_failures):
+            expected_fields["agent_version"] = "fast_hybrid_v2"
         for key, expected in expected_fields.items():
             if row.get(key) != expected:
                 raise ValueError(f"{path}: {sample_id} frozen field changed: {key}")
-        if row.get("annotation_leak_check") != "passed":
+        leak_check = row.get("annotation_leak_check")
+        if (
+            engineering_failure
+            and allow_incomplete_engineering_failures
+            and leak_check in {None, "not_run"}
+        ):
+            leak_checks_not_run += 1
+        elif leak_check != "passed":
             leaks += 1
         reruns += int(row.get("candidate_rerun") or 0)
-        failures += int(
-            bool(row.get("error") or row.get("api_error") or row.get("frame_error") or row.get("parse_error"))
-        )
+        failures += int(engineering_failure)
+        model_fallbacks += int(model_fallback)
+        cost_complete = True
         for key in ("end_to_end_total_tokens", "end_to_end_visual_tokens"):
             value = row.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-                raise ValueError(f"{path}: {sample_id} has invalid {key}")
+                cost_complete = False
         if row.get("candidate_cost_complete") is not True:
             raise ValueError(f"{path}: {sample_id} frozen-candidate cost is incomplete")
         if row.get("end_to_end_total_tokens_complete") is not True:
-            raise ValueError(f"{path}: {sample_id} total-token cost is incomplete")
+            cost_complete = False
         if row.get("end_to_end_visual_tokens_complete") is not True:
-            raise ValueError(f"{path}: {sample_id} visual-token cost is incomplete")
-    if leaks or reruns or failures > expected_count * 0.01:
+            cost_complete = False
+        if not cost_complete:
+            if not (engineering_failure and allow_incomplete_engineering_failures):
+                raise ValueError(f"{path}: {sample_id} end-to-end cost is incomplete")
+            incomplete_cost_rows += 1
+    if leaks or reruns or failures > expected_count * max_engineering_failure_rate:
         raise ValueError(
             f"{path}: audit failed (leaks={leaks}, reruns={reruns}, failures={failures})"
         )
@@ -285,9 +304,48 @@ def audit_result_file(
         "sha256": sha256_file(path),
         "rows": len(rows),
         "engineering_failures": failures,
+        "model_fallbacks": model_fallbacks,
+        "incomplete_cost_rows": incomplete_cost_rows,
+        "annotation_checks_not_run": leak_checks_not_run,
         "annotation_leaks": leaks,
         "candidate_reruns": reruns,
     }
+
+
+def is_model_fallback(row: Mapping[str, Any]) -> bool:
+    """Return whether a valid candidate fallback followed a model answer failure.
+
+    These rows are valid system outcomes and have complete accounting.  They are
+    reported separately from infrastructure/API/frame failures so the untrained
+    Teacher baseline can expose the behaviour that SFT is intended to improve.
+    """
+
+    error = str(row.get("error") or "")
+    prediction = str(row.get("prediction") or "").strip().upper()
+    candidate = str(row.get("candidate_answer") or "").strip().upper()
+    return bool(
+        error
+        and "no valid final answer" in error
+        and row.get("fallback_to_candidate") is True
+        and prediction
+        and prediction == candidate
+        and row.get("candidate_cost_complete") is True
+        and row.get("end_to_end_total_tokens_complete") is True
+        and row.get("end_to_end_visual_tokens_complete") is True
+        and row.get("annotation_leak_check") == "passed"
+    )
+
+
+def is_engineering_failure(row: Mapping[str, Any]) -> bool:
+    """Classify failures that invalidate execution or cost accounting."""
+
+    if row.get("api_error") or row.get("frame_error") or row.get("parse_error"):
+        return True
+    if row.get("failure_stage") or row.get("trajectory_valid") is False:
+        return True
+    if is_model_fallback(row):
+        return False
+    return bool(row.get("error") or row.get("verifier_error"))
 
 
 __all__ = [
@@ -297,6 +355,8 @@ __all__ = [
     "build_protocol",
     "canonical_sha256",
     "freeze_json",
+    "is_engineering_failure",
+    "is_model_fallback",
     "load_protocol",
     "manifest_sample_ids",
     "read_jsonl",

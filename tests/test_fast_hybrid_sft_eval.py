@@ -245,3 +245,66 @@ def test_result_audit_rejects_wrong_manifest_sample_ids(tmp_path: Path) -> None:
             served_model_sha256="s" * 64,
             teacher_model_sha256=BASE_SHA,
         )
+
+
+def test_teacher_audit_separates_model_fallback_from_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    result = tmp_path / "teacher.jsonl"
+    common = {
+        "dataset": "lvbench",
+        "answer": "A",
+        "manifest_sha256": "m" * 64,
+        "candidate_results_sha256": "c" * 64,
+        "experiment_config_sha256": "e" * 64,
+        "model_artifact_sha256": "s" * 64,
+        "teacher_model_sha256": BASE_SHA,
+        "candidate_rerun": 0,
+        "candidate_cost_complete": True,
+    }
+    fallback = {
+        **common,
+        "sample_id": "fallback",
+        "prediction": "A",
+        "candidate_answer": "A",
+        "agent_version": "fast_hybrid_v2",
+        "fallback_to_candidate": True,
+        "annotation_leak_check": "passed",
+        "error": "verification: no valid final answer (stop_reason=no_answer_no_tool_call)",
+        "end_to_end_total_tokens": 100,
+        "end_to_end_total_tokens_complete": True,
+        "end_to_end_visual_tokens": 80,
+        "end_to_end_visual_tokens_complete": True,
+    }
+    timeout = {
+        **common,
+        "sample_id": "timeout",
+        "prediction": "A",
+        "candidate_answer": "A",
+        "annotation_leak_check": "not_run",
+        "error": "TimeoutError: timed out",
+        "end_to_end_total_tokens": 10,
+        "end_to_end_total_tokens_complete": False,
+        "end_to_end_visual_tokens": None,
+        "end_to_end_visual_tokens_complete": False,
+    }
+    _jsonl(result, [fallback, timeout])
+
+    audit = audit_result_file(
+        result,
+        dataset="lvbench",
+        expected_count=2,
+        expected_sample_ids={"fallback", "timeout"},
+        manifest_sha256="m" * 64,
+        candidate_sha256="c" * 64,
+        experiment_config_sha256="e" * 64,
+        served_model_sha256="s" * 64,
+        teacher_model_sha256=BASE_SHA,
+        allow_incomplete_engineering_failures=True,
+        max_engineering_failure_rate=1.0,
+    )
+
+    assert audit["model_fallbacks"] == 1
+    assert audit["engineering_failures"] == 1
+    assert audit["incomplete_cost_rows"] == 1
+    assert audit["annotation_checks_not_run"] == 1

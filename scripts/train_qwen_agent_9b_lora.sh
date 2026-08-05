@@ -324,16 +324,21 @@ training_length_args=(
 )
 training_warmup_ratio=0.05
 distributed_args=()
+model_load_dtype=bfloat16
 if [[ "$USE_FSDP2" == "1" ]]; then
   # ms-swift 4.4.2's bundled fsdp2 preset uses PyTorch native FULL_SHARD,
   # transformer auto-wrap, and activation checkpointing. This avoids a full
-  # 9B replica on every GPU while keeping the registered LoRA objective. PEFT
-  # promotes adapters to FP32 by default, so the project plugin restores the
-  # registered BF16 LoRA dtype before FSDP2 wraps the model.
+  # 9B replica on every GPU while keeping the registered LoRA objective.
+  # Accelerate's FSDP2 path intentionally keeps original/master parameters in
+  # FP32 and applies a BF16 MixedPrecisionPolicy for forward/backward compute.
+  # Loading the frozen base in FP32 therefore keeps each FSDP unit uniform with
+  # PEFT's FP32 LoRA masters while all expensive math remains BF16.
+  model_load_dtype=float32
   distributed_args=(
     --fsdp fsdp2
-    --lora_dtype bfloat16
-    --external_plugins "$PROJECT_DIR/scripts/swift_fsdp2_bf16_lora_plugin.py"
+    --lora_dtype float32
+    --fp16 false
+    --bf16 true
   )
 fi
 if [[ "$smoke" -eq 1 ]]; then
@@ -363,7 +368,7 @@ NPROC_PER_NODE="$gpu_count" \
   --split_dataset_ratio 0 \
   --add_version false \
   --check_model false \
-  --torch_dtype bfloat16 \
+  --torch_dtype "$model_load_dtype" \
   --attn_impl sdpa \
   --target_modules all-linear \
   --freeze_llm false \

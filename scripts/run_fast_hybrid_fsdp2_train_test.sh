@@ -35,11 +35,10 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
 launcher_sha=$(sha256sum scripts/train_qwen_agent_9b_lora.sh | awk '{print $1}')
-plugin_sha=$(sha256sum scripts/swift_fsdp2_bf16_lora_plugin.py | awk '{print $1}')
 smoke_report=""
 if [[ -f "$FSDP2_METADATA" ]]; then
   smoke_report=$(
-    "$SWIFT_PYTHON" - "$FSDP2_METADATA" "$launcher_sha" "$plugin_sha" <<'PY'
+    "$SWIFT_PYTHON" - "$FSDP2_METADATA" "$launcher_sha" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -47,7 +46,6 @@ path = Path(sys.argv[1])
 value = json.loads(path.read_text(encoding="utf-8"))
 if (
     value.get("launcher_sha256") == sys.argv[2]
-    and value.get("plugin_sha256") == sys.argv[3]
 ):
     report = Path(str(value.get("report") or ""))
     if report.is_file():
@@ -73,7 +71,7 @@ if [[ -z "$smoke_report" ]]; then
   "$SWIFT_PYTHON" scripts/qwen_sft_smoke_gate.py check \
     --report "$smoke_report" --formal-output-dir "$FORMAL_DIR" \
     --train-data "$SFT_DATA" --base-model-artifact-sha256 "$MODEL_SHA"
-  "$SWIFT_PYTHON" - "$FSDP2_METADATA" "$smoke_report" "$launcher_sha" "$plugin_sha" <<'PY'
+  "$SWIFT_PYTHON" - "$FSDP2_METADATA" "$smoke_report" "$launcher_sha" <<'PY'
 import json, os, sys, tempfile
 from pathlib import Path
 
@@ -83,9 +81,10 @@ payload = {
     "kind": "fast_hybrid_fsdp2_smoke",
     "report": str(Path(sys.argv[2]).resolve()),
     "launcher_sha256": sys.argv[3],
-    "plugin_sha256": sys.argv[4],
     "cuda_visible_devices": "0,1,2,3,4,5,6,7",
     "fsdp": "fsdp2",
+    "master_parameter_dtype": "float32",
+    "compute_dtype": "bfloat16",
 }
 output.parent.mkdir(parents=True, exist_ok=True)
 with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output.parent, delete=False) as handle:

@@ -24,6 +24,7 @@ SWIFT_PYTHON="$SFT_ENV_DIR/bin/python"
 [[ -f "$SFT_DATA" ]] || { echo "missing filtered SFT data: $SFT_DATA" >&2; exit 2; }
 
 export ROOT SFT_ENV_DIR SWIFT_PYTHON
+export SFT_PYTHON="$SWIFT_PYTHON"
 export SWIFT_BIN="$SFT_ENV_DIR/bin/swift"
 export MODEL_PATH MODEL_SHA
 export TEST_CANDIDATE_ROOT="${TEST_CANDIDATE_ROOT:-/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/fast_hybrid_eva/frozen_direct}"

@@ -158,6 +158,56 @@ def test_fast_hybrid_export_masks_rejected_intermediate_answer(tmp_path: Path) -
     assert "Answer: C" not in trained
 
 
+def test_fast_hybrid_export_uses_candidate_blind_judge_when_gate_rejects_all_proposals(
+    tmp_path: Path,
+) -> None:
+    frame = (tmp_path / "frame.png").resolve()
+    frame.write_bytes(b"image")
+    trajectory = _trajectory(frame)
+    trajectory["prediction"] = trajectory["final_prediction"] = "B"
+    trajectory["candidate_answer"] = "B"
+    trajectory["fallback_to_candidate"] = True
+    trajectory["request_trace"][-1]["content"] = "Answer: C"
+    judge_messages = trajectory["request_trace"][-1]["messages"]
+    trajectory["judge_confirmations"] = [
+        {
+            "judge_seed": seed,
+            "prediction": "B",
+            "final_prediction": "B",
+            "raw_response": '{"answer":"B"}',
+            "finish_reason": "stop",
+            "usage": {"total_tokens": 20},
+            "request_messages": judge_messages,
+            "request_prompt_sha256": character * 64,
+            "error": None,
+            "api_error": None,
+            "frame_error": None,
+            "parse_error": None,
+        }
+        for seed, character in ((17, "f"), (42, "1"), (73, "2"))
+    ]
+
+    records = build_fast_hybrid_sft_records(trajectory)
+
+    assert [record["metadata"]["assistant_target_types"] for record in records] == [
+        ["tool"],
+        ["final"],
+    ]
+    assert records[-1]["metadata"]["stage"] == "selection_judge"
+    assert records[-1]["messages"][-1] == {
+        "role": "assistant",
+        "content": "Answer: B",
+        "loss": True,
+    }
+    trained = [
+        message["content"]
+        for record in records
+        for message in record["messages"]
+        if message.get("loss") is True
+    ]
+    assert "Answer: C" not in trained
+
+
 def test_frame_audit_requires_existing_one_to_one_files(tmp_path: Path) -> None:
     frame = (tmp_path / "frame.png").resolve()
     frame.write_bytes(b"image")

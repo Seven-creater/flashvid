@@ -84,6 +84,51 @@ def _episode_messages(
     return messages
 
 
+def _accepted_judge_request(
+    trajectory: Mapping[str, Any], prediction: str
+) -> dict[str, Any] | None:
+    """Recover the accepted final action from the 3/3 evidence Judges.
+
+    The external candidate gate can reject every verifier proposal.  In that
+    case ``request_trace`` correctly contains only rejected answers, while the
+    accepted answer is recorded by the independent Judge confirmations.  Use
+    one actual, candidate-blind Judge prompt as the final SFT episode; never
+    synthesize a target without three matching confirmations.
+    """
+
+    raw_confirmations = trajectory.get("judge_confirmations")
+    if not isinstance(raw_confirmations, list):
+        return None
+    confirmations: list[dict[str, Any]] = []
+    for raw in raw_confirmations:
+        if not isinstance(raw, Mapping):
+            continue
+        answer = str(raw.get("final_prediction", raw.get("prediction")) or "").strip().upper()
+        messages = raw.get("request_messages")
+        if (
+            answer != prediction
+            or not isinstance(messages, list)
+            or not messages
+            or any(raw.get(field) for field in ("error", "api_error", "frame_error", "parse_error"))
+        ):
+            continue
+        confirmations.append(dict(raw))
+    if len(confirmations) < 3:
+        return None
+    confirmations.sort(key=lambda item: int(item.get("judge_seed") or 0))
+    chosen = confirmations[0]
+    return {
+        "stage": "selection_judge",
+        "prompt_hash": chosen.get("request_prompt_sha256"),
+        "seed": chosen.get("judge_seed"),
+        "attempt_index": 0,
+        "messages": deepcopy(chosen["request_messages"]),
+        "content": f"Answer: {prediction}",
+        "finish_reason": chosen.get("finish_reason"),
+        "usage": deepcopy(chosen.get("usage") or {}),
+    }
+
+
 def build_fast_hybrid_sft_records(
     trajectory: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
@@ -97,20 +142,23 @@ def build_fast_hybrid_sft_records(
         raise ValueError("selected Fast Hybrid trajectory has no request_trace")
     terminal = _terminal_requests(raw_trace)
     classified = [(_action(str(item.get("content") or "")), item) for item in terminal]
-    answer_indices = [
-        index for index, ((kind, _), _request) in enumerate(classified) if kind == "answer"
-    ]
-    if not answer_indices:
-        raise ValueError("Fast Hybrid trajectory has no final answer action")
-    final_index = max(answer_indices)
     prediction = str(
         trajectory.get("final_prediction", trajectory.get("prediction")) or ""
     ).strip().upper()
-    final_answer = extract_strict_answer_letter(
-        classified[final_index][0][1], tuple("ABCDEFGH")
-    )
-    if final_answer != prediction:
-        raise ValueError("final SFT answer differs from Fast Hybrid final_prediction")
+    matching_answers = [
+        index
+        for index, ((kind, content), _request) in enumerate(classified)
+        if kind == "answer"
+        and extract_strict_answer_letter(content, tuple("ABCDEFGH")) == prediction
+    ]
+    if matching_answers:
+        final_index = max(matching_answers)
+    else:
+        accepted = _accepted_judge_request(trajectory, prediction)
+        if accepted is None:
+            raise ValueError("final SFT answer differs from Fast Hybrid final_prediction")
+        classified.append((("answer", f"Answer: {prediction}"), accepted))
+        final_index = len(classified) - 1
 
     records: list[dict[str, Any]] = []
     for index, ((kind, content), request) in enumerate(classified):

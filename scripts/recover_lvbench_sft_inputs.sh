@@ -22,6 +22,7 @@ PATCH_DIR="$RECOVERY/direct_patch"
 PATCH_NAME=lvbench_qwen_qwen3-5-9b-3e3c0499_direct_no_think_greedy_uniform32.jsonl
 REPAIRED_DIR="$ROOT/candidates/test/lvbench"
 REPAIRED="$REPAIRED_DIR/lvbench_qwen_qwen3-5-9b-3e3c0499_direct_no_think_greedy_uniform32_repaired.jsonl"
+REPAIRED_SHA=d1c700512d8269f8a2b669b52a44f8a671a50acd9dc1bd664f0d5cee239b4c60
 MODEL_PATH=/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B
 MODEL_SHA=5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60
 QWEN_CONFIG_SHA=9d54cf66790845757755a63fd7b20f4c9e84199f01462cdbf8980bb851a62351
@@ -64,6 +65,12 @@ wait "$p1" || extract_status=$?
 (( extract_status == 0 )) || exit "$extract_status"
 video_valid "$VIDEO_DIR/idZkam9zqAs.mp4"
 video_valid "$VIDEO_DIR/gXnhqF0TqqI.mp4"
+
+if [[ -f "$REPAIRED" ]] && [[ "$(sha256sum "$REPAIRED" | awk '{print $1}')" == "$REPAIRED_SHA" ]]; then
+  echo "LVBench frozen Direct repair is already complete: $REPAIRED"
+  trap - EXIT
+  exit 0
+fi
 
 "$PYTHON" scripts/repair_direct_candidate_file.py prepare \
   --manifest "$MANIFEST" --original "$ORIGINAL" --output "$SUBSET" \

@@ -29,12 +29,24 @@ def main() -> int:
     parser.add_argument("--selected", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--summary", type=Path, required=True)
+    parser.add_argument("--minimum-total", type=int, default=300)
+    parser.add_argument("--minimum-per-dataset", type=int, default=80)
     args = parser.parse_args()
+
+    if args.minimum_total < 1 or args.minimum_per_dataset < 1:
+        raise ValueError("SFT minimum thresholds must be positive integers")
 
     selected = read_jsonl(args.selected)
     counts = Counter(str(row.get("dataset") or "") for row in selected)
-    if len(selected) < 300 or any(counts.get(dataset, 0) < 80 for dataset in ("lvbench", "lsdbench", "cgbench")):
-        raise ValueError("SFT start gate failed: need 300 stable samples and at least 80 per dataset")
+    if len(selected) < args.minimum_total or any(
+        counts.get(dataset, 0) < args.minimum_per_dataset
+        for dataset in ("lvbench", "lsdbench", "cgbench")
+    ):
+        raise ValueError(
+            "SFT start gate failed: need "
+            f"{args.minimum_total} stable samples and at least "
+            f"{args.minimum_per_dataset} per dataset"
+        )
     records: list[dict] = []
     for row in selected:
         assert_deferred_result_public(row)
@@ -57,6 +69,8 @@ def main() -> int:
             record["metadata"]["assistant_target_types"].count("tool")
             for record in records
         ),
+        "minimum_total": args.minimum_total,
+        "minimum_per_dataset": args.minimum_per_dataset,
     }
     args.summary.parent.mkdir(parents=True, exist_ok=True)
     args.summary.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -62,6 +62,16 @@ def test_post_teacher_recovers_only_allowlisted_owned_base_services() -> None:
     assert "kill -9" not in text
 
 
+def test_post_teacher_records_and_propagates_an_authorized_sft_gate_override() -> None:
+    text = _text("scripts/run_fast_hybrid_post_teacher.sh")
+    assert 'SFT_MIN_TOTAL="${SFT_MIN_TOTAL:-300}"' in text
+    assert 'SFT_MIN_PER_DATASET="${SFT_MIN_PER_DATASET:-80}"' in text
+    assert "sft_start_gate_effective.json" in text
+    assert "user_authorized_threshold_override" in text
+    assert text.count('--minimum-total "$SFT_MIN_TOTAL"') == 2
+    assert text.count('--minimum-per-dataset "$SFT_MIN_PER_DATASET"') == 2
+
+
 def test_train_eval_only_stops_owned_project_services() -> None:
     text = _text("scripts/run_fast_hybrid_train_eval.sh")
     assert "SERVICE_OWNER_PROJECT_DIR" in text

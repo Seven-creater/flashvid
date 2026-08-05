@@ -21,6 +21,17 @@ COMP="$ROOT/trajectories/compression_v2"
 SFT_DIR="$ROOT/sft_data"
 MODEL_SHA="${MODEL_SHA:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60}"
 MODEL_PATH="${MODEL_PATH:-/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B}"
+SFT_MIN_TOTAL="${SFT_MIN_TOTAL:-300}"
+SFT_MIN_PER_DATASET="${SFT_MIN_PER_DATASET:-80}"
+
+[[ "$SFT_MIN_TOTAL" =~ ^[1-9][0-9]*$ ]] || {
+  echo "SFT_MIN_TOTAL must be a positive integer" >&2
+  exit 2
+}
+[[ "$SFT_MIN_PER_DATASET" =~ ^[1-9][0-9]*$ ]] || {
+  echo "SFT_MIN_PER_DATASET must be a positive integer" >&2
+  exit 2
+}
 
 LV_MANIFEST=/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_train.jsonl
 LV_SHA=5e0ec526ba3645a0c230943fbed50e0c302a7a519dfb29371f54777875b29cc2
@@ -243,10 +254,43 @@ fi
   --dataset-manifest-sha256 "cgbench=$CG_SHA" \
   --trajectories "${SELECT_TRAJECTORIES[@]}" \
   --prejudge-index "${SELECT_INDEXES[@]}" --output-dir "$CTRL"
-"$PYTHON" - "$CTRL/select_summary.json" <<'PY'
+"$PYTHON" - "$CTRL/select_summary.json" "$CTRL/sft_start_gate_effective.json" \
+  "$SFT_MIN_TOTAL" "$SFT_MIN_PER_DATASET" <<'PY'
 import json, sys
-value=json.load(open(sys.argv[1]))
-assert value["sft_start_gate"]["passed"] is True, value["sft_start_gate"]
+from pathlib import Path
+
+summary_path, output_path, minimum_total, minimum_per_dataset = sys.argv[1:]
+minimum_total = int(minimum_total)
+minimum_per_dataset = int(minimum_per_dataset)
+value = json.load(open(summary_path, encoding="utf-8"))
+original = value["sft_start_gate"]
+counts = original["selected_by_dataset"]
+conditions = {
+    "total_at_least_minimum": original["selected_total"] >= minimum_total,
+    "each_dataset_at_least_minimum": all(
+        counts.get(dataset, 0) >= minimum_per_dataset
+        for dataset in ("lvbench", "lsdbench", "cgbench")
+    ),
+}
+effective = {
+    "schema_version": 1,
+    "passed": all(conditions.values()),
+    "user_authorized_threshold_override": (
+        minimum_total != original["minimum_total"]
+        or minimum_per_dataset != original["minimum_per_dataset"]
+    ),
+    "selected_total": original["selected_total"],
+    "selected_by_dataset": counts,
+    "minimum_total": minimum_total,
+    "minimum_per_dataset": minimum_per_dataset,
+    "conditions": conditions,
+    "original_preregistered_gate": original,
+}
+Path(output_path).write_text(
+    json.dumps(effective, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+assert effective["passed"] is True, effective
 PY
 mark_stage "$CURRENT_STAGE" passed
 
@@ -326,12 +370,16 @@ mark_stage "$CURRENT_STAGE" started
 "$PYTHON" scripts/build_fast_hybrid_sft.py \
   --selected "$COMP/selected_pruned.jsonl" \
   --output "$SFT_DIR/fast_hybrid_sft.jsonl" \
-  --summary "$SFT_DIR/fast_hybrid_sft_summary.json"
+  --summary "$SFT_DIR/fast_hybrid_sft_summary.json" \
+  --minimum-total "$SFT_MIN_TOTAL" \
+  --minimum-per-dataset "$SFT_MIN_PER_DATASET"
 "$PYTHON" scripts/check_fast_hybrid_sft.py \
   --train-manifest "$TRAIN600" --selected "$COMP/selected_pruned.jsonl" \
   --sft-data "$SFT_DIR/fast_hybrid_sft.jsonl" \
   --summary "$SFT_DIR/fast_hybrid_sft_summary.json" --config-sha256 "$CONFIG_SHA" \
-  --output "$SFT_DIR/fast_hybrid_sft_audit.json"
+  --output "$SFT_DIR/fast_hybrid_sft_audit.json" \
+  --minimum-total "$SFT_MIN_TOTAL" \
+  --minimum-per-dataset "$SFT_MIN_PER_DATASET"
 mark_stage "$CURRENT_STAGE" passed
 CURRENT_STAGE=complete
 mark_stage "$CURRENT_STAGE" passed

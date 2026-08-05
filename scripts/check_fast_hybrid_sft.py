@@ -229,6 +229,8 @@ def main() -> int:
     parser.add_argument("--summary", type=Path, required=True)
     parser.add_argument("--config-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--minimum-total", type=int, default=300)
+    parser.add_argument("--minimum-per-dataset", type=int, default=80)
     args = parser.parse_args()
     try:
         report = validate_fast_hybrid_sft_data(
@@ -237,6 +239,8 @@ def main() -> int:
             sft_path=args.sft_data,
             summary_path=args.summary,
             config_sha256=args.config_sha256,
+            minimum_total=args.minimum_total,
+            minimum_per_dataset=args.minimum_per_dataset,
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
         report = {

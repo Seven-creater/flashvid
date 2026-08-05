@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -20,6 +20,7 @@ from flashvid_eval.fast_hybrid_eval_protocol import (
     freeze_json,
     load_protocol,
     manifest_sample_ids,
+    read_jsonl,
     require_sha256,
     sha256_file,
 )
@@ -156,11 +157,7 @@ def build_jobs(
             teacher_model_sha256,
         ]
         if resume:
-            # A child can exit successfully while still writing per-sample
-            # timeout/error rows.  Resume those rows once before the frozen
-            # matrix audit instead of treating their sparse error schema as a
-            # protocol-field drift.
-            command.extend(("--resume", "--retry-errors"))
+            command.append("--resume")
         jobs.append(
             BulkJob(
                 job_id=f"{phase}:{run_id}:{dataset}",
@@ -172,6 +169,109 @@ def build_jobs(
             )
         )
     return jobs
+
+
+def build_error_retry_jobs(jobs: Sequence[BulkJob]) -> list[BulkJob]:
+    """Build a separate, auditable one-shot retry for sparse error rows."""
+
+    retries: list[BulkJob] = []
+    for job in jobs:
+        retries.append(
+            replace(
+                job,
+                job_id=f"{job.job_id}:retry-errors",
+                command=(*job.command, "--retry-errors"),
+                log_path=job.log_path.with_name(
+                    f"{job.log_path.stem}_retry_errors{job.log_path.suffix}"
+                ),
+            )
+        )
+    return retries
+
+
+def _retryable_sample_ids(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    retryable: list[str] = []
+    for row in read_jsonl(path):
+        if (
+            row.get("error")
+            or row.get("verifier_error")
+            or row.get("failure_stage")
+            or row.get("api_error")
+            or row.get("frame_error")
+            or row.get("parse_error")
+            or row.get("trajectory_valid") is False
+        ):
+            retryable.append(str(row.get("sample_id") or ""))
+    return sorted(retryable)
+
+
+def retry_error_rows_once(
+    jobs: Sequence[BulkJob], *, output_root: Path, repo_root: Path, plan_path: Path
+) -> None:
+    """Retry per-sample engineering failures once without changing the frozen run plan."""
+
+    run_path = output_root / "evaluation_error_retry_run.json"
+    if run_path.exists():
+        previous = _load_json(run_path)
+        if previous.get("source_plan_sha256") != sha256_file(plan_path):
+            raise RuntimeError("error-retry run belongs to another evaluation plan")
+        for reference in previous.get("result_files", {}).values():
+            path = Path(str(reference.get("path") or ""))
+            if not path.is_file() or sha256_file(path) != reference.get("sha256"):
+                raise RuntimeError("error-retry result changed after it was frozen")
+        if previous.get("status") != "passed":
+            raise RuntimeError("the one allowed per-sample error retry did not clear all errors")
+        return
+
+    before = {job.job_id: _retryable_sample_ids(job.output_path) for job in jobs}
+    retry_jobs = [
+        retry
+        for retry, job in zip(build_error_retry_jobs(jobs), jobs)
+        if before[job.job_id]
+    ]
+    if not retry_jobs:
+        return
+    retry_plan = {
+        "schema_version": 1,
+        "kind": "fast_hybrid_sft_eval_error_retry_plan",
+        "source_plan_sha256": sha256_file(plan_path),
+        "before": before,
+        "jobs": [
+            {
+                **asdict(job),
+                "command": list(job.command),
+                "log_path": str(job.log_path),
+                "output_path": str(job.output_path),
+            }
+            for job in retry_jobs
+        ],
+    }
+    retry_plan["plan_fingerprint"] = canonical_sha256(retry_plan)
+    retry_plan_path = output_root / "evaluation_error_retry_plan.json"
+    freeze_json(retry_plan_path, retry_plan)
+    execute_jobs(retry_jobs, repo_root=repo_root, retry_failed_processes=True)
+    after = {job.job_id: _retryable_sample_ids(job.output_path) for job in jobs}
+    report = {
+        "schema_version": 1,
+        "kind": "fast_hybrid_sft_eval_error_retry_run",
+        "status": "passed" if not any(after.values()) else "failed",
+        "source_plan_sha256": sha256_file(plan_path),
+        "retry_plan_sha256": sha256_file(retry_plan_path),
+        "before": before,
+        "after": after,
+        "result_files": {
+            job.job_id: {
+                "path": str(job.output_path.resolve()),
+                "sha256": sha256_file(job.output_path),
+            }
+            for job in jobs
+        },
+    }
+    freeze_json(run_path, report)
+    if report["status"] != "passed":
+        raise RuntimeError("the one allowed per-sample error retry did not clear all errors")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -265,6 +365,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Each child is resume-safe. Retry the failed process once so a transient
         # service/API interruption does not strand an otherwise complete matrix.
         execute_jobs(jobs, repo_root=args.repo_root.resolve(), retry_failed_processes=True)
+        if args.resume:
+            retry_error_rows_once(
+                jobs,
+                output_root=args.output_root,
+                repo_root=args.repo_root.resolve(),
+                plan_path=plan_path,
+            )
         files: dict[str, Any] = {}
         for job, dataset in zip(jobs, DATASETS):
             entry = protocol["splits"][args.phase][dataset]

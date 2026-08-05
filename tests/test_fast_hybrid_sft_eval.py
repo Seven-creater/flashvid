@@ -15,7 +15,11 @@ from flashvid_eval.fast_hybrid_eval_protocol import (
     sha256_file,
 )
 from scripts.freeze_fast_hybrid_sft_checkpoint import freeze_checkpoint
-from scripts.run_fast_hybrid_sft_eval import _load_checkpoint, build_jobs
+from scripts.run_fast_hybrid_sft_eval import (
+    _load_checkpoint,
+    build_error_retry_jobs,
+    build_jobs,
+)
 
 
 BASE_SHA = "a" * 64
@@ -146,7 +150,10 @@ def test_checkpoint_and_eval_jobs_bind_base_adapter_manifest_and_candidate(
     ]
     assert command[command.index("--teacher-model-artifact-sha256") + 1] == BASE_SHA
     assert "--resume" in command
-    assert "--retry-errors" in command
+    assert "--retry-errors" not in command
+    retry = list(build_error_retry_jobs(jobs)[0].command)
+    assert retry[:-1] == command
+    assert retry[-1] == "--retry-errors"
 
 
 def test_result_audit_rejects_unbound_served_stack(tmp_path: Path) -> None:

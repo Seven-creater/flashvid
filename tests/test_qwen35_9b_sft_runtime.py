@@ -75,8 +75,22 @@ def test_training_launcher_supports_official_eight_gpu_fsdp2() -> None:
     text = _text("scripts/train_qwen_agent_9b_lora.sh")
     assert 'USE_FSDP2="${USE_FSDP2:-0}"' in text
     assert 'USE_FSDP2=1 requires CUDA_VISIBLE_DEVICES=$eight_gpu_set' in text
-    assert 'distributed_args=(--fsdp fsdp2 --lora_dtype bfloat16)' in text
+    assert '--fsdp fsdp2' in text
+    assert '--lora_dtype bfloat16' in text
+    assert '--external_plugins "$PROJECT_DIR/scripts/swift_fsdp2_bf16_lora_plugin.py"' in text
     assert '"${distributed_args[@]}"' in text
+
+
+def test_fsdp2_plugin_is_narrow_and_fails_closed() -> None:
+    text = _text("scripts/swift_fsdp2_bf16_lora_plugin.py")
+    assert "_ORIGINAL_PREPARE_MODEL" in text
+    assert 'getattr(args, "tuner_type", None) == "lora"' in text
+    assert "_uses_fsdp2(args)" in text
+    assert "parameter.requires_grad" in text
+    assert "parameter.data.to(dtype=torch.bfloat16)" in text
+    assert "uniformly BF16 frozen base" in text
+    assert "still has mixed floating parameter dtypes" in text
+    assert "found no trainable parameters" in text
 
 
 def test_training_launcher_preserves_lora_and_loss_contract() -> None:

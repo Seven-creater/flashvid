@@ -327,8 +327,14 @@ distributed_args=()
 if [[ "$USE_FSDP2" == "1" ]]; then
   # ms-swift 4.4.2's bundled fsdp2 preset uses PyTorch native FULL_SHARD,
   # transformer auto-wrap, and activation checkpointing. This avoids a full
-  # 9B replica on every GPU while keeping the registered LoRA objective.
-  distributed_args=(--fsdp fsdp2 --lora_dtype bfloat16)
+  # 9B replica on every GPU while keeping the registered LoRA objective. PEFT
+  # promotes adapters to FP32 by default, so the project plugin restores the
+  # registered BF16 LoRA dtype before FSDP2 wraps the model.
+  distributed_args=(
+    --fsdp fsdp2
+    --lora_dtype bfloat16
+    --external_plugins "$PROJECT_DIR/scripts/swift_fsdp2_bf16_lora_plugin.py"
+  )
 fi
 if [[ "$smoke" -eq 1 ]]; then
   # A one-step smoke cannot spend its only optimizer step at zero learning

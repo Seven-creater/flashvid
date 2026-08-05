@@ -162,6 +162,8 @@ def test_smoke_and_formal_runs_are_explicitly_bound() -> None:
 def test_train_eval_can_send_final_epoch_directly_to_test300() -> None:
     launcher = _text("scripts/run_fast_hybrid_train_eval.sh")
     assert 'DIRECT_TEST_AFTER_TRAIN="${DIRECT_TEST_AFTER_TRAIN:-0}"' in launcher
+    assert 'VLLM_BIN="${VLLM_BIN:-$(dirname "$PYTHON")/vllm}"' in launcher
+    assert "export VLLM_BIN" in launcher
     assert "select_final_epoch_for_direct_test" in launcher
     assert "final_epoch_direct_test_no_dev_selection" in launcher
     assert 'expected_epoch = max(' in launcher

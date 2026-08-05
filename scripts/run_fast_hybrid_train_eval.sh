@@ -8,11 +8,17 @@ export PYTHONPATH="$PROJECT_DIR:$PROJECT_DIR/src"
 SERVICE_OWNER_PROJECT_DIR="${SERVICE_OWNER_PROJECT_DIR:-$PROJECT_DIR}"
 
 PYTHON="${PYTHON:-/data02/usr/wangqihao/Demo/test/flashvid/.venv/bin/python}"
+VLLM_BIN="${VLLM_BIN:-$(dirname "$PYTHON")/vllm}"
 SFT_PYTHON="${SFT_PYTHON:-$PROJECT_DIR/.venv-qwen35-sft-cu124/bin/python}"
 SFT_ENV_DIR="${SFT_ENV_DIR:-$(cd "$(dirname "$SFT_PYTHON")/.." && pwd)}"
 SWIFT_PYTHON="${SWIFT_PYTHON:-$SFT_PYTHON}"
 SWIFT_BIN="${SWIFT_BIN:-$SFT_ENV_DIR/bin/swift}"
 export SFT_ENV_DIR SWIFT_PYTHON SWIFT_BIN
+export VLLM_BIN
+[[ -x "$VLLM_BIN" ]] || {
+  echo "vLLM executable not found: $VLLM_BIN" >&2
+  exit 2
+}
 MODEL_PATH="${MODEL_PATH:-/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B}"
 MODEL_SHA="${MODEL_SHA:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60}"
 CONFIG="${CONFIG:-configs/experiments/fast_hybrid_eva_sft.json}"

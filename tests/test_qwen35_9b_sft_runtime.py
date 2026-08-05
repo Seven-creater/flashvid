@@ -75,7 +75,7 @@ def test_training_launcher_supports_official_eight_gpu_fsdp2() -> None:
     text = _text("scripts/train_qwen_agent_9b_lora.sh")
     assert 'USE_FSDP2="${USE_FSDP2:-0}"' in text
     assert 'USE_FSDP2=1 requires CUDA_VISIBLE_DEVICES=$eight_gpu_set' in text
-    assert 'distributed_args=(--fsdp fsdp2)' in text
+    assert 'distributed_args=(--fsdp fsdp2 --lora_dtype bfloat16)' in text
     assert '"${distributed_args[@]}"' in text
 
 

@@ -172,6 +172,7 @@ def test_fsdp2_one_shot_uses_all_gpus_then_test300() -> None:
     assert "export USE_FSDP2=1" in text
     assert "export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in text
     assert "export DIRECT_TEST_AFTER_TRAIN=1" in text
+    assert "export TEST_CANDIDATE_ROOT=" in text
     assert "fsdp2_smoke_metadata.json" in text
     assert "qwen_sft_smoke_gate.py check" in text
     assert "run_fast_hybrid_train_eval.sh" in text

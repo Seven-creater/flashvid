@@ -26,6 +26,7 @@ SWIFT_PYTHON="$SFT_ENV_DIR/bin/python"
 export ROOT SFT_ENV_DIR SWIFT_PYTHON
 export SWIFT_BIN="$SFT_ENV_DIR/bin/swift"
 export MODEL_PATH MODEL_SHA
+export TEST_CANDIDATE_ROOT="${TEST_CANDIDATE_ROOT:-/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/fast_hybrid_eva/frozen_direct}"
 export USE_FSDP2=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export DIRECT_TEST_AFTER_TRAIN=1

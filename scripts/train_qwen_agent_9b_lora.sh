@@ -313,7 +313,11 @@ training_length_args=(
   --save_strategy epoch
   --save_total_limit 3
 )
+training_warmup_ratio=0.05
 if [[ "$smoke" -eq 1 ]]; then
+  # A one-step smoke cannot spend its only optimizer step at zero learning
+  # rate. Formal three-epoch training keeps the registered 0.05 warmup.
+  training_warmup_ratio=0
   training_length_args=(
     --max_steps 1
     --logging_strategy steps
@@ -349,7 +353,7 @@ NPROC_PER_NODE="$gpu_count" \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps "$gradient_accumulation_steps" \
   --learning_rate 1e-4 \
-  --warmup_ratio 0.05 \
+  --warmup_ratio "$training_warmup_ratio" \
   --weight_decay 0.01 \
   --max_length 16384 \
   --gradient_checkpointing true \

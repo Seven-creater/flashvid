@@ -18,7 +18,9 @@ MODEL_SHA="${MODEL_SHA:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709
 CONFIG="${CONFIG:-configs/experiments/fast_hybrid_eva_sft.json}"
 CONFIG_SHA="${CONFIG_SHA:-74c2e3a7ecf0dbae30d00037bc748fe0861fdba2501fcf94efeb8aa58856e830}"
 ROOT="${ROOT:-results/eval/fast_hybrid_eva_sft}"
-SFT_DATA="$ROOT/sft_data/fast_hybrid_sft.jsonl"
+SFT_SOURCE="$ROOT/sft_data/fast_hybrid_sft.jsonl"
+SFT_DATA="$ROOT/sft_data/fast_hybrid_sft_max16384.jsonl"
+SFT_LENGTH_AUDIT="$ROOT/sft_data/fast_hybrid_sft_max16384_audit.json"
 FORMAL_DIR="$ROOT/checkpoints/qwen35_9b_lora"
 CHECKPOINT_AUDIT="$FORMAL_DIR/checkpoint_audit.json"
 PROTOCOL="$ROOT/frozen/evaluation_protocol.json"
@@ -187,7 +189,10 @@ mark_stage "$CURRENT_STAGE" passed
 CURRENT_STAGE=training_smoke
 mark_stage "$CURRENT_STAGE" started
 stop_owned_services
-[[ -f "$SFT_DATA" ]] || { echo "approved SFT data is missing: $SFT_DATA" >&2; exit 1; }
+[[ -f "$SFT_SOURCE" ]] || { echo "approved SFT data is missing: $SFT_SOURCE" >&2; exit 1; }
+"$SFT_PYTHON" scripts/filter_swift_sft_length.py \
+  --input "$SFT_SOURCE" --output "$SFT_DATA" --audit "$SFT_LENGTH_AUDIT" \
+  --model "$MODEL_PATH" --model-artifact-sha256 "$MODEL_SHA" --max-length 16384
 SMOKE_POINTER="$ROOT/checkpoints/active_smoke_report.txt"
 SMOKE_REPORT=""
 if [[ -f "$SMOKE_POINTER" ]]; then

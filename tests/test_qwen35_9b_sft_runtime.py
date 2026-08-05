@@ -163,12 +163,23 @@ def test_train_eval_can_send_final_epoch_directly_to_test300() -> None:
     assert 'CURRENT_STAGE=checkpoint_dev' in launcher
 
 
+def test_fsdp2_one_shot_uses_all_gpus_then_test300() -> None:
+    text = _text("scripts/run_fast_hybrid_fsdp2_train_test.sh")
+    assert "export USE_FSDP2=1" in text
+    assert "export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in text
+    assert "export DIRECT_TEST_AFTER_TRAIN=1" in text
+    assert "fsdp2_smoke_metadata.json" in text
+    assert "qwen_sft_smoke_gate.py check" in text
+    assert "run_fast_hybrid_train_eval.sh" in text
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is unavailable")
 def test_training_shells_parse() -> None:
     for path in (
         "scripts/install_ms_swift_442.sh",
         "scripts/preflight_qwen35_9b_lora.sh",
         "scripts/train_qwen_agent_9b_lora.sh",
+        "scripts/run_fast_hybrid_fsdp2_train_test.sh",
         "scripts/serve_qwen_agent.sh",
         "scripts/stop_qwen_agent.sh",
     ):

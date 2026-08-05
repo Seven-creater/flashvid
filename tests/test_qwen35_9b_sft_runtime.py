@@ -75,13 +75,17 @@ def test_training_launcher_supports_official_eight_gpu_fsdp2() -> None:
     text = _text("scripts/train_qwen_agent_9b_lora.sh")
     assert 'USE_FSDP2="${USE_FSDP2:-0}"' in text
     assert 'USE_FSDP2=1 requires CUDA_VISIBLE_DEVICES=$eight_gpu_set' in text
-    assert '--fsdp fsdp2' in text
+    assert '--fsdp "$PROJECT_DIR/configs/training/fsdp2_lora_full_state.json"' in text
     assert '--lora_dtype float32' in text
     assert '--fp16 false' in text
     assert '--bf16 true' in text
     assert "model_load_dtype=float32" in text
     assert '--torch_dtype "$model_load_dtype"' in text
     assert '"${distributed_args[@]}"' in text
+    fsdp = _text("configs/training/fsdp2_lora_full_state.json")
+    assert '"fsdp_version": 2' in fsdp
+    assert '"state_dict_type": "FULL_STATE_DICT"' in fsdp
+    assert '"cpu_ram_efficient_loading": true' in fsdp
 
 
 def test_training_launcher_preserves_lora_and_loss_contract() -> None:

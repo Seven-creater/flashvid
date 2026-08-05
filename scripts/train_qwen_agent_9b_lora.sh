@@ -335,7 +335,7 @@ if [[ "$USE_FSDP2" == "1" ]]; then
   # PEFT's FP32 LoRA masters while all expensive math remains BF16.
   model_load_dtype=float32
   distributed_args=(
-    --fsdp fsdp2
+    --fsdp "$PROJECT_DIR/configs/training/fsdp2_lora_full_state.json"
     --lora_dtype float32
     --fp16 false
     --bf16 true

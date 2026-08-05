@@ -108,6 +108,7 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "--lora_dropout 0.05",
         "--attn_impl sdpa",
         "verify_swift_loss_mask.py",
+        "--reuse-valid",
         "preflight_qwen35_9b_lora.py",
         "smoke_one_sample.jsonl",
         "--max_steps 1",

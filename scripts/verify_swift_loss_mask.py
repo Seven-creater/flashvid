@@ -289,6 +289,45 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+def load_valid_cached_report(
+    output: Path,
+    *,
+    sft_data: Path,
+    model: Path,
+    sample_count: int,
+) -> dict[str, Any] | None:
+    """Return an immutable matching report without repeating media tokenization."""
+
+    if not output.is_file():
+        return None
+    try:
+        report = json.loads(output.read_text(encoding="utf-8"))
+        encoded_records = sum(
+            1 for line in sft_data.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+        valid = (
+            isinstance(report, dict)
+            and report.get("status") == "passed"
+            and report.get("ms_swift_version") == REQUIRED_SWIFT_VERSION
+            and Path(str(report.get("model") or "")).resolve() == model.resolve()
+            and Path(str(report.get("sft_data") or "")).resolve() == sft_data.resolve()
+            and report.get("sft_data_sha256") == _sha256(sft_data)
+            and report.get("template_type") == "qwen3_5"
+            and report.get("template_backend") == "swift"
+            and report.get("loss_scale") == "default"
+            and int(report.get("checked_records", 0)) >= sample_count
+            and int(report.get("masked_role_probes", 0)) >= sample_count
+            and int(report.get("assistant_loss_probes", 0)) >= sample_count
+            and int(report.get("encoded_records", 0)) == encoded_records
+            and 0 < int(report.get("maximum_encoded_tokens", 0)) <= TRAINING_MAX_LENGTH
+            and int(report.get("minimum_trainable_labels", 0)) > 0
+            and int(report.get("max_length", 0)) == TRAINING_MAX_LENGTH
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return report if valid else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -300,11 +339,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--reuse-valid",
+        action="store_true",
+        help="reuse an existing report only when all paths, hashes and invariants match",
+    )
     args = parser.parse_args(argv)
 
     try:
         if not args.sft_data.is_file():
             raise FileNotFoundError(args.sft_data)
+        if args.reuse_valid:
+            cached = load_valid_cached_report(
+                args.output,
+                sft_data=args.sft_data,
+                model=args.model,
+                sample_count=args.samples,
+            )
+            if cached is not None:
+                print(json.dumps({"cache_reused": True, **cached}, ensure_ascii=False, indent=2))
+                return 0
         template, template_type = _load_real_template(args.model)
         records = _read_jsonl(args.sft_data)
         verification = verify_records_with_template(

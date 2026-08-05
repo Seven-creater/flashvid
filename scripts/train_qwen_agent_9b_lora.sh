@@ -291,6 +291,7 @@ PY
   --sft-data "$training_data" \
   --model "$MODEL_PATH" \
   --samples "$loss_mask_samples" \
+  --reuse-valid \
   --output "$OUTPUT_DIR/preflight/swift_loss_mask.json"
 model_preflight_args=()
 if [[ "$load_weights_preflight" -eq 1 ]]; then

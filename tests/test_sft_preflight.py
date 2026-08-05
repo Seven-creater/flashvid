@@ -11,6 +11,7 @@ import pytest
 
 from scripts.check_sft_data import validate_sft_data
 from scripts.verify_swift_loss_mask import (
+    load_valid_cached_report,
     verify_all_record_encodings,
     verify_records_with_template,
 )
@@ -250,6 +251,42 @@ def test_real_template_probe_logic_accepts_expected_masks() -> None:
     encoded = verify_all_record_encodings(records, _FakeTemplate())
     assert encoded["encoded_records"] == 1
     assert encoded["maximum_encoded_tokens"] > 0
+
+
+def test_loss_mask_report_cache_requires_exact_data_and_invariants(tmp_path: Path) -> None:
+    data = tmp_path / "train.jsonl"
+    model = tmp_path / "model"
+    report_path = tmp_path / "report.json"
+    model.mkdir()
+    data.write_text(json.dumps({"messages": _messages(0.25)}) + "\n", encoding="utf-8")
+    import hashlib
+
+    report = {
+        "status": "passed",
+        "ms_swift_version": "4.4.2",
+        "model": str(model.resolve()),
+        "template_type": "qwen3_5",
+        "template_backend": "swift",
+        "loss_scale": "default",
+        "sft_data": str(data.resolve()),
+        "sft_data_sha256": hashlib.sha256(data.read_bytes()).hexdigest(),
+        "checked_records": 3,
+        "masked_role_probes": 8,
+        "assistant_loss_probes": 3,
+        "encoded_records": 1,
+        "maximum_encoded_tokens": 100,
+        "minimum_trainable_labels": 4,
+        "max_length": 16384,
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    assert load_valid_cached_report(
+        report_path, sft_data=data, model=model, sample_count=3
+    ) == report
+
+    data.write_text(data.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    assert load_valid_cached_report(
+        report_path, sft_data=data, model=model, sample_count=3
+    ) is None
 
 
 def test_real_template_probe_honors_explicit_false_assistant_loss() -> None:

@@ -28,6 +28,9 @@ def _is_bfloat16(value: object) -> bool:
 
 
 def _uses_fsdp2(args: object) -> bool:
+    config = getattr(args, "fsdp_config", None)
+    if isinstance(config, dict) and int(config.get("fsdp_version", 0)) == 2:
+        return True
     value = getattr(args, "fsdp", None)
     if isinstance(value, (list, tuple, set)):
         return any("fsdp2" in str(item).lower() for item in value)
@@ -113,4 +116,3 @@ def _prepare_model_with_uniform_bfloat16_lora(
 if not getattr(TunerMixin, "_flashvid_fsdp2_bf16_lora_patch", False):
     TunerMixin.prepare_model = _prepare_model_with_uniform_bfloat16_lora
     TunerMixin._flashvid_fsdp2_bf16_lora_patch = True
-

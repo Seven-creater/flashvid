@@ -84,6 +84,7 @@ def test_training_launcher_supports_official_eight_gpu_fsdp2() -> None:
 def test_fsdp2_plugin_is_narrow_and_fails_closed() -> None:
     text = _text("scripts/swift_fsdp2_bf16_lora_plugin.py")
     assert "_ORIGINAL_PREPARE_MODEL" in text
+    assert 'config.get("fsdp_version", 0)' in text
     assert 'getattr(args, "tuner_type", None) == "lora"' in text
     assert "_uses_fsdp2(args)" in text
     assert "parameter.requires_grad" in text

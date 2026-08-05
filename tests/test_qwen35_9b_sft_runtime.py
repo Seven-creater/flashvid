@@ -132,6 +132,15 @@ def test_smoke_and_formal_runs_are_explicitly_bound() -> None:
     assert 'qwen_sft_smoke_gate.py" check' in launcher
 
 
+def test_train_eval_can_send_final_epoch_directly_to_test300() -> None:
+    launcher = _text("scripts/run_fast_hybrid_train_eval.sh")
+    assert 'DIRECT_TEST_AFTER_TRAIN="${DIRECT_TEST_AFTER_TRAIN:-0}"' in launcher
+    assert "select_final_epoch_for_direct_test" in launcher
+    assert "final_epoch_direct_test_no_dev_selection" in launcher
+    assert 'expected_epoch = max(' in launcher
+    assert 'CURRENT_STAGE=checkpoint_dev' in launcher
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is unavailable")
 def test_training_shells_parse() -> None:
     for path in (

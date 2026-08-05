@@ -18,6 +18,7 @@ MODEL_SHA="${MODEL_SHA:-5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709
 CONFIG="${CONFIG:-configs/experiments/fast_hybrid_eva_sft.json}"
 CONFIG_SHA="${CONFIG_SHA:-74c2e3a7ecf0dbae30d00037bc748fe0861fdba2501fcf94efeb8aa58856e830}"
 ROOT="${ROOT:-results/eval/fast_hybrid_eva_sft}"
+DIRECT_TEST_AFTER_TRAIN="${DIRECT_TEST_AFTER_TRAIN:-0}"
 SFT_SOURCE="$ROOT/sft_data/fast_hybrid_sft.jsonl"
 SFT_DATA="$ROOT/sft_data/fast_hybrid_sft_max16384.jsonl"
 SFT_LENGTH_AUDIT="$ROOT/sft_data/fast_hybrid_sft_max16384_audit.json"
@@ -25,6 +26,12 @@ FORMAL_DIR="$ROOT/checkpoints/qwen35_9b_lora"
 CHECKPOINT_AUDIT="$FORMAL_DIR/checkpoint_audit.json"
 PROTOCOL="$ROOT/frozen/evaluation_protocol.json"
 WINNER="$ROOT/dev_eval/winner.json"
+if [[ "$DIRECT_TEST_AFTER_TRAIN" == "1" ]]; then
+  WINNER="$ROOT/final_test/final_epoch_winner.json"
+elif [[ "$DIRECT_TEST_AFTER_TRAIN" != "0" ]]; then
+  echo "DIRECT_TEST_AFTER_TRAIN must be 0 or 1" >&2
+  exit 2
+fi
 STATE="$ROOT/autopilot/train_eval_state.jsonl"
 TEST_CANDIDATE_ROOT="${TEST_CANDIDATE_ROOT:-results/eval/fast_hybrid_eva/frozen_direct}"
 SERVICES_STARTED=0
@@ -258,6 +265,58 @@ PY
 test "${#CHECKPOINT_CONFIGS[@]}" -eq 3
 mark_stage "$CURRENT_STAGE" passed
 
+if [[ "$DIRECT_TEST_AFTER_TRAIN" == "1" ]]; then
+  CURRENT_STAGE=select_final_epoch_for_direct_test
+  mark_stage "$CURRENT_STAGE" started
+  FINAL_CHECKPOINT_CONFIG="${CHECKPOINT_CONFIGS[-1]}"
+  "$PYTHON" - "$PROTOCOL" "$PROTOCOL_SHA" "$FINAL_CHECKPOINT_CONFIG" \
+    "$CHECKPOINT_AUDIT" "$ROOT/dev_eval/teacher" "$WINNER" <<'PY'
+import json, sys
+from pathlib import Path
+
+from flashvid_eval.fast_hybrid_eval_protocol import freeze_json, load_protocol, sha256_file
+from scripts.run_fast_hybrid_sft_eval import _load_checkpoint
+
+protocol_path, protocol_sha, config_path, audit_path, teacher_root, output_path = map(Path, sys.argv[1:])
+protocol_sha = str(protocol_sha)
+protocol = load_protocol(protocol_path, protocol_sha)
+checkpoint = _load_checkpoint(config_path, protocol)
+audit = json.loads(audit_path.read_text(encoding="utf-8"))
+expected_epoch = max(int(round(float(item["epoch"]))) for item in audit["checkpoints"])
+if int(checkpoint["epoch"]) != expected_epoch:
+    raise RuntimeError("final checkpoint config is not the maximum trained epoch")
+payload = {
+    "schema_version": 1,
+    "kind": "fast_hybrid_sft_winner",
+    "status": "passed",
+    "evaluation_protocol": {"path": str(protocol_path.resolve()), "sha256": protocol_sha},
+    "evaluation_protocol_sha256": protocol_sha,
+    "teacher_run": {
+        "path": str(teacher_root.resolve()),
+        "metadata_sha256": sha256_file(teacher_root / "evaluation_run.json"),
+    },
+    "selection": {
+        "policy": "final_epoch_direct_test_no_dev_selection",
+        "dev_evaluated": False,
+        "selected": {
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "epoch": checkpoint["epoch"],
+            "global_step": checkpoint["global_step"],
+        },
+    },
+    "checkpoint_config": {
+        "path": str(config_path.resolve()),
+        "sha256": sha256_file(config_path),
+        "checkpoint_id": checkpoint["checkpoint_id"],
+        "served_stack_sha256": checkpoint["served_stack_sha256"],
+    },
+    "checkpoint_dev_run": None,
+}
+freeze_json(output_path, payload)
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  mark_stage "$CURRENT_STAGE" passed
+else
 CURRENT_STAGE=checkpoint_dev
 mark_stage "$CURRENT_STAGE" started
 CHECKPOINT_SELECTION_ARGS=()
@@ -300,6 +359,7 @@ if (( selection_code == 2 )); then
   mark_stage "$CURRENT_STAGE" passed
   trap - EXIT
   exit 0
+fi
 fi
 
 CURRENT_STAGE=winner_test

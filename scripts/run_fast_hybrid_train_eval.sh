@@ -170,8 +170,8 @@ mark_stage "$CURRENT_STAGE" passed
 
 CURRENT_STAGE=teacher_dev
 mark_stage "$CURRENT_STAGE" started
-ensure_base_pair
 if ! evaluation_passed "$ROOT/dev_eval/teacher" dev teacher "$MODEL_SHA"; then
+  ensure_base_pair
   "$PYTHON" scripts/run_fast_hybrid_sft_eval.py \
     --protocol "$PROTOCOL" --expected-protocol-sha256 "$PROTOCOL_SHA" \
     --phase dev --mode teacher --run-id teacher_dev_v1 \

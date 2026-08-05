@@ -12,6 +12,7 @@ FORMAL_OUTPUT_DIR=""
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 MIN_GPU_MEMORY_MIB="${MIN_GPU_MEMORY_MIB:-43008}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+USE_FSDP2="${USE_FSDP2:-0}"
 
 train_data=""
 resume=0
@@ -140,6 +141,10 @@ fi
   echo "EXPECTED_MODEL_ARTIFACT_SHA256 must be a SHA-256" >&2
   exit 2
 }
+[[ "$USE_FSDP2" == "0" || "$USE_FSDP2" == "1" ]] || {
+  echo "USE_FSDP2 must be 0 or 1" >&2
+  exit 2
+}
 if [[ "$smoke" -eq 0 ]]; then
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/qwen_sft_smoke_gate.py" check \
     --report "$smoke_report" \
@@ -196,6 +201,10 @@ case "$CUDA_VISIBLE_DEVICES" in
     exit 2
     ;;
 esac
+if [[ "$USE_FSDP2" == "1" && "$CUDA_VISIBLE_DEVICES" != "$eight_gpu_set" ]]; then
+  echo "USE_FSDP2=1 requires CUDA_VISIBLE_DEVICES=$eight_gpu_set" >&2
+  exit 2
+fi
 gpu_free_memory_ok "$CUDA_VISIBLE_DEVICES" || {
   echo "each selected GPU must provide at least 42 GiB free: $CUDA_VISIBLE_DEVICES" >&2
   exit 2
@@ -314,6 +323,13 @@ training_length_args=(
   --save_total_limit 3
 )
 training_warmup_ratio=0.05
+distributed_args=()
+if [[ "$USE_FSDP2" == "1" ]]; then
+  # ms-swift 4.4.2's bundled fsdp2 preset uses PyTorch native FULL_SHARD,
+  # transformer auto-wrap, and activation checkpointing. This avoids a full
+  # 9B replica on every GPU while keeping the registered LoRA objective.
+  distributed_args=(--fsdp fsdp2)
+fi
 if [[ "$smoke" -eq 1 ]]; then
   # A one-step smoke cannot spend its only optimizer step at zero learning
   # rate. Formal three-epoch training keeps the registered 0.05 warmup.
@@ -364,6 +380,7 @@ NPROC_PER_NODE="$gpu_count" \
   --seed 42 \
   --data_seed 42 \
   --output_dir "$OUTPUT_DIR" \
+  "${distributed_args[@]}" \
   "${training_length_args[@]}" \
   "${resume_args[@]}"
 

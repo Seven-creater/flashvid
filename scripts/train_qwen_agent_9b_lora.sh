@@ -212,13 +212,17 @@ training_data="$train_data"
 loss_mask_samples=3
 if [[ "$smoke" -eq 1 ]]; then
   training_data="$OUTPUT_DIR/preflight/smoke_one_sample.jsonl"
-  "$SWIFT_PYTHON" - "$train_data" "$training_data" <<'PY'
+  smoke_rank_padding=$((gpu_count * gradient_accumulation_steps))
+  "$SWIFT_PYTHON" - "$train_data" "$training_data" "$smoke_rank_padding" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 source = Path(sys.argv[1])
 output = Path(sys.argv[2])
+copies = int(sys.argv[3])
+if copies < 1:
+    raise SystemExit("smoke rank padding must be positive")
 with source.open(encoding="utf-8") as handle:
     for line_number, line in enumerate(handle, 1):
         if not line.strip():
@@ -226,7 +230,10 @@ with source.open(encoding="utf-8") as handle:
         value = json.loads(line)
         if not isinstance(value, dict):
             raise SystemExit(f"row {line_number}: expected an object")
-        output.write_text(json.dumps(value, ensure_ascii=False) + "\n", encoding="utf-8")
+        # One unique logical sample is repeated only so every data-parallel rank
+        # receives a complete gradient-accumulation window for the 1-step smoke.
+        encoded = json.dumps(value, ensure_ascii=False) + "\n"
+        output.write_text(encoded * copies, encoding="utf-8")
         break
     else:
         raise SystemExit("SFT data is empty")

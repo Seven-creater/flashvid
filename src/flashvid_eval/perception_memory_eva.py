@@ -764,6 +764,24 @@ def build_perception_messages(
     content[0] = dict(content[0])
     content[0]["text"] = str(content[0]["text"])[len(opening) :]
     content.pop()
+    if use_frame_indices:
+        expected_items = 1 + 2 * len(observation.timestamps)
+        if len(content) != expected_items:
+            raise ValueError("indexed EVA observation has an unexpected content layout")
+        for frame_index, timestamp in enumerate(observation.timestamps):
+            text_position = 1 + frame_index * 2
+            image_position = text_position + 1
+            if (
+                content[text_position].get("type") != "text"
+                or content[image_position].get("type") != "image_url"
+            ):
+                raise ValueError("indexed EVA observation has an invalid frame layout")
+            content[text_position] = {
+                "type": "text",
+                "text": (
+                    f"Frame index {frame_index}, timestamp {timestamp:.3f} seconds:"
+                ),
+            }
     return [
         {"role": "system", "content": system},
         {

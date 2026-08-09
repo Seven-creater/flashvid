@@ -21,8 +21,8 @@ from urllib.request import url2pathname
 from .perception_memory_eva import (
     PERCEPTION_NORMALIZATION_VERSION,
     normalize_perception_state,
-    parse_perception_state,
 )
+from .perception_memory_replay import bind_replay_perception_state
 from .qwen_sft import (
     build_sft_record,
     canonical_sha256,
@@ -257,7 +257,9 @@ def _normalize_raw_perception_response(
 
     if not isinstance(value, str):
         raise ValueError("perception response must be raw JSON text")
-    state = parse_perception_state(value, valid_letters)
+    state, _reference_mode = bind_replay_perception_state(
+        value, valid_letters, actual_timestamps
+    )
     if state is None:
         raise ValueError("raw perception response failed the frozen parser")
     private = _private_path(state.to_dict(), "$.raw_perception_response")
@@ -376,11 +378,12 @@ def _terminal_requests(
             raise ValueError(f"request_trace[{index}] has invalid prefix_index")
         messages = request.get("messages", request.get("request_messages"))
         prompt_hash = str(request.get("prompt_hash") or canonical_sha256(messages))
+        retry_group = str(request.get("retry_group_id") or prompt_hash)
         key = (
             str(request.get("stage") or request.get("request_kind") or "").casefold(),
             step_index,
             prefix_index,
-            prompt_hash,
+            retry_group,
             str(request.get("seed") if request.get("seed") is not None else ""),
         )
         groups.setdefault(key, []).append((index, request))
@@ -824,6 +827,24 @@ def build_perception_memory_sft_records(
         )
         if canonical_sha256(observed_payload) != canonical_sha256(response):
             raise ValueError("perception state differs from the actual model response")
+        model_target = state.get("perception_model_target")
+        if model_target is None:
+            target_content = _canonical_json(response)
+        else:
+            target_payload = _normalize_raw_perception_response(
+                model_target,
+                valid_letters=valid_letters,
+                resolved_start_time=resolved_start,
+                resolved_end_time=resolved_end,
+                actual_timestamps=actual_timestamps,
+            )
+            if canonical_sha256(target_payload) != canonical_sha256(response):
+                raise ValueError(
+                    "perception model target differs from normalized state"
+                )
+            target_content = _canonical_json(
+                _json_object(model_target, "perception_model_target")
+            )
         complete = bool(state["evidence_complete"])
         records.append(
             _episode_record(
@@ -831,7 +852,7 @@ def build_perception_memory_sft_records(
                 observation,
                 step_index=step_index,
                 target_type="memory",
-                target_content=_canonical_json(response),
+                target_content=target_content,
                 role="perception",
                 memory=memory,
                 prefix_complete=complete,

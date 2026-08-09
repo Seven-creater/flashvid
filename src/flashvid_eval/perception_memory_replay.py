@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .perception_memory_eva import (
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
+    PerceptionState,
     build_controller_messages,
     build_perception_messages,
     parse_perception_state,
@@ -480,11 +481,11 @@ def _prompt_hash(messages: Sequence[Mapping[str, Any]]) -> str:
     return canonical_sha256(messages)
 
 
-def _parse_replay_perception_state(
+def bind_replay_perception_state(
     text: str,
     valid_letters: Iterable[str],
     actual_timestamps: Sequence[float],
-) -> tuple[Any, str]:
+) -> tuple[PerceptionState | None, str]:
     """Bind zero-based frame references to immutable cached timestamps."""
 
     try:
@@ -522,6 +523,68 @@ def _parse_replay_perception_state(
             "frame_index",
         )
     return parse_perception_state(text, valid_letters), "timestamp"
+
+
+def _perception_model_target(
+    state: PerceptionState, actual_timestamps: Sequence[float]
+) -> str:
+    timestamps = tuple(float(value) for value in actual_timestamps)
+    payload = state.to_dict()
+    indexed_facts: list[dict[str, Any]] = []
+    for fact in state.timestamped_facts:
+        matches = [
+            index
+            for index, timestamp in enumerate(timestamps)
+            if timestamp == fact.time
+        ]
+        if not matches:
+            raise ValueError(
+                "normalized perception fact is not bound to a cached frame"
+            )
+        indexed_facts.append({"frame_index": matches[0], "fact": fact.fact})
+    payload["timestamped_facts"] = indexed_facts
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _retry_perception_messages(
+    messages: Sequence[Mapping[str, Any]], reason: str
+) -> list[dict[str, Any]]:
+    retry = copy.deepcopy(list(messages))
+    if len(retry) != 2 or retry[-1].get("role") != "user":
+        raise ValueError("perception retry requires the frozen two-message prompt")
+    content = retry[-1].get("content")
+    if not isinstance(content, list):
+        raise ValueError("perception retry requires multimodal user content")
+    correction = (
+        "Correction: the previous response was invalid or incomplete. Return one "
+        "compact raw JSON object only. In timestamped_facts, use the zero-based "
+        "frame_index printed immediately beside each image; do not use timestamp "
+        "seconds as frame_index. Use no more than 12 facts and preserve the exact "
+        "required schema."
+    )
+    content.append({"type": "text", "text": correction})
+    return retry
+
+
+class ReplayAttemptFailure(ValueError):
+    """Carry failed model attempts into the durable JSONL failure row."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_type: str,
+        request_trace: Sequence[Mapping[str, Any]],
+        perception_states: Sequence[Mapping[str, Any]],
+        tool_steps: Sequence[Mapping[str, Any]],
+    ) -> None:
+        super().__init__(message)
+        self.failure_type = failure_type
+        self.request_trace = copy.deepcopy(list(request_trace))
+        self.perception_states = copy.deepcopy(list(perception_states))
+        self.tool_steps = copy.deepcopy(list(tool_steps))
 
 
 @dataclass(frozen=True)
@@ -677,10 +740,19 @@ class PerceptionMemoryReplay:
                 use_frame_indices=True,
             )
             assert_annotation_free_request({"messages": perception_messages})
+            retry_group_id = _prompt_hash(perception_messages)
             state = None
             retry_reason: str | None = None
             timestamp_reference_mode = "invalid"
             for attempt_index in range(2):
+                attempt_messages = (
+                    perception_messages
+                    if attempt_index == 0
+                    else _retry_perception_messages(
+                        perception_messages, retry_reason or ""
+                    )
+                )
+                assert_annotation_free_request({"messages": attempt_messages})
                 max_tokens = (
                     self.config.perception_max_tokens
                     if attempt_index == 0
@@ -688,14 +760,14 @@ class PerceptionMemoryReplay:
                 )
                 result = self.client.chat(
                     self.config.model,
-                    perception_messages,
+                    attempt_messages,
                     max_tokens=max_tokens,
                     temperature=0.0,
                     seed=self.config.seed + step_index * 10 + 2,
                     response_format={"type": "json_object"},
                     chat_template_kwargs={"enable_thinking": False},
                 )
-                parsed, timestamp_reference_mode = _parse_replay_perception_state(
+                parsed, timestamp_reference_mode = bind_replay_perception_state(
                     result.content,
                     sample.option_letters,
                     cached.observation.timestamps,
@@ -718,7 +790,7 @@ class PerceptionMemoryReplay:
                     {
                         "stage": "perception",
                         "model": self.config.model,
-                        "messages": copy.deepcopy(perception_messages),
+                        "messages": copy.deepcopy(attempt_messages),
                         "content": result.content,
                         "reasoning_content": result.reasoning_content,
                         "finish_reason": result.finish_reason,
@@ -727,7 +799,8 @@ class PerceptionMemoryReplay:
                         "seed": self.config.seed + step_index * 10 + 2,
                         "step_index": step_index,
                         "prefix_index": step_index,
-                        "prompt_hash": _prompt_hash(perception_messages),
+                        "prompt_hash": _prompt_hash(attempt_messages),
+                        "retry_group_id": retry_group_id,
                         "attempt_index": attempt_index,
                         "retry_of_attempt": 0 if attempt_index else None,
                         "retry_reason": attempt_failure or retry_reason,
@@ -743,14 +816,25 @@ class PerceptionMemoryReplay:
                 state = None
             if state is None:
                 if retry_reason == "finish_reason_length":
-                    raise RuntimeError(
-                        f"perception step {step_index} response was truncated after retry"
+                    failure_type = "RuntimeError"
+                    message = f"perception step {step_index} response was truncated after retry"
+                else:
+                    failure_type = "ValueError"
+                    message = (
+                        f"perception step {step_index} returned invalid evidence after "
+                        f"retry: {retry_reason}"
                     )
-                raise ValueError(
-                    f"perception step {step_index} returned invalid evidence after retry: "
-                    f"{retry_reason}"
+                raise ReplayAttemptFailure(
+                    message,
+                    failure_type=failure_type,
+                    request_trace=trace,
+                    perception_states=states,
+                    tool_steps=tool_steps,
                 )
             memory.merge(state)
+            perception_model_target = _perception_model_target(
+                state, cached.observation.timestamps
+            )
             states.append(
                 {
                     "step_index": step_index,
@@ -765,6 +849,7 @@ class PerceptionMemoryReplay:
                     "subsample_version": cached.subsample_version,
                     "perception": state.to_dict(),
                     "perception_response": state.to_dict(),
+                    "perception_model_target": perception_model_target,
                     "memory_after": memory.to_dict(),
                     # Perception's self-report is not a correctness label.  The
                     # later three-seed, ground-truth-deferred prefix gate owns this.
@@ -908,6 +993,7 @@ def _failure_row(
 ) -> dict[str, Any]:
     dataset, sample_id, source_id = _source_identity(source)
     annotation = "failed" if isinstance(error, AnnotationLeakError) else "passed"
+    error_type = str(getattr(error, "failure_type", type(error).__name__))
     return {
         "schema_version": 1,
         "backend": "perception_memory_replay",
@@ -933,11 +1019,13 @@ def _failure_row(
         "scoring_deferred": True,
         "candidate_rerun": 0,
         "annotation_leak_check": annotation,
-        "perception_states": [],
-        "request_trace": [],
-        "tool_steps": [],
-        "error": f"{type(error).__name__}: {error}",
-        "error_type": type(error).__name__,
+        "perception_states": copy.deepcopy(
+            list(getattr(error, "perception_states", ()))
+        ),
+        "request_trace": copy.deepcopy(list(getattr(error, "request_trace", ()))),
+        "tool_steps": copy.deepcopy(list(getattr(error, "tool_steps", ()))),
+        "error": f"{error_type}: {error}",
+        "error_type": error_type,
     }
 
 
@@ -1053,6 +1141,7 @@ __all__ = [
     "PerceptionMemoryReplay",
     "ReplayConfig",
     "cached_frame_steps",
+    "bind_replay_perception_state",
     "canonical_sha256",
     "file_sha256",
     "public_model_sample",

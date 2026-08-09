@@ -218,6 +218,29 @@ def _many_frame_source(
     return source
 
 
+def _timestamp_index_source(tmp_path: Path) -> dict:
+    source = _source(tmp_path)
+    first = source["tool_steps"][0]
+    second = source["tool_steps"][1]
+    source["tool_steps"] = [
+        {
+            **first,
+            "start_time": 3000.0,
+            "end_time": 3020.0,
+            "nframes": 2,
+            "frame_paths": [first["frame_paths"][0], second["frame_paths"][0]],
+            "actual_timestamps": [3011.0, 3018.0],
+        }
+    ]
+    return source
+
+
+def _indexed_state(interval: tuple[float, float], frame_index: int, fact: str) -> str:
+    payload = json.loads(_state(interval, fact, sufficient=True))
+    payload["timestamped_facts"] = [{"frame_index": frame_index, "fact": fact}]
+    return json.dumps(payload)
+
+
 def test_replay_uses_only_current_cached_frames_and_merges_memory(
     tmp_path: Path,
 ) -> None:
@@ -337,13 +360,84 @@ def test_replay_retries_one_malformed_response_with_audit_trace(
     assert [call["max_tokens"] for call in client.calls] == [1024, 2048]
 
 
+def test_replay_rejects_timestamp_seconds_as_frame_index_and_corrects_prompt(
+    tmp_path: Path,
+) -> None:
+    source = _timestamp_index_source(tmp_path)
+    invalid = _indexed_state(
+        (3000.0, 3020.0), 3011, "The player wears black headphones."
+    )
+    valid = _indexed_state((3000.0, 3020.0), 1, "The player wears black headphones.")
+    client = FakeClient([invalid, valid])
+
+    result = PerceptionMemoryReplay(client).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    first_prompt = json.dumps(client.calls[0]["messages"], ensure_ascii=False)
+    retry_prompt = json.dumps(client.calls[1]["messages"], ensure_ascii=False)
+    assert "Frame index 0, timestamp 3011.000 seconds" in first_prompt
+    assert "Frame index 1, timestamp 3018.000 seconds" in first_prompt
+    assert "do not use timestamp seconds as frame_index" in retry_prompt
+    assert result["perception_states"][0]["perception"]["timestamped_facts"] == [
+        {"time": 3018.0, "fact": "The player wears black headphones."}
+    ]
+    attempts = result["request_trace"][1:]
+    assert attempts[0]["content"] == invalid
+    assert attempts[0]["retry_reason"] == "invalid_json_or_schema"
+    assert attempts[0]["prompt_hash"] != attempts[1]["prompt_hash"]
+    assert attempts[0]["retry_group_id"] == attempts[1]["retry_group_id"]
+
+
+def test_failed_replay_persists_both_raw_attempts(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    audit = _audit(tmp_path / "audit.json")
+    source = _timestamp_index_source(tmp_path)
+    source_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    first = _indexed_state((3000.0, 3020.0), 3011, "Visible fact one.")
+    second = _indexed_state((3000.0, 3020.0), 3018, "Visible fact two.")
+
+    summary = replay_jsonl(
+        input_path=source_path,
+        output_path=output_path,
+        audit_summary_path=audit,
+        replayer=PerceptionMemoryReplay(FakeClient([first, second])),
+    )
+
+    row = json.loads(output_path.read_text(encoding="utf-8"))
+    assert summary["failed"] == 1
+    assert row["error_type"] == "ValueError"
+    assert [item["stage"] for item in row["request_trace"]] == [
+        "controller",
+        "perception",
+        "perception",
+    ]
+    assert [item["content"] for item in row["request_trace"][1:]] == [first, second]
+    assert [item["finish_reason"] for item in row["request_trace"][1:]] == [
+        "stop",
+        "stop",
+    ]
+    assert [item["usage"]["total_tokens"] for item in row["request_trace"][1:]] == [
+        120,
+        120,
+    ]
+
+
 def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
     tmp_path: Path,
 ) -> None:
+    first_payload = json.loads(_overflow_state((0.0, 10.0)))
+    first_payload["timestamped_facts"] = [
+        {"frame_index": 0, "fact": item["fact"]}
+        for item in first_payload["timestamped_facts"]
+    ]
     client = FakeClient(
         [
-            _overflow_state((0.0, 10.0)),
-            _state((20.0, 30.0), "The person opens the door.", sufficient=True),
+            json.dumps(first_payload),
+            _indexed_state((20.0, 30.0), 0, "The person opens the door."),
         ]
     )
     result = PerceptionMemoryReplay(client).replay(
@@ -410,6 +504,21 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
         "memory",
         "final",
     ]
+    perception_targets = [
+        json.loads(record["messages"][-1]["content"])
+        for record in records
+        if record["metadata"]["process_role"] == "perception"
+    ]
+    assert all(
+        set(fact) == {"frame_index", "fact"}
+        for target in perception_targets
+        for fact in target["timestamped_facts"]
+    )
+    assert all(
+        "time" not in fact
+        for target in perception_targets
+        for fact in target["timestamped_facts"]
+    )
 
 
 def test_legacy_problem_is_read_strictly_from_public_user_prompt(

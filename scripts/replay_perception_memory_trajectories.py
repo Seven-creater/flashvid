@@ -34,6 +34,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--timeout", type=float, default=80.0)
     parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument(
+        "--local-media-paths",
+        action="store_true",
+        help="Send local file:// media as absolute paths for Transformers serving.",
+    )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -41,10 +46,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=args.model,
             seed=args.seed,
             perception_max_tokens=args.max_tokens,
+            local_media_transport="path" if args.local_media_paths else "file_url",
         )
         replayer = PerceptionMemoryReplay(
             OpenAICompatibleClient(
-                args.base_url, api_key=args.api_key, timeout=args.timeout
+                args.base_url,
+                api_key=args.api_key,
+                timeout=args.timeout,
+                local_file_urls_as_paths=args.local_media_paths,
             ),
             config,
         )

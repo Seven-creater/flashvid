@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 from flashvid_eval.client import ChatResult, OpenAICompatibleClient
 from flashvid_eval.qwen_protocol import (
@@ -144,6 +145,36 @@ def test_client_accepts_legacy_reasoning_content(monkeypatch) -> None:
         "Qwen", [{"role": "user", "content": "Q"}]
     )
     assert result.reasoning_content == "legacy private reasoning"
+
+
+def test_client_can_send_local_file_urls_as_paths(monkeypatch, tmp_path: Path) -> None:
+    captured: dict = {}
+    response = {
+        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]
+    }
+    frame = (tmp_path / "frame.png").resolve()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": frame.as_uri()}},
+                {"type": "text", "text": "Describe the frame."},
+            ],
+        }
+    ]
+
+    def fake_urlopen(request, timeout):
+        captured.update(json.loads(request.data.decode("utf-8")))
+        return io.BytesIO(json.dumps(response).encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    OpenAICompatibleClient(
+        "http://localhost:8000/v1", local_file_urls_as_paths=True
+    ).chat("Qwen", messages)
+
+    sent_url = captured["messages"][0]["content"][0]["image_url"]["url"]
+    assert Path(sent_url).resolve() == frame
+    assert messages[0]["content"][0]["image_url"]["url"] == frame.as_uri()
 
 
 def test_strict_json_answer_parser_rejects_prose_fences_and_extra_fields() -> None:

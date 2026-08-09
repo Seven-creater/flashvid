@@ -400,6 +400,7 @@ class ReplayConfig:
     perception_max_tokens: int = 1024
     temperature: float = 0.0
     enable_thinking: bool = False
+    local_media_transport: str = "file_url"
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -408,6 +409,8 @@ class ReplayConfig:
             raise ValueError("perception_max_tokens must be positive")
         if self.temperature != 0.0 or self.enable_thinking:
             raise ValueError("cached Perception replay must be greedy with thinking disabled")
+        if self.local_media_transport not in {"file_url", "path"}:
+            raise ValueError("local_media_transport must be file_url or path")
 
     def fingerprint(self) -> str:
         return canonical_sha256(
@@ -418,6 +421,7 @@ class ReplayConfig:
                 "perception_max_tokens": self.perception_max_tokens,
                 "temperature": self.temperature,
                 "enable_thinking": self.enable_thinking,
+                "local_media_transport": self.local_media_transport,
                 "perception_prompt": "build_perception_messages_v1",
                 "memory_merge": "EvidenceMemory.merge_v1",
                 "implementation_dependencies": (

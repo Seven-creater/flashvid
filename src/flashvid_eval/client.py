@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,10 +33,37 @@ def _message_text(value: Any) -> str:
 
 
 class OpenAICompatibleClient:
-    def __init__(self, base_url: str, api_key: str = "no", timeout: float = 900.0):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "no",
+        timeout: float = 900.0,
+        *,
+        local_file_urls_as_paths: bool = False,
+    ):
         self.endpoint = base_url.rstrip("/") + "/chat/completions"
         self.api_key = api_key
         self.timeout = timeout
+        self.local_file_urls_as_paths = local_file_urls_as_paths
+
+    @staticmethod
+    def _local_media_paths(value: Any) -> Any:
+        if isinstance(value, list):
+            return [OpenAICompatibleClient._local_media_paths(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {
+            key: OpenAICompatibleClient._local_media_paths(item)
+            for key, item in value.items()
+        }
+        url = result.get("url")
+        if isinstance(url, str) and url.startswith("file://"):
+            parsed = urllib.parse.urlparse(url)
+            path = urllib.request.url2pathname(parsed.path)
+            if parsed.netloc:
+                path = f"//{parsed.netloc}{path}"
+            result["url"] = path
+        return result
 
     def chat(
         self,
@@ -53,9 +82,12 @@ class OpenAICompatibleClient:
         media_io_kwargs: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> ChatResult:
+        request_messages = messages
+        if self.local_file_urls_as_paths:
+            request_messages = self._local_media_paths(deepcopy(messages))
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": request_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }

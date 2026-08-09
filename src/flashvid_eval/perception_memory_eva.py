@@ -622,11 +622,20 @@ def build_perception_messages(
         f"{_question_text(sample)}\nVisual evidence request: {evidence_request}\n"
         "Describe what these frames establish and what remains unobserved."
     )
+    content = observation_content(observation, instruction)
+    opening = "<tool_response>"
+    if not content or not str(content[0].get("text", "")).startswith(opening):
+        raise ValueError("EVA observation is missing the tool-response wrapper")
+    if content[-1].get("text") != "</tool_response>":
+        raise ValueError("EVA observation has an invalid tool-response wrapper")
+    content[0] = dict(content[0])
+    content[0]["text"] = str(content[0]["text"])[len(opening) :]
+    content.pop()
     return [
         {"role": "system", "content": system},
         {
             "role": "user",
-            "content": observation_content(observation, instruction),
+            "content": content,
         },
     ]
 

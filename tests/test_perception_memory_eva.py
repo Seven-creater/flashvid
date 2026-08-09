@@ -133,6 +133,9 @@ def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
     assert "question_type" not in serialized
     assert messages_have_media(messages)
     assert serialized.count("image_url") == 2  # type plus payload key
+    content = messages[-1]["content"]
+    assert not content[0]["text"].startswith("<tool_response>")
+    assert all(item.get("text") != "</tool_response>" for item in content)
     assert_annotation_free_request({"messages": messages})
 
 

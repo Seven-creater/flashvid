@@ -11,6 +11,7 @@ from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_replay import (
     PerceptionMemoryReplay,
     ReplayConfig,
+    bind_replay_perception_state,
     cached_frame_steps,
     public_model_sample,
     replay_implementation_dependency_hashes,
@@ -315,6 +316,33 @@ def test_replay_binds_frame_index_to_exact_cached_timestamp(tmp_path: Path) -> N
     assert "frame_index" in client.calls[0]["messages"][0]["content"]
 
 
+@pytest.mark.parametrize("language", ["", "json"])
+def test_binder_accepts_one_complete_json_fence(language: str) -> None:
+    payload = _indexed_state((0.0, 10.0), 0, "The person opens the door.")
+    state, mode = bind_replay_perception_state(
+        f"  ```{language}\n{payload}\n```  ", ("A", "B"), (1.0,)
+    )
+
+    assert state is not None
+    assert mode == "frame_index"
+    assert state.timestamped_facts[0].time == 1.0
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        "Explanation before.\n```json\n{}\n```",
+        "```json\n{}\n```\nExplanation after.",
+        "```json\n{}\n```\n```json\n{}\n```",
+    ],
+)
+def test_binder_rejects_explanation_and_multiple_json_fences(wrapped: str) -> None:
+    state, mode = bind_replay_perception_state(wrapped, ("A", "B"), (1.0,))
+
+    assert state is None
+    assert mode == "invalid"
+
+
 @pytest.mark.parametrize(
     ("first_output", "finish_reason", "retry_reason"),
     [
@@ -437,7 +465,9 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
     client = FakeClient(
         [
             json.dumps(first_payload),
-            _indexed_state((20.0, 30.0), 0, "The person opens the door."),
+            "```json\n"
+            + _indexed_state((20.0, 30.0), 0, "The person opens the door.")
+            + "\n```",
         ]
     )
     result = PerceptionMemoryReplay(client).replay(
@@ -484,6 +514,7 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
         }
     )
     records = build_perception_memory_sft_records(result)
+    assert result["request_trace"][3]["content"].startswith("```json\n")
     first_state = result["perception_states"][0]["perception_response"]
     assert (
         len(json.loads(result["request_trace"][1]["content"])["timestamped_facts"])

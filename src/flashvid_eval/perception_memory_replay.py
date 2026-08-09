@@ -40,6 +40,10 @@ FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
 FRAME_SUBSAMPLE_VERSION = "v1"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
 _CHOICE_LINE = re.compile(r"(?m)^([A-H]):\s*(.+?)\s*$")
+_STRICT_JSON_FENCE = re.compile(
+    r"\A\s*```(?:json)?[ \t]*\r?\n(?P<body>\{.*\})\r?\n```[ \t]*\s*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
 _FLIP_GROUPS = frozenset(
     {
         "untrained_correct_sft_wrong",
@@ -488,8 +492,12 @@ def bind_replay_perception_state(
 ) -> tuple[PerceptionState | None, str]:
     """Bind zero-based frame references to immutable cached timestamps."""
 
+    candidate = (text or "").strip()
+    fenced = _STRICT_JSON_FENCE.fullmatch(candidate)
+    if fenced is not None:
+        candidate = fenced.group("body")
     try:
-        payload = json.loads((text or "").strip())
+        payload = json.loads(candidate)
     except json.JSONDecodeError:
         return None, "invalid"
     if not isinstance(payload, dict):

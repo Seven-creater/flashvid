@@ -514,7 +514,6 @@ class PerceptionMemoryReplay:
                 seed=self.config.seed + step_index * 10 + 2,
                 response_format={"type": "json_object"},
                 chat_template_kwargs={"enable_thinking": False},
-                extra_body={"return_token_ids": True},
             )
             perception_trace = {
                 "stage": "perception",

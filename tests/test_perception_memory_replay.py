@@ -194,6 +194,7 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(tmp_path: Path
     assert result["perception_states"][0]["evidence_complete"] is False
     assert result["perception_states"][1]["evidence_complete"] is False
     assert len(client.calls) == 2
+    assert all("extra_body" not in call for call in client.calls)
     first_serialized = json.dumps(client.calls[0]["messages"], ensure_ascii=False)
     second_serialized = json.dumps(client.calls[1]["messages"], ensure_ascii=False)
     assert "candidate" not in first_serialized.casefold()

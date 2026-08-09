@@ -9,7 +9,9 @@ import pytest
 from scripts.run_perception_memory_explicit_time_rescue import (
     _canonical_sha256,
     _validate_frozen_scope,
+    _validate_manifest_counts,
     _validate_manifest_row,
+    _rescue_trajectory_id,
 )
 
 
@@ -66,6 +68,35 @@ def test_repair_manifest_row_rejects_private_or_forged_inputs() -> None:
     forged["source_row_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="source_row_sha256"):
         _validate_manifest_row(forged)
+
+
+def test_repair_scope_requires_37_trajectories_across_6_samples() -> None:
+    rows = [
+        {
+            "dataset": "lvbench",
+            "sample_id": f"sample-{index % 6}",
+            "source_trajectory_id": f"source-{index}",
+        }
+        for index in range(37)
+    ]
+
+    _validate_manifest_counts(rows, expected_rows=37, expected_samples=6)
+    rescue_ids = [
+        _rescue_trajectory_id(str(row["source_trajectory_id"])) for row in rows
+    ]
+    assert len(rescue_ids) == len(set(rescue_ids)) == 37
+    assert all(item.endswith(":explicit_time_rescue_v1") for item in rescue_ids)
+
+    with pytest.raises(ValueError, match="37 rows"):
+        _validate_manifest_counts(rows[:-1], expected_rows=37, expected_samples=6)
+    five_sample_rows = [
+        {**row, "sample_id": f"sample-{index % 5}"}
+        for index, row in enumerate(rows)
+    ]
+    with pytest.raises(ValueError, match="6 unique samples"):
+        _validate_manifest_counts(
+            five_sample_rows, expected_rows=37, expected_samples=6
+        )
 
 
 def test_frozen_scope_cryptographically_binds_explicit_time_manifest(

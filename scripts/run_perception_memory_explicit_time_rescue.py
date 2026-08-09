@@ -40,6 +40,13 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _rescue_trajectory_id(source_trajectory_id: str) -> str:
+    identity = str(source_trajectory_id).strip()
+    if not identity:
+        raise ValueError("source_trajectory_id cannot be empty")
+    return f"{identity}:explicit_time_rescue_v1"
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line_number, line in enumerate(
@@ -55,6 +62,31 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"{path}:{line_number}: row must be an object")
         rows.append(row)
     return rows
+
+
+def _validate_manifest_counts(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_rows: int,
+    expected_samples: int,
+) -> None:
+    if expected_rows <= 0 or expected_samples <= 0:
+        raise ValueError("expected repair counts must be positive")
+    if len(rows) != expected_rows:
+        raise ValueError(
+            f"repair manifest must contain {expected_rows} rows, got {len(rows)}"
+        )
+    samples = {
+        (str(row.get("dataset") or ""), str(row.get("sample_id") or ""))
+        for row in rows
+    }
+    if any(not dataset or not sample_id for dataset, sample_id in samples):
+        raise ValueError("repair manifest rows require dataset and sample_id")
+    if len(samples) != expected_samples:
+        raise ValueError(
+            "repair manifest must contain "
+            f"{expected_samples} unique samples, got {len(samples)}"
+        )
 
 
 def _validate_frozen_scope(
@@ -208,6 +240,9 @@ def _run_one(
     )
     result.update(
         {
+            "trajectory_id": _rescue_trajectory_id(
+                str(row["source_trajectory_id"])
+            ),
             "source_trajectory_id": row["source_trajectory_id"],
             "source_row_sha256": row["source_row_sha256"],
             "source_file_sha256": row.get("source_file_sha256"),
@@ -234,17 +269,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-turns", type=int, default=6)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--concurrency", type=int, default=6)
-    parser.add_argument("--expected-count", type=int, default=6)
+    parser.add_argument("--expected-rows", type=int, default=37)
+    parser.add_argument("--expected-samples", type=int, default=6)
     parser.add_argument("--local-media-paths", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
 
     try:
         rows = _load_jsonl(args.repair_manifest)
-        if len(rows) != args.expected_count:
-            raise ValueError(
-                f"repair manifest must contain {args.expected_count} rows, got {len(rows)}"
-            )
+        _validate_manifest_counts(
+            rows,
+            expected_rows=args.expected_rows,
+            expected_samples=args.expected_samples,
+        )
         manifest_sha256 = _file_sha256(args.repair_manifest)
         frozen_scope_sha256 = _validate_frozen_scope(
             args.frozen_scope, args.repair_manifest, manifest_sha256

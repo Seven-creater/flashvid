@@ -32,7 +32,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", default="Qwen3.5-9B")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--timeout", type=float, default=80.0)
+    parser.add_argument("--max-frames-per-call", type=int, default=128)
+    parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument(
         "--local-media-paths",
@@ -46,6 +47,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=args.model,
             seed=args.seed,
             perception_max_tokens=args.max_tokens,
+            max_frames_per_call=args.max_frames_per_call,
+            request_timeout_s=args.timeout,
             local_media_transport="path" if args.local_media_paths else "file_url",
         )
         replayer = PerceptionMemoryReplay(

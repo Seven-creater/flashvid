@@ -34,7 +34,9 @@ from .qwen_agents.core import ChatClient, FrameObservation, FrameRequest, ToolSt
 from .schemas import ModelSample
 
 
-REPLAY_VERSION = "perception_memory_replay_v2"
+REPLAY_VERSION = "perception_memory_replay_v3"
+FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
+FRAME_SUBSAMPLE_VERSION = "v1"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
 _CHOICE_LINE = re.compile(r"(?m)^([A-H]):\s*(.+?)\s*$")
 _FLIP_GROUPS = frozenset(
@@ -314,6 +316,11 @@ def public_model_sample(row: Mapping[str, Any]) -> ModelSample:
 class CachedFrameStep:
     request: FrameRequest
     observation: FrameObservation
+    source_frame_count: int
+    subsample_indices: tuple[int, ...]
+    subsample_policy: str = FRAME_SUBSAMPLE_POLICY
+    subsample_version: str = FRAME_SUBSAMPLE_VERSION
+    frame_cap_applied: bool = False
 
 
 def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
@@ -339,6 +346,11 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
         parsed_timestamps = tuple(
             _finite(value, f"tool step {index} timestamp") for value in timestamps
         )
+        if any(
+            later < earlier
+            for earlier, later in zip(parsed_timestamps, parsed_timestamps[1:])
+        ):
+            raise ValueError(f"tool step {index} timestamps must be non-decreasing")
         start = _finite(raw.get("start_time"), f"tool step {index} start_time")
         end = _finite(raw.get("end_time"), f"tool step {index} end_time")
         if end <= start:
@@ -391,8 +403,67 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
             estimated_visual_tokens=int(raw.get("estimated_visual_tokens") or 0),
             latency_s=0.0,
         )
-        steps.append(CachedFrameStep(request, observation))
+        steps.append(
+            CachedFrameStep(
+                request,
+                observation,
+                source_frame_count=len(paths),
+                subsample_indices=tuple(range(len(paths))),
+            )
+        )
     return tuple(steps)
+
+
+def _uniform_subsample_indices(source_count: int, retained_count: int) -> tuple[int, ...]:
+    if source_count <= 0 or retained_count <= 0 or retained_count > source_count:
+        raise ValueError("frame subsample counts are invalid")
+    if retained_count == source_count:
+        return tuple(range(source_count))
+    if retained_count == 1:
+        return ((source_count - 1) // 2,)
+    return tuple(
+        (index * (source_count - 1) + (retained_count - 1) // 2)
+        // (retained_count - 1)
+        for index in range(retained_count)
+    )
+
+
+def _cap_cached_frame_step(
+    cached: CachedFrameStep, max_frames_per_call: int
+) -> CachedFrameStep:
+    source_count = len(cached.observation.frame_paths)
+    if source_count <= max_frames_per_call:
+        return cached
+    indices = _uniform_subsample_indices(source_count, max_frames_per_call)
+    request = FrameRequest(
+        start_time=cached.request.start_time,
+        end_time=cached.request.end_time,
+        nframes=len(indices),
+        resize=cached.request.resize,
+        evidence_request=cached.request.evidence_request,
+    )
+    visual_tokens = cached.observation.estimated_visual_tokens
+    if visual_tokens:
+        visual_tokens = max(1, round(visual_tokens * len(indices) / source_count))
+    observation = FrameObservation(
+        request=request,
+        resolved_start_time=cached.observation.resolved_start_time,
+        resolved_end_time=cached.observation.resolved_end_time,
+        resolved_nframes=len(indices),
+        frame_paths=tuple(cached.observation.frame_paths[index] for index in indices),
+        timestamps=tuple(cached.observation.timestamps[index] for index in indices),
+        backend=cached.observation.backend,
+        cache_hit=cached.observation.cache_hit,
+        estimated_visual_tokens=visual_tokens,
+        latency_s=cached.observation.latency_s,
+    )
+    return CachedFrameStep(
+        request=request,
+        observation=observation,
+        source_frame_count=source_count,
+        subsample_indices=indices,
+        frame_cap_applied=True,
+    )
 
 
 def _tool_target(request: FrameRequest) -> str:
@@ -416,12 +487,23 @@ class ReplayConfig:
     temperature: float = 0.0
     enable_thinking: bool = False
     local_media_transport: str = "file_url"
+    max_frames_per_call: int = 128
+    request_timeout_s: float = 300.0
 
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("model cannot be empty")
         if self.perception_max_tokens <= 0:
             raise ValueError("perception_max_tokens must be positive")
+        if self.max_frames_per_call <= 0:
+            raise ValueError("max_frames_per_call must be positive")
+        if (
+            isinstance(self.request_timeout_s, bool)
+            or not isinstance(self.request_timeout_s, (int, float))
+            or not math.isfinite(float(self.request_timeout_s))
+            or self.request_timeout_s <= 0
+        ):
+            raise ValueError("request_timeout_s must be positive and finite")
         if self.temperature != 0.0 or self.enable_thinking:
             raise ValueError(
                 "cached Perception replay must be greedy with thinking disabled"
@@ -440,6 +522,10 @@ class ReplayConfig:
                 "temperature": self.temperature,
                 "enable_thinking": self.enable_thinking,
                 "local_media_transport": self.local_media_transport,
+                "max_frames_per_call": self.max_frames_per_call,
+                "frame_subsample_policy": FRAME_SUBSAMPLE_POLICY,
+                "frame_subsample_version": FRAME_SUBSAMPLE_VERSION,
+                "request_timeout_s": float(self.request_timeout_s),
                 "perception_prompt": "build_perception_messages_v1",
                 "memory_merge": "EvidenceMemory.merge_v1",
                 "implementation_dependencies": (
@@ -455,6 +541,11 @@ class PerceptionMemoryReplay:
     def __init__(self, client: ChatClient, config: ReplayConfig | None = None) -> None:
         self.client = client
         self.config = config or ReplayConfig()
+        client_timeout = getattr(client, "timeout", None)
+        if client_timeout is not None and not math.isclose(
+            float(client_timeout), float(self.config.request_timeout_s)
+        ):
+            raise ValueError("client timeout differs from ReplayConfig.request_timeout_s")
 
     def replay(
         self,
@@ -501,7 +592,10 @@ class PerceptionMemoryReplay:
 
         duration = max(item.request.end_time for item in steps)
         video_metadata = {"duration": duration, "width": 0, "height": 0}
-        for step_index, cached in enumerate(steps):
+        for step_index, source_cached in enumerate(steps):
+            cached = _cap_cached_frame_step(
+                source_cached, self.config.max_frames_per_call
+            )
             controller_messages = build_controller_messages(
                 sample, memory, video_metadata
             )
@@ -568,6 +662,11 @@ class PerceptionMemoryReplay:
                     "request": cached.request.to_tool_arguments(),
                     "frame_paths": list(cached.observation.frame_paths),
                     "timestamps": list(cached.observation.timestamps),
+                    "source_frame_count": cached.source_frame_count,
+                    "frame_cap_applied": cached.frame_cap_applied,
+                    "subsample_indices": list(cached.subsample_indices),
+                    "subsample_policy": cached.subsample_policy,
+                    "subsample_version": cached.subsample_version,
                     "perception": state.to_dict(),
                     "perception_response": state.to_dict(),
                     "memory_after": memory.to_dict(),
@@ -578,9 +677,19 @@ class PerceptionMemoryReplay:
                     "source_perception_evidence_sufficient": state.evidence_sufficient,
                 }
             )
-            tool_steps.append(
-                asdict(ToolStep.from_observation("perception", cached.observation))
+            tool_step = asdict(
+                ToolStep.from_observation("perception", cached.observation)
             )
+            tool_step.update(
+                {
+                    "source_frame_count": cached.source_frame_count,
+                    "frame_cap_applied": cached.frame_cap_applied,
+                    "subsample_indices": list(cached.subsample_indices),
+                    "subsample_policy": cached.subsample_policy,
+                    "subsample_version": cached.subsample_version,
+                }
+            )
+            tool_steps.append(tool_step)
 
         prompt_tokens = sum(
             int(item["usage"].get("prompt_tokens", 0) or 0) for item in trace
@@ -621,6 +730,7 @@ class PerceptionMemoryReplay:
                 "choices": dict(sample.choices),
             },
             "model": self.config.model,
+            "request_timeout_s": float(self.config.request_timeout_s),
             "candidate_answer": sample.candidate_answer,
             "candidate_rerun": 0,
             "annotation_leak_check": "passed",
@@ -714,6 +824,7 @@ def _failure_row(
         "diagnostics_gate_sha256": audit_summary_sha256,
         "audit_summary_sha256": audit_summary_sha256,
         "config_sha256": config.fingerprint(),
+        "request_timeout_s": float(config.request_timeout_s),
         "run_fingerprint": canonical_sha256(
             {
                 "config_sha256": config.fingerprint(),

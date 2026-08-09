@@ -188,6 +188,32 @@ def _source(tmp_path: Path, trajectory_id: str = "lvbench:s1:teacher:0") -> dict
     }
 
 
+def _many_frame_source(
+    tmp_path: Path, frame_count: int, *, use_fps: bool = False
+) -> dict:
+    source = _source(tmp_path)
+    frame_paths: list[str] = []
+    for index in range(frame_count):
+        path = (tmp_path / f"many-frame-{index:03d}.jpg").resolve()
+        path.write_bytes(b"cached frame")
+        frame_paths.append(str(path))
+    step = {
+        "start_time": 0.0,
+        "end_time": float(frame_count),
+        "resize": 0.75,
+        "evidence_request": "Observe the full cached interval.",
+        "frame_paths": frame_paths,
+        "actual_timestamps": [float(index) for index in range(frame_count)],
+        "estimated_visual_tokens": frame_count * 10,
+    }
+    if use_fps:
+        step["fps"] = 1.0
+    else:
+        step["nframes"] = frame_count
+    source["tool_steps"] = [step]
+    return source
+
+
 def test_replay_uses_only_current_cached_frames_and_merges_memory(
     tmp_path: Path,
 ) -> None:
@@ -205,7 +231,7 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(
     )
 
     assert result["scoring_deferred"] is True
-    assert result["trajectory_id"].endswith(":perception_memory_replay_v2")
+    assert result["trajectory_id"].endswith(":perception_memory_replay_v3")
     assert (
         result["perception_normalization_version"] == PERCEPTION_NORMALIZATION_VERSION
     )
@@ -345,6 +371,16 @@ def test_cached_replay_fails_on_missing_or_mismatched_frames(tmp_path: Path) -> 
     source["tool_steps"][0]["frame_paths"] = [str(tmp_path / "missing.jpg")]
     with pytest.raises(FileNotFoundError, match="cached frame does not exist"):
         cached_frame_steps(source)
+    source = _source(tmp_path)
+    source["tool_steps"][0]["actual_timestamps"] = [2.0]
+    source["tool_steps"][1]["actual_timestamps"] = [2.0, 1.0]
+    source["tool_steps"][1]["frame_paths"] = [
+        source["tool_steps"][0]["frame_paths"][0],
+        source["tool_steps"][1]["frame_paths"][0],
+    ]
+    source["tool_steps"][1]["nframes"] = 2
+    with pytest.raises(ValueError, match="timestamps must be non-decreasing"):
+        cached_frame_steps(source)
 
 
 def test_replay_validates_every_raw_fact_before_compaction(tmp_path: Path) -> None:
@@ -362,6 +398,107 @@ def test_replay_validates_every_raw_fact_before_compaction(tmp_path: Path) -> No
         )
 
 
+def test_cached_replay_frame_cap_is_boundary_safe_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    boundary = cached_frame_steps(_many_frame_source(tmp_path, 128))[0]
+    assert replay_module._cap_cached_frame_step(boundary, 128) is boundary
+    assert boundary.frame_cap_applied is False
+    assert boundary.subsample_indices == tuple(range(128))
+    assert boundary.subsample_policy == "uniform_nearest"
+    assert boundary.subsample_version == "v1"
+
+    source = _many_frame_source(tmp_path, 129, use_fps=True)
+    cached = cached_frame_steps(source)[0]
+    first = replay_module._cap_cached_frame_step(cached, 128)
+    second = replay_module._cap_cached_frame_step(cached, 128)
+
+    assert first == second
+    assert first.frame_cap_applied is True
+    assert first.source_frame_count == 129
+    assert first.subsample_indices == tuple(
+        (index * 128 + 63) // 127 for index in range(128)
+    )
+    assert first.request.nframes == 128 and first.request.fps is None
+    assert first.observation.resolved_nframes == 128
+    assert first.observation.frame_paths[0].endswith("many-frame-000.jpg")
+    assert first.observation.frame_paths[-1].endswith("many-frame-128.jpg")
+    assert first.observation.timestamps[0] == 0.0
+    assert first.observation.timestamps[-1] == 128.0
+    assert first.observation.estimated_visual_tokens == 1280
+
+
+def test_capped_tool_target_and_frames_round_trip_to_process_sft(
+    tmp_path: Path,
+) -> None:
+    client = FakeClient(
+        [_state((0.0, 129.0), "The person opens the door.", sufficient=True)]
+    )
+    result = PerceptionMemoryReplay(client).replay(
+        _many_frame_source(tmp_path, 129, use_fps=True),
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    tool_payload = json.loads(
+        result["request_trace"][0]["content"]
+        .removeprefix("<tool_call>")
+        .removesuffix("</tool_call>")
+    )
+    assert tool_payload["arguments"]["nframes"] == 128
+    assert "fps" not in tool_payload["arguments"]
+    assert result["tool_steps"][0]["source_frame_count"] == 129
+    assert result["tool_steps"][0]["frame_cap_applied"] is True
+    assert result["tool_steps"][0]["subsample_policy"] == "uniform_nearest"
+    assert result["tool_steps"][0]["subsample_version"] == "v1"
+    assert len(result["tool_steps"][0]["subsample_indices"]) == 128
+    assert result["tool_steps"][0]["nframes"] == 128
+    assert len(result["tool_steps"][0]["frame_paths"]) == 128
+    assert result["tool_steps"][0]["visual_tokens"] == 1280
+    assert result["perception_states"][0]["source_frame_count"] == 129
+    assert result["perception_states"][0]["frame_cap_applied"] is True
+    assert result["perception_states"][0]["subsample_indices"] == result[
+        "tool_steps"
+    ][0]["subsample_indices"]
+    assert (
+        sum(
+            item.get("type") == "image_url"
+            for item in client.calls[0]["messages"][-1]["content"]
+        )
+        == 128
+    )
+
+    result["_selection_stable"] = True
+    result["prediction"] = result["final_prediction"] = "B"
+    result["perception_states"][0]["evidence_complete"] = True
+    judge_messages = [
+        {"role": "system", "content": "Judge only the supplied evidence."},
+        {"role": "user", "content": "Use evidence E0001."},
+    ]
+    result["perception_states"][0]["judge_confirmations"] = [
+        {
+            "judge_seed": seed,
+            "prediction": "B",
+            "evidence_ids": ["E0001"],
+            "raw_response": '{"answer":"B","evidence_ids":["E0001"]}',
+            "request_messages": judge_messages,
+            "evidence_complete": True,
+            "annotation_leak_check": "passed",
+            "error": None,
+        }
+        for seed in (17, 42, 73)
+    ]
+    records = build_perception_memory_sft_records(result)
+    exported_tool = json.loads(
+        records[0]["messages"][-1]["content"]
+        .removeprefix("<tool_call>")
+        .removesuffix("</tool_call>")
+    )
+    assert exported_tool["arguments"]["nframes"] == 128
+    assert "fps" not in exported_tool["arguments"]
+    assert len(records[1]["images"]) == 128
+
+
 def test_replay_fingerprint_includes_semantic_source_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -375,6 +512,8 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
     assert all(len(value) == 64 for value in dependencies.values())
 
     baseline = ReplayConfig().fingerprint()
+    assert ReplayConfig(max_frames_per_call=127).fingerprint() != baseline
+    assert ReplayConfig(request_timeout_s=299).fingerprint() != baseline
     monkeypatch.setattr(
         replay_module,
         "replay_implementation_dependency_hashes",

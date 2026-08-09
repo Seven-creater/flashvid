@@ -19,7 +19,7 @@ from flashvid_eval.flashvid_hybrid import (
 )
 from flashvid_eval.fast_hybrid_eva import FastHybridEvaEvaluator, OFFICIAL_EVA_COMMIT
 from flashvid_eval.perception_memory_eva import (
-    RESCUE_TRAJECTORY_VARIANTS,
+    DURATION_RESCUE_TRAJECTORY_VARIANTS,
     PerceptionMemoryEvaEvaluator,
 )
 from flashvid_eval.offline_budget import normalize_candidate
@@ -161,7 +161,7 @@ def _validate_perception_memory_variant(value: str) -> str:
     """Accept only the base schedule or a pre-registered duration-only rescue."""
 
     variant = str(value).strip()
-    allowed = {"base", *RESCUE_TRAJECTORY_VARIANTS}
+    allowed = {"base", *DURATION_RESCUE_TRAJECTORY_VARIANTS}
     if variant not in allowed:
         raise ValueError(
             "perception_memory_eva trajectory-variant-id must be one of: "
@@ -178,7 +178,7 @@ def _candidate_superset_allowed(
     return bool(
         backend == "perception_memory_eva"
         and defer_scoring
-        and trajectory_variant_id in RESCUE_TRAJECTORY_VARIANTS
+        and trajectory_variant_id in DURATION_RESCUE_TRAJECTORY_VARIANTS
     )
 
 

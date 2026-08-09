@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -11,10 +12,12 @@ from scripts.evaluate_mcq import (
 )
 from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_eva import (
+    DURATION_RESCUE_TRAJECTORY_VARIANTS,
     EvidenceDecision,
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
     PerceptionMemoryEvaEvaluator,
+    REPAIR_ONLY_TRAJECTORY_VARIANTS,
     RESCUE_TRAJECTORY_VARIANTS,
     apply_candidate_gate,
     build_completeness_messages,
@@ -23,6 +26,7 @@ from flashvid_eval.perception_memory_eva import (
     build_judge_messages,
     build_perception_messages,
     duplicate_interval,
+    explicit_time_rescue_request,
     interval_iou,
     messages_have_media,
     parse_completeness,
@@ -479,7 +483,12 @@ class _DurationOnlySession:
 
     def select(self, request: FrameRequest) -> FrameObservation:
         self.requests.append(request)
-        count = int(request.nframes or 1)
+        count = int(
+            request.nframes
+            or math.ceil(
+                (request.end_time - request.start_time) * float(request.fps or 1.0)
+            )
+        )
         if count == 1:
             timestamps = ((request.start_time + request.end_time) / 2.0,)
         else:
@@ -533,13 +542,147 @@ def test_rescue_frame_request_is_duration_only_and_pre_registered(
     assert request is not None
     assert (request.start_time, request.end_time, request.nframes) == expected
     assert request.resize == 0.75
-    assert set(RESCUE_TRAJECTORY_VARIANTS) == {
+    assert set(DURATION_RESCUE_TRAJECTORY_VARIANTS) == {
         "rescue_global32",
         "rescue_global64",
         "rescue_first_half64",
         "rescue_second_half64",
     }
+    assert REPAIR_ONLY_TRAJECTORY_VARIANTS == {"rescue_explicit_time"}
+    assert RESCUE_TRAJECTORY_VARIANTS == {
+        *DURATION_RESCUE_TRAJECTORY_VARIANTS,
+        *REPAIR_ONLY_TRAJECTORY_VARIANTS,
+    }
     assert rescue_frame_request("base", 100.0) is None
+
+
+def test_explicit_time_rescue_uses_public_question_seconds_and_proves_mismatch() -> None:
+    request, audit = explicit_time_rescue_request(
+        "What happens at 65:02?",
+        4000.0,
+        [[65.02, 65.29]],
+    )
+
+    assert request.to_tool_arguments() == {
+        "start_time": 3901.0,
+        "end_time": 3903.0,
+        "resize": 1.0,
+        "fps": 4.0,
+        "evidence_request": request.evidence_request,
+    }
+    assert audit == {
+        "mode": "rescue_explicit_time",
+        "parsed_time_source": "public_question",
+        "parsed_time_range": [3901.0, 3903.0],
+        "selected_interval": [3901.0, 3903.0],
+        "source_requested_intervals": [[65.02, 65.29]],
+        "source_interval_mismatch": True,
+        "sampling": {"fps": 4.0},
+        "max_frames": 96,
+    }
+
+
+def test_explicit_time_rescue_caps_long_public_interval_at_96_frames() -> None:
+    request, audit = explicit_time_rescue_request(
+        "What happens from 65:02 to 66:02?",
+        4100.0,
+        [[65.02, 66.02]],
+    )
+
+    assert (request.start_time, request.end_time) == (3901.0, 3963.0)
+    assert request.nframes == 96
+    assert request.fps is None
+    assert audit["sampling"] == {"nframes": 96}
+
+
+def test_explicit_time_rescue_fails_closed_without_repair_mismatch() -> None:
+    with pytest.raises(ValueError, match="source interval mismatch"):
+        explicit_time_rescue_request(
+            "What happens at 65:02?",
+            4000.0,
+            [[3901.0, 3903.0]],
+        )
+    with pytest.raises(ValueError, match="repair source requested intervals"):
+        explicit_time_rescue_request("What happens at 65:02?", 4000.0, None)
+
+
+def test_explicit_time_rescue_is_private_free_official_and_controller_resumes(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    sample = ModelSample(
+        dataset="lvbench",
+        sample_id="explicit-65m",
+        video="video.mp4",
+        question="What happens at 65:02?",
+        choices={"A": "Sits down", "B": "Walks outside"},
+        candidate_answer="B",
+    )
+    session = _DurationOnlySession(tmp_path, duration=4000.0)
+    client = _FakeClient(
+        [
+            _state_json(
+                interval=(3901.0, 3903.0),
+                fact_time=3901.0,
+            ),
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=2,
+        scoring_deferred=True,
+        train600_manifest_sha256="3" * 64,
+        trajectory_schedule_id="repair-explicit-time-v1",
+        trajectory_variant_id="rescue_explicit_time",
+    )
+
+    result = evaluator.run(
+        sample,
+        rescue_source_requested_intervals=[[65.02, 65.29]],
+    )
+
+    assert result["error"] is None
+    assert result["explicit_time_rescue_audit"]["source_interval_mismatch"] is True
+    assert len(session.requests) == 1
+    request = session.requests[0]
+    assert (request.start_time, request.end_time, request.fps) == (
+        3901.0,
+        3903.0,
+        4.0,
+    )
+    assert request.nframes is None
+    controller_trace = [
+        item for item in result["request_trace"] if item["stage"] == "controller"
+    ]
+    assert controller_trace[0]["deterministic_rescue_action"] is True
+    assert controller_trace[0]["source_cached_action"] is False
+    parsed_action = parse_controller_action(controller_trace[0]["content"])
+    assert parsed_action is not None and parsed_action.request == request
+    assert "deterministic_rescue_action" not in controller_trace[1]
+    assert len(result["tool_steps"][0]["actual_timestamps"]) == 8
+    assert result["tool_steps"][0]["actual_timestamps"] == tuple(
+        sorted(result["tool_steps"][0]["actual_timestamps"])
+    )
+    assert all(
+        3901.0 <= timestamp <= 3903.0
+        for timestamp in result["tool_steps"][0]["actual_timestamps"]
+    )
+    serialized_requests = json.dumps(client.messages, ensure_ascii=False)
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_requests
+    assert "SECRET_ANNOTATION_SENTINEL" not in serialized_requests
+    assert "time_range" not in serialized_requests
+    assert "clue_intervals" not in serialized_requests
+    assert "question_type" not in serialized_requests
+    assert messages_have_media(client.messages[0])
+    assert not messages_have_media(client.messages[1])
 
 
 def test_rescue_first_action_is_private_free_then_controller_resumes_and_is_sft_ready(

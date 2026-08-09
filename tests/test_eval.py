@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from flashvid_eval.answers import extract_answer_letter, extract_strict_answer_letter
 from flashvid_eval.client import ChatResult
 from flashvid_eval.datasets import VideoIndex, load_samples
@@ -169,6 +171,23 @@ def test_agent_time_parser_uses_question_only() -> None:
     assert parse_question_time_range("How is the mood from 44:18-44:21?") == (2658.0, 2661.0)
     assert parse_question_time_range("What happens at 04:40?") == (279.0, 281.0)
     assert parse_question_time_range("When does the first game start? (A) 01:23 (B) 05:15") is None
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("What happens at 65:02?", (3901.0, 3903.0)),
+        ("What happens from 65:02-65:29?", (3902.0, 3929.0)),
+        ("What happens from 1:05:02 to 1:05:29?", (3902.0, 3929.0)),
+        ("What happens during 04:40\u201304:46?", (280.0, 286.0)),
+        ("What happens during 04:40\u201404:46?", (280.0, 286.0)),
+        ("What happens during 04:40 ~ 04:46?", (280.0, 286.0)),
+    ],
+)
+def test_agent_time_parser_supports_long_video_public_formats(
+    question: str, expected: tuple[float, float]
+) -> None:
+    assert parse_question_time_range(question) == expected
 
 
 def test_evidence_model_sample_physically_strips_private_scoring_fields() -> None:

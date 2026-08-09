@@ -17,6 +17,7 @@ from .datasets import VideoIndex
 from .eva_official import select_frames as official_select_frames
 from .media import estimate_visual_tokens, probe_video
 from .privacy import assert_deferred_result_public
+from .question_time import parse_question_time_range
 from .schemas import ModelSample, Sample, ScoringRecord
 
 
@@ -45,32 +46,6 @@ def _content_with_video(video: Path, text: str) -> list[dict[str, Any]]:
         {"type": "video_url", "video_url": {"url": video.as_uri()}},
         {"type": "text", "text": text},
     ]
-
-
-_TIMESTAMP = re.compile(r"(?<!\d)(?:(\d{1,2}):)?([0-5]?\d):([0-5]\d)(?!\d)")
-
-
-def _timestamp_seconds(match: re.Match[str]) -> float:
-    hours = int(match.group(1) or 0)
-    minutes = int(match.group(2))
-    seconds = int(match.group(3))
-    return float(hours * 3600 + minutes * 60 + seconds)
-
-
-def parse_question_time_range(question: str) -> tuple[float, float] | None:
-    """Parse timestamps present in the question text, never dataset metadata."""
-
-    matches = list(_TIMESTAMP.finditer(question))
-    if not matches:
-        return None
-    first = _timestamp_seconds(matches[0])
-    if len(matches) == 1:
-        return max(0.0, first - 1.0), first + 1.0
-    between = question[matches[0].end():matches[1].start()]
-    if not re.search(r"(?:-|\u2013|\u2014|~|to|through|until|from)", between, re.IGNORECASE):
-        return None
-    second = _timestamp_seconds(matches[1])
-    return (min(first, second), max(first, second))
 
 
 def _parse_tool_calls(text: str) -> list[dict[str, Any]]:

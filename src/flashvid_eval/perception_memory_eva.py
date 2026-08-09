@@ -31,6 +31,7 @@ from .qwen_agents.core import (
     ToolStep,
     observation_content,
 )
+from .question_time import parse_question_time_range
 from .schemas import ModelSample
 
 
@@ -40,13 +41,17 @@ _JSON_FENCE_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")
-RESCUE_TRAJECTORY_VARIANTS = frozenset(
+REPAIR_ONLY_TRAJECTORY_VARIANTS = frozenset({"rescue_explicit_time"})
+DURATION_RESCUE_TRAJECTORY_VARIANTS = frozenset(
     {
         "rescue_global32",
         "rescue_global64",
         "rescue_first_half64",
         "rescue_second_half64",
     }
+)
+RESCUE_TRAJECTORY_VARIANTS = frozenset(
+    {*DURATION_RESCUE_TRAJECTORY_VARIANTS, *REPAIR_ONLY_TRAJECTORY_VARIANTS}
 )
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
 
@@ -81,7 +86,87 @@ def _question_text(sample: ModelSample) -> str:
     return f"Question: {sample.question}\nChoices:\n{options}"
 
 
-def rescue_frame_request(variant: str, video_duration: float) -> FrameRequest | None:
+def _source_requested_intervals(
+    value: Sequence[Sequence[float]] | None,
+) -> tuple[tuple[float, float], ...]:
+    if not value:
+        raise ValueError(
+            "rescue_explicit_time requires repair source requested intervals"
+        )
+    intervals: list[tuple[float, float]] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            raise ValueError(f"source requested interval {index} must be an array")
+        if len(raw) != 2:
+            raise ValueError(f"source requested interval {index} must have two values")
+        start = _finite_number(raw[0], f"source requested interval {index} start")
+        end = _finite_number(raw[1], f"source requested interval {index} end")
+        if end <= start:
+            raise ValueError(f"source requested interval {index} is invalid")
+        intervals.append((start, end))
+    return tuple(intervals)
+
+
+def explicit_time_rescue_request(
+    question: str,
+    video_duration: float,
+    source_requested_intervals: Sequence[Sequence[float]] | None,
+) -> tuple[FrameRequest, dict[str, Any]]:
+    """Build one dense, question-time rescue request with source-mismatch proof."""
+
+    duration = _finite_number(video_duration, "video_duration")
+    if duration <= 0:
+        raise ValueError("video_duration must be positive")
+    parsed = parse_question_time_range(question)
+    selected = parse_question_time_range(question, padding_s=1.0)
+    if parsed is None or selected is None:
+        raise ValueError("rescue_explicit_time requires a public question timestamp")
+    source_intervals = _source_requested_intervals(source_requested_intervals)
+    source_mismatch = all(
+        max(parsed[0], source[0]) >= min(parsed[1], source[1])
+        for source in source_intervals
+    )
+    if not source_mismatch:
+        raise ValueError(
+            "rescue_explicit_time requires a source interval mismatch"
+        )
+
+    start = max(0.0, selected[0])
+    end = min(duration, selected[1])
+    if start >= duration or end <= start:
+        raise ValueError("question timestamp is outside the video duration")
+    requested_frames = max(1, int(math.ceil((end - start) * 4.0)))
+    sampling = {"fps": 4.0} if requested_frames <= 96 else {"nframes": 96}
+    request = FrameRequest(
+        start_time=start,
+        end_time=end,
+        resize=1.0,
+        evidence_request=(
+            "Record the directly visible action, state change, ordering, count, "
+            "or text needed to distinguish the answer options at the explicit "
+            "time stated in the public question."
+        ),
+        **sampling,
+    )
+    return request, {
+        "mode": "rescue_explicit_time",
+        "parsed_time_source": "public_question",
+        "parsed_time_range": list(parsed),
+        "selected_interval": [start, end],
+        "source_requested_intervals": [list(item) for item in source_intervals],
+        "source_interval_mismatch": True,
+        "sampling": sampling,
+        "max_frames": 96,
+    }
+
+
+def rescue_frame_request(
+    variant: str,
+    video_duration: float,
+    *,
+    question: str | None = None,
+    source_requested_intervals: Sequence[Sequence[float]] | None = None,
+) -> FrameRequest | None:
     """Return one annotation-free, duration-only rescue coverage request."""
 
     name = str(variant).strip()
@@ -89,6 +174,13 @@ def rescue_frame_request(variant: str, video_duration: float) -> FrameRequest | 
         return None
     if name not in RESCUE_TRAJECTORY_VARIANTS:
         raise ValueError(f"unsupported Perception-Memory trajectory variant: {name}")
+    if name == "rescue_explicit_time":
+        if question is None:
+            raise ValueError("rescue_explicit_time requires the public question")
+        request, _audit = explicit_time_rescue_request(
+            question, video_duration, source_requested_intervals
+        )
+        return request
     duration = _finite_number(video_duration, "video_duration")
     if duration <= 0:
         raise ValueError("video_duration must be positive")
@@ -1065,6 +1157,7 @@ class PerceptionMemoryEvaEvaluator:
             source,
             package_root / "privacy.py",
             package_root / "eva_official.py",
+            package_root / "question_time.py",
             package_root / "qwen_agents" / "core.py",
         )
         implementation_hashes = {
@@ -1226,7 +1319,12 @@ class PerceptionMemoryEvaEvaluator:
             content, sample.option_letters, memory.evidence_ids
         )
 
-    def run(self, sample: ModelSample) -> dict[str, Any]:
+    def run(
+        self,
+        sample: ModelSample,
+        *,
+        rescue_source_requested_intervals: Sequence[Sequence[float]] | None = None,
+    ) -> dict[str, Any]:
         request_trace: list[dict[str, Any]] = []
         tool_steps: list[dict[str, Any]] = []
         perception_states: list[dict[str, Any]] = []
@@ -1242,6 +1340,7 @@ class PerceptionMemoryEvaEvaluator:
         error: str | None = None
         annotation_check = "passed"
         tool_latency = 0.0
+        explicit_time_rescue_audit: dict[str, Any] | None = None
 
         try:
             video = self.index.resolve(sample.video)
@@ -1249,14 +1348,26 @@ class PerceptionMemoryEvaEvaluator:
                 video, f"pm-{sample.dataset}-{sample.sample_id}"
             )
             feedback = ""
-            rescue_request = (
-                rescue_frame_request(
+            rescue_request = None
+            if (
+                self.scoring_deferred
+                and self.trajectory_variant_id == "rescue_explicit_time"
+            ):
+                rescue_request, explicit_time_rescue_audit = (
+                    explicit_time_rescue_request(
+                        sample.question,
+                        float(session.metadata["duration"]),
+                        rescue_source_requested_intervals,
+                    )
+                )
+            elif (
+                self.scoring_deferred
+                and self.trajectory_variant_id
+                in DURATION_RESCUE_TRAJECTORY_VARIANTS
+            ):
+                rescue_request = rescue_frame_request(
                     self.trajectory_variant_id, float(session.metadata["duration"])
                 )
-                if self.scoring_deferred
-                and self.trajectory_variant_id in RESCUE_TRAJECTORY_VARIANTS
-                else None
-            )
             for turn in range(self.max_turns):
                 if turn == 0 and rescue_request is not None:
                     controller_messages = build_controller_messages(
@@ -1282,8 +1393,15 @@ class PerceptionMemoryEvaEvaluator:
                             "step_index": turn,
                             "prefix_index": -1,
                             "prompt_hash": _messages_sha256(controller_messages),
-                            "source_cached_action": True,
+                            "source_cached_action": (
+                                self.trajectory_variant_id
+                                in DURATION_RESCUE_TRAJECTORY_VARIANTS
+                            ),
+                            "deterministic_rescue_action": True,
                             "trajectory_variant_id": self.trajectory_variant_id,
+                            "explicit_time_rescue_audit": copy.deepcopy(
+                                explicit_time_rescue_audit
+                            ),
                         }
                     )
                 else:
@@ -1626,6 +1744,7 @@ class PerceptionMemoryEvaEvaluator:
             "train600_manifest_sha256": self.train600_manifest_sha256,
             "config_sha256": self.experiment_config_sha256 or self.run_fingerprint(),
             "scoring_deferred": self.scoring_deferred,
+            "explicit_time_rescue_audit": explicit_time_rescue_audit,
             "dataset": sample.dataset,
             "sample_id": sample.sample_id,
             "candidate_answer": candidate,
@@ -1683,6 +1802,7 @@ class PerceptionMemoryEvaEvaluator:
 __all__ = [
     "CompletenessDecision",
     "ControllerAction",
+    "DURATION_RESCUE_TRAJECTORY_VARIANTS",
     "EvidenceDecision",
     "EvidenceMemory",
     "FinalDecision",
@@ -1691,6 +1811,7 @@ __all__ = [
     "PerceptionMemoryEvaEvaluator",
     "PerceptionState",
     "PERCEPTION_NORMALIZATION_VERSION",
+    "REPAIR_ONLY_TRAJECTORY_VARIANTS",
     "RESCUE_TRAJECTORY_VARIANTS",
     "TimestampedFact",
     "apply_candidate_gate",
@@ -1700,6 +1821,7 @@ __all__ = [
     "build_judge_messages",
     "build_perception_messages",
     "duplicate_interval",
+    "explicit_time_rescue_request",
     "interval_iou",
     "messages_have_media",
     "parse_completeness",

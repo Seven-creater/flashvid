@@ -32,6 +32,7 @@ from .perception_memory_eva import (
 )
 from .privacy import AnnotationLeakError, assert_annotation_free_request
 from .qwen_agents.core import ChatClient, FrameObservation, FrameRequest, ToolStep
+from .runner import parse_question_time_range
 from .schemas import ModelSample
 
 
@@ -98,6 +99,7 @@ def replay_implementation_dependency_hashes() -> dict[str, str]:
         "perception_memory_eva": package_root / "perception_memory_eva.py",
         "privacy": package_root / "privacy.py",
         "qwen_agent_core": package_root / "qwen_agents" / "core.py",
+        "runner": package_root / "runner.py",
     }
     missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
@@ -326,6 +328,38 @@ class CachedFrameStep:
     subsample_policy: str = FRAME_SUBSAMPLE_POLICY
     subsample_version: str = FRAME_SUBSAMPLE_VERSION
     frame_cap_applied: bool = False
+
+
+class SourceExplicitTimeParseMismatch(ValueError):
+    """Reject cached evidence selected from a misparsed explicit question time."""
+
+    failure_type = "source_explicit_time_parse_mismatch"
+
+    def __init__(
+        self,
+        expected_interval: tuple[float, float],
+        requested_intervals: Sequence[tuple[float, float]],
+    ) -> None:
+        super().__init__(
+            "cached requests do not cover the correctly parsed explicit question time"
+        )
+        self.expected_interval = expected_interval
+        self.requested_intervals = tuple(requested_intervals)
+
+
+def _reject_misparsed_explicit_time_source(
+    sample: ModelSample, steps: Sequence[CachedFrameStep]
+) -> None:
+    expected = parse_question_time_range(sample.question)
+    if expected is None:
+        return
+    requested = tuple(
+        (step.request.start_time, step.request.end_time) for step in steps
+    )
+    expected_start, expected_end = expected
+    if any(start <= expected_end and end >= expected_start for start, end in requested):
+        return
+    raise SourceExplicitTimeParseMismatch(expected, requested)
 
 
 def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
@@ -557,7 +591,12 @@ def _perception_model_target(
 
 
 def _retry_perception_messages(
-    messages: Sequence[Mapping[str, Any]], reason: str
+    messages: Sequence[Mapping[str, Any]],
+    reason: str,
+    *,
+    valid_letters: Sequence[str],
+    frame_count: int,
+    interval: tuple[float, float],
 ) -> list[dict[str, Any]]:
     retry = copy.deepcopy(list(messages))
     if len(retry) != 2 or retry[-1].get("role") != "user":
@@ -565,12 +604,39 @@ def _retry_perception_messages(
     content = retry[-1].get("content")
     if not isinstance(content, list):
         raise ValueError("perception retry requires multimodal user content")
+    letters = tuple(str(letter).strip().upper() for letter in valid_letters)
+    if not letters or len(set(letters)) != len(letters):
+        raise ValueError("perception retry requires unique valid option letters")
+    if frame_count <= 0:
+        raise ValueError("perception retry requires a positive frame count")
+    start = _finite(interval[0], "perception retry interval start")
+    end = _finite(interval[1], "perception retry interval end")
+    if end <= start:
+        raise ValueError("perception retry interval must be increasing")
+    skeleton = {
+        "interval": [start, end],
+        "timestamped_facts": [],
+        "option_evidence": {
+            letter: {"supports": [], "contradicts": []} for letter in letters
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+        "evidence_sufficient": False,
+        "next_evidence_needed": "",
+    }
     correction = (
-        "Correction: the previous response was invalid or incomplete. Return one "
-        "compact raw JSON object only. In timestamped_facts, use the zero-based "
-        "frame_index printed immediately beside each image; do not use timestamp "
-        "seconds as frame_index. Use no more than 12 facts and preserve the exact "
-        "required schema."
+        f"Correction after {reason or 'invalid_json_or_schema'}: return one compact "
+        "raw JSON object only. The current observation contains exactly "
+        f"{frame_count} frames, so every timestamped_facts item must be exactly "
+        f'{{"frame_index": <integer 0 through {frame_count - 1}>, '
+        '"fact": "<directly visible fact>"}}. do not use timestamp seconds as '
+        f"frame_index. Use no more than 6 facts. Copy interval exactly as "
+        f"[{start}, {end}]. option_evidence must contain exactly "
+        f"{', '.join(letters)}; every option value must be an object with exactly "
+        "supports and contradicts string arrays. A bare list as an option value is "
+        "forbidden. Preserve every top-level key and its type. Use this exact JSON "
+        "skeleton, replacing only arrays, the boolean, and next_evidence_needed: "
+        + json.dumps(skeleton, ensure_ascii=False, separators=(",", ":"))
     )
     content.append({"type": "text", "text": correction})
     return retry
@@ -679,6 +745,7 @@ class PerceptionMemoryReplay:
     ) -> dict[str, Any]:
         sample = public_model_sample(source)
         steps = cached_frame_steps(source)
+        _reject_misparsed_explicit_time_source(sample, steps)
         source_trajectory_id = _nonempty(
             source.get("trajectory_id"), "source trajectory_id"
         )
@@ -757,7 +824,14 @@ class PerceptionMemoryReplay:
                     perception_messages
                     if attempt_index == 0
                     else _retry_perception_messages(
-                        perception_messages, retry_reason or ""
+                        perception_messages,
+                        retry_reason or "",
+                        valid_letters=sample.option_letters,
+                        frame_count=len(cached.observation.timestamps),
+                        interval=(
+                            cached.observation.resolved_start_time,
+                            cached.observation.resolved_end_time,
+                        ),
                     )
                 )
                 assert_annotation_free_request({"messages": attempt_messages})
@@ -1002,7 +1076,7 @@ def _failure_row(
     dataset, sample_id, source_id = _source_identity(source)
     annotation = "failed" if isinstance(error, AnnotationLeakError) else "passed"
     error_type = str(getattr(error, "failure_type", type(error).__name__))
-    return {
+    row = {
         "schema_version": 1,
         "backend": "perception_memory_replay",
         "agent_version": REPLAY_VERSION,
@@ -1035,6 +1109,17 @@ def _failure_row(
         "error": f"{error_type}: {error}",
         "error_type": error_type,
     }
+    if isinstance(error, SourceExplicitTimeParseMismatch):
+        row.update(
+            {
+                "source_explicit_time_parse_mismatch": True,
+                "question_explicit_time_range": list(error.expected_interval),
+                "source_requested_intervals": [
+                    list(interval) for interval in error.requested_intervals
+                ],
+            }
+        )
+    return row
 
 
 def replay_jsonl(

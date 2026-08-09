@@ -348,6 +348,16 @@ def test_binder_rejects_explanation_and_multiple_json_fences(wrapped: str) -> No
     [
         ('{"interval":[0', "length", "finish_reason_length"),
         ("not json", "stop", "invalid_json_or_schema"),
+        (
+            '{"option_evidence":{"A":["supports":["visible"]]}}',
+            "stop",
+            "invalid_json_or_schema",
+        ),
+        (
+            '{"interval":[0,10],"timestamped_facts":[]',
+            "stop",
+            "invalid_json_or_schema",
+        ),
     ],
 )
 def test_replay_retries_one_malformed_response_with_audit_trace(
@@ -417,6 +427,152 @@ def test_replay_rejects_timestamp_seconds_as_frame_index_and_corrects_prompt(
     assert attempts[0]["retry_reason"] == "invalid_json_or_schema"
     assert attempts[0]["prompt_hash"] != attempts[1]["prompt_hash"]
     assert attempts[0]["retry_group_id"] == attempts[1]["retry_group_id"]
+
+
+@pytest.mark.parametrize(
+    "invalid_option_evidence",
+    [
+        {"A": [], "B": [], "C": []},
+        {
+            "A": {"supports": [], "contradicts": []},
+            "B": [],
+            "C": {"supports": [], "contradicts": []},
+        },
+        {
+            "A": {"supports": []},
+            "B": {"supports": [], "contradicts": []},
+            "C": {"supports": [], "contradicts": []},
+        },
+        {
+            "A": {"supports": "visible", "contradicts": []},
+            "B": {"supports": [], "contradicts": []},
+            "C": {"supports": [], "contradicts": []},
+        },
+        {
+            "A": {"supports": [], "contradicts": []},
+            "B": {"supports": [], "contradicts": []},
+        },
+        {
+            "A": {"supports": [], "contradicts": []},
+            "B": {"supports": [], "contradicts": []},
+            "C": {"supports": [], "contradicts": []},
+            "D": {"supports": [], "contradicts": []},
+        },
+        [],
+    ],
+    ids=[
+        "all-bare-lists",
+        "one-bare-list",
+        "missing-contradicts",
+        "supports-not-array",
+        "missing-valid-option",
+        "extra-option",
+        "option-evidence-not-object",
+    ],
+)
+def test_retry_prompt_repairs_observed_option_evidence_schema_failures(
+    tmp_path: Path, invalid_option_evidence: Any
+) -> None:
+    source = _timestamp_index_source(tmp_path)
+    source["public_sample"]["choices"] = {
+        "A": "waits",
+        "B": "opens the door",
+        "C": "walks away",
+    }
+    invalid = json.loads(
+        _indexed_state((3000.0, 3020.0), 0, "The person opens the door.")
+    )
+    invalid["option_evidence"] = invalid_option_evidence
+    valid = json.loads(
+        _indexed_state((3000.0, 3020.0), 0, "The person opens the door.")
+    )
+    valid["option_evidence"]["C"] = {"supports": [], "contradicts": []}
+    client = FakeClient([json.dumps(invalid), json.dumps(valid)])
+
+    result = PerceptionMemoryReplay(client).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    retry_prompt = json.dumps(client.calls[1]["messages"], ensure_ascii=False)
+    assert "exactly 2 frames" in retry_prompt
+    assert "integer 0 through 1" in retry_prompt
+    assert "no more than 6 facts" in retry_prompt
+    assert "Copy interval exactly as [3000.0, 3020.0]" in retry_prompt
+    assert "A, B, C" in retry_prompt
+    assert "A bare list as an option value is forbidden" in retry_prompt
+    for letter in ("A", "B", "C"):
+        assert (
+            f'\\"{letter}\\":{{\\"supports\\":[],\\"contradicts\\":[]}}' in retry_prompt
+        )
+    assert result["perception_states"][0]["perception_attempts"] == 2
+
+
+def test_replay_classifies_long_minute_source_time_parse_mismatch_before_model_call(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "source.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    audit = _audit(tmp_path / "audit.json")
+    source = _source(tmp_path)
+    source["public_sample"]["question"] = "What happens at 65:02?"
+    step = source["tool_steps"][0]
+    source["tool_steps"] = [
+        {
+            **step,
+            "start_time": 64.02,
+            "end_time": 66.02,
+            "actual_timestamps": [65.02],
+        }
+    ]
+    source_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    client = FakeClient([])
+
+    summary = replay_jsonl(
+        input_path=source_path,
+        output_path=output_path,
+        audit_summary_path=audit,
+        replayer=PerceptionMemoryReplay(client),
+    )
+
+    row = json.loads(output_path.read_text(encoding="utf-8"))
+    assert summary["failed"] == 1
+    assert row["error_type"] == "source_explicit_time_parse_mismatch"
+    assert row["source_explicit_time_parse_mismatch"] is True
+    assert row["question_explicit_time_range"] == [3901.0, 3903.0]
+    assert row["source_requested_intervals"] == [[64.02, 66.02]]
+    assert row["request_trace"] == []
+    assert client.calls == []
+
+
+def test_replay_accepts_cached_request_covering_long_minute_question_time(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    source["public_sample"]["question"] = "What happens at 65:02?"
+    step = source["tool_steps"][0]
+    source["tool_steps"] = [
+        {
+            **step,
+            "start_time": 3901.0,
+            "end_time": 3903.0,
+            "actual_timestamps": [3902.0],
+        }
+    ]
+    output = _indexed_state((3901.0, 3903.0), 0, "The person opens the door.")
+    client = FakeClient([output])
+
+    result = PerceptionMemoryReplay(client).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    assert result["error"] is None
+    assert result["perception_states"][0]["perception"]["timestamped_facts"] == [
+        {"time": 3902.0, "fact": "The person opens the door."}
+    ]
 
 
 def test_failed_replay_persists_both_raw_attempts(tmp_path: Path) -> None:
@@ -724,6 +880,7 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
         "perception_memory_eva",
         "privacy",
         "qwen_agent_core",
+        "runner",
     }
     assert all(len(value) == 64 for value in dependencies.values())
 

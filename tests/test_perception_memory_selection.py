@@ -7,6 +7,7 @@ import pytest
 
 from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_prefix_judge import bind_prefix_jobs
+from flashvid_eval.perception_memory_eva import PERCEPTION_NORMALIZATION_VERSION
 from flashvid_eval.perception_memory_replay import PerceptionMemoryReplay
 from flashvid_eval.perception_memory_selection import (
     label_and_select_trajectories,
@@ -58,6 +59,7 @@ def _trajectory(
         "scoring_deferred": True,
         "annotation_leak_check": "passed",
         "candidate_rerun": 0,
+        "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
         "candidate_answer": "A",
         "prediction": None,
         "final_prediction": None,

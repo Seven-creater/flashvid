@@ -17,6 +17,7 @@ from flashvid_eval.perception_memory_replay import (
     replay_jsonl,
     validate_badcase_audit_summary,
 )
+from flashvid_eval.perception_memory_eva import PERCEPTION_NORMALIZATION_VERSION
 from flashvid_eval.perception_memory_sft import build_perception_memory_sft_records
 
 
@@ -78,6 +79,33 @@ def _state(interval: tuple[float, float], fact: str, *, sufficient: bool) -> str
             "unresolved": [] if sufficient else ["what happens next"],
             "evidence_sufficient": sufficient,
             "next_evidence_needed": "" if sufficient else "observe later",
+        }
+    )
+
+
+def _overflow_state(interval: tuple[float, float]) -> str:
+    facts = [
+        {"time": interval[0] + 1.0, "fact": f"visible fact {index}"}
+        for index in range(20)
+    ]
+    return json.dumps(
+        {
+            "interval": list(interval),
+            "timestamped_facts": facts,
+            "option_evidence": {
+                "A": {
+                    "supports": [],
+                    "contradicts": ["visible fact 19", "redundant contradiction"],
+                },
+                "B": {
+                    "supports": ["visible fact 19", "redundant support"],
+                    "contradicts": [],
+                },
+            },
+            "temporal_changes": [f"change {index}" for index in range(8)],
+            "unresolved": [f"unresolved {index}" for index in range(6)],
+            "evidence_sufficient": False,
+            "next_evidence_needed": " ".join(["observe"] * 30),
         }
     )
 
@@ -160,7 +188,9 @@ def _source(tmp_path: Path, trajectory_id: str = "lvbench:s1:teacher:0") -> dict
     }
 
 
-def test_replay_uses_only_current_cached_frames_and_merges_memory(tmp_path: Path) -> None:
+def test_replay_uses_only_current_cached_frames_and_merges_memory(
+    tmp_path: Path,
+) -> None:
     source = _source(tmp_path)
     client = FakeClient(
         [
@@ -175,7 +205,10 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(tmp_path: Path
     )
 
     assert result["scoring_deferred"] is True
-    assert result["trajectory_id"].endswith(":perception_memory_replay_v1")
+    assert result["trajectory_id"].endswith(":perception_memory_replay_v2")
+    assert (
+        result["perception_normalization_version"] == PERCEPTION_NORMALIZATION_VERSION
+    )
     assert result["candidate_answer"] == "A"
     assert result["diagnostics_gate_sha256"] == "b" * 64
     assert result["experiment_config_sha256"] == result["config_sha256"]
@@ -209,7 +242,7 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
 ) -> None:
     client = FakeClient(
         [
-            _state((0.0, 10.0), "The person approaches the door.", sufficient=False),
+            _overflow_state((0.0, 10.0)),
             _state((20.0, 30.0), "The person opens the door.", sufficient=True),
         ]
     )
@@ -257,6 +290,19 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
         }
     )
     records = build_perception_memory_sft_records(result)
+    first_state = result["perception_states"][0]["perception_response"]
+    assert (
+        len(json.loads(result["request_trace"][1]["content"])["timestamped_facts"])
+        == 20
+    )
+    assert len(first_state["timestamped_facts"]) == 12
+    assert any(
+        item["fact"] == "visible fact 19" for item in first_state["timestamped_facts"]
+    )
+    assert first_state["option_evidence"]["B"]["supports"] == ["visible fact 19"]
+    assert len(first_state["temporal_changes"]) == 4
+    assert len(first_state["unresolved"]) == 3
+    assert len(first_state["next_evidence_needed"].split()) == 20
     assert [record["metadata"]["episode_target_type"] for record in records] == [
         "tool",
         "memory",
@@ -266,7 +312,9 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
     ]
 
 
-def test_legacy_problem_is_read_strictly_from_public_user_prompt(tmp_path: Path) -> None:
+def test_legacy_problem_is_read_strictly_from_public_user_prompt(
+    tmp_path: Path,
+) -> None:
     source = _source(tmp_path)
     source.pop("public_sample")
     source["request_trace"] = [
@@ -299,6 +347,21 @@ def test_cached_replay_fails_on_missing_or_mismatched_frames(tmp_path: Path) -> 
         cached_frame_steps(source)
 
 
+def test_replay_validates_every_raw_fact_before_compaction(tmp_path: Path) -> None:
+    payload = json.loads(_overflow_state((0.0, 10.0)))
+    payload["timestamped_facts"][10]["time"] = 2.0
+    client = FakeClient([json.dumps(payload)])
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+
+    with pytest.raises(ValueError, match="does not match an actual sampled frame"):
+        PerceptionMemoryReplay(client).replay(
+            source,
+            source_file_sha256="a" * 64,
+            audit_summary_sha256="b" * 64,
+        )
+
+
 def test_replay_fingerprint_includes_semantic_source_dependencies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -316,6 +379,12 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
         replay_module,
         "replay_implementation_dependency_hashes",
         lambda: {**dependencies, "perception_memory_eva": "0" * 64},
+    )
+    assert ReplayConfig().fingerprint() != baseline
+    monkeypatch.setattr(
+        replay_module,
+        "PERCEPTION_NORMALIZATION_VERSION",
+        "different_normalization",
     )
     assert ReplayConfig().fingerprint() != baseline
 
@@ -336,7 +405,9 @@ def test_audit_gate_requires_exact_passed_test300_scope(tmp_path: Path) -> None:
         validate_badcase_audit_summary(audit)
 
 
-def test_jsonl_replay_is_atomic_resumable_and_fingerprint_locked(tmp_path: Path) -> None:
+def test_jsonl_replay_is_atomic_resumable_and_fingerprint_locked(
+    tmp_path: Path,
+) -> None:
     source_path = tmp_path / "source.jsonl"
     output_path = tmp_path / "output.jsonl"
     audit = _audit(tmp_path / "audit.json")

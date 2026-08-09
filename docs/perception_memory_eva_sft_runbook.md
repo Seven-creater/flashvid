@@ -151,6 +151,7 @@ python scripts/evaluate_mcq.py \
   --model-artifact-sha256 "$MODEL_ARTIFACT_SHA" \
   --model Qwen3.5-9B --qwen-protocol no_think \
   --base-url http://127.0.0.1:8200/v1 \
+  --local-media-paths \
   --max-turns 6 --max-frames-per-call 128 --concurrency 32 \
   --output-dir "$PM_ROOT/trajectories/rescue/$VARIANT/$DATASET" \
   --resume

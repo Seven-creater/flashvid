@@ -108,6 +108,7 @@
     "agent_version": "perception_memory_v1",
     "model": "Qwen3.5-9B",
     "model_path": "/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B",
+    "local_media_transport": "path",
     "allowed_models": ["Qwen3.5-9B"],
     "official_eva_commit": "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a",
     "allowed_frame_tools": ["official_eva_frame_select", "ffmpeg", "decord"],

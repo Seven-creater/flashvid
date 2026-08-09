@@ -34,9 +34,7 @@ from .qwen_agents.core import (
 from .schemas import ModelSample
 
 
-_TOOL_CALL_RE = re.compile(
-    r"^\s*<tool_call>\s*(\{.*\})\s*</tool_call>\s*$", re.DOTALL
-)
+_TOOL_CALL_RE = re.compile(r"^\s*<tool_call>\s*(\{.*\})\s*</tool_call>\s*$", re.DOTALL)
 _JSON_FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*\n(\{.*\})\n```\s*$",
     re.DOTALL | re.IGNORECASE,
@@ -83,9 +81,7 @@ def _question_text(sample: ModelSample) -> str:
     return f"Question: {sample.question}\nChoices:\n{options}"
 
 
-def rescue_frame_request(
-    variant: str, video_duration: float
-) -> FrameRequest | None:
+def rescue_frame_request(variant: str, video_duration: float) -> FrameRequest | None:
     """Return one annotation-free, duration-only rescue coverage request."""
 
     name = str(variant).strip()
@@ -198,12 +194,16 @@ def parse_controller_action(text: str) -> ControllerAction | None:
 
 def _controller_tool_call(request: FrameRequest) -> str:
     payload = {"tool": "frame_select", "arguments": request.to_tool_arguments()}
-    return "<tool_call>" + json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ) + "</tool_call>"
+    return (
+        "<tool_call>"
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "</tool_call>"
+    )
 
 
 def _messages_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -259,6 +259,67 @@ class PerceptionState:
 
 
 _PERCEPTION_TIMESTAMP_TOLERANCE_S = 0.001
+_MAX_PERCEPTION_FACTS = 12
+_MAX_OPTION_EVIDENCE_ITEMS = 1
+_MAX_TEMPORAL_CHANGES = 4
+_MAX_UNRESOLVED_ITEMS = 3
+_MAX_OBSERVATION_WORDS = 20
+_MAX_OBSERVATION_CHARS = 240
+PERCEPTION_NORMALIZATION_VERSION = "perception_state_normalization_v2"
+
+
+def _bounded_observation_text(value: str, *, max_words: int) -> str:
+    words = _clean_text(value, "perception observation").split()
+    return " ".join(words[:max_words])[:_MAX_OBSERVATION_CHARS].strip()
+
+
+def _evenly_spaced_positions(length: int, limit: int) -> tuple[int, ...]:
+    if length < 0 or limit <= 0:
+        raise ValueError("length must be non-negative and limit must be positive")
+    if length <= limit:
+        return tuple(range(length))
+    denominator = limit - 1
+    if denominator <= 0:
+        return (0,)
+    return tuple(
+        (index * (length - 1) + denominator // 2) // denominator
+        for index in range(limit)
+    )
+
+
+def _compact_timestamped_facts(
+    facts: Sequence[TimestampedFact],
+    option_evidence: Mapping[str, OptionObservation],
+) -> tuple[TimestampedFact, ...]:
+    ordered = sorted(enumerate(facts), key=lambda item: (item[1].time, item[0]))
+    referenced = {
+        _normal_key(text)
+        for observation in option_evidence.values()
+        for text in (*observation.supports, *observation.contradicts)
+    }
+    priority = [item for item in ordered if _normal_key(item[1].fact) in referenced]
+    ordinary = [item for item in ordered if _normal_key(item[1].fact) not in referenced]
+    selected: list[tuple[int, TimestampedFact]] = []
+    priority_limit = min(_MAX_PERCEPTION_FACTS, len(priority))
+    if priority_limit:
+        selected.extend(
+            priority[index]
+            for index in _evenly_spaced_positions(len(priority), priority_limit)
+        )
+    remaining = _MAX_PERCEPTION_FACTS - len(selected)
+    if remaining:
+        selected.extend(
+            ordinary[index]
+            for index in _evenly_spaced_positions(len(ordinary), remaining)
+        )
+    selected.sort(key=lambda item: (item[1].time, item[0]))
+    return tuple(
+        TimestampedFact(
+            item.time,
+            _bounded_observation_text(item.fact, max_words=_MAX_OBSERVATION_WORDS),
+        )
+        for _original_index, item in selected
+    )
 
 
 def parse_perception_state(
@@ -340,13 +401,15 @@ def parse_perception_state(
         return None
 
 
-def validate_perception_state_observation(
+def normalize_perception_state(
     state: PerceptionState,
-    observation: FrameObservation,
     *,
+    resolved_start_time: float,
+    resolved_end_time: float,
+    actual_timestamps: Sequence[float],
     timestamp_tolerance_s: float = _PERCEPTION_TIMESTAMP_TOLERANCE_S,
 ) -> PerceptionState:
-    """Bind model-reported facts to this call's real sampled timestamps.
+    """Validate raw state, bind real timestamps, then compact deterministically.
 
     The perception prompt prints timestamps to millisecond precision, so a model
     timestamp may differ from the selector value by at most one millisecond.  A
@@ -362,12 +425,12 @@ def validate_perception_state_observation(
     ):
         raise ValueError("timestamp_tolerance_s must be a finite non-negative number")
     tolerance = float(timestamp_tolerance_s)
-    start = _finite_number(observation.resolved_start_time, "resolved_start_time")
-    end = _finite_number(observation.resolved_end_time, "resolved_end_time")
+    start = _finite_number(resolved_start_time, "resolved_start_time")
+    end = _finite_number(resolved_end_time, "resolved_end_time")
     if end <= start:
         raise ValueError("resolved perception interval must be increasing")
     actual_timestamps = tuple(
-        _finite_number(item, "actual frame timestamp") for item in observation.timestamps
+        _finite_number(item, "actual frame timestamp") for item in actual_timestamps
     )
     if not actual_timestamps:
         raise ValueError("perception observation contains no actual frame timestamps")
@@ -389,10 +452,58 @@ def validate_perception_state_observation(
                 "perception fact timestamp does not match an actual sampled frame timestamp"
             )
         bound_facts.append(TimestampedFact(actual, item.fact))
+    compact_options = {
+        letter: OptionObservation(
+            tuple(
+                _bounded_observation_text(value, max_words=_MAX_OBSERVATION_WORDS)
+                for value in observation.supports[:_MAX_OPTION_EVIDENCE_ITEMS]
+            ),
+            tuple(
+                _bounded_observation_text(value, max_words=_MAX_OBSERVATION_WORDS)
+                for value in observation.contradicts[:_MAX_OPTION_EVIDENCE_ITEMS]
+            ),
+        )
+        for letter, observation in state.option_evidence.items()
+    }
     return replace(
         state,
         interval=(start, end),
-        timestamped_facts=tuple(bound_facts),
+        timestamped_facts=_compact_timestamped_facts(
+            bound_facts, state.option_evidence
+        ),
+        option_evidence=compact_options,
+        temporal_changes=tuple(
+            _bounded_observation_text(value, max_words=_MAX_OBSERVATION_WORDS)
+            for value in state.temporal_changes[:_MAX_TEMPORAL_CHANGES]
+        ),
+        unresolved=tuple(
+            _bounded_observation_text(value, max_words=_MAX_OBSERVATION_WORDS)
+            for value in state.unresolved[:_MAX_UNRESOLVED_ITEMS]
+        ),
+        next_evidence_needed=(
+            _bounded_observation_text(
+                state.next_evidence_needed, max_words=_MAX_OBSERVATION_WORDS
+            )
+            if state.next_evidence_needed
+            else ""
+        ),
+    )
+
+
+def validate_perception_state_observation(
+    state: PerceptionState,
+    observation: FrameObservation,
+    *,
+    timestamp_tolerance_s: float = _PERCEPTION_TIMESTAMP_TOLERANCE_S,
+) -> PerceptionState:
+    """Normalize one state against the exact frames returned by the tool."""
+
+    return normalize_perception_state(
+        state,
+        resolved_start_time=observation.resolved_start_time,
+        resolved_end_time=observation.resolved_end_time,
+        actual_timestamps=observation.timestamps,
+        timestamp_tolerance_s=timestamp_tolerance_s,
     )
 
 
@@ -485,9 +596,7 @@ class EvidenceMemory:
 
         self.observed_intervals.append(state.interval)
         for item in state.timestamped_facts:
-            self._evidence_id(
-                item.fact, state.interval, item.time, "timestamped_fact"
-            )
+            self._evidence_id(item.fact, state.interval, item.time, "timestamped_fact")
         for change in state.temporal_changes:
             self._evidence_id(change, state.interval, None, "temporal_change")
         for letter in self.option_letters:
@@ -540,9 +649,7 @@ class EvidenceMemory:
         }
 
 
-def interval_iou(
-    first: tuple[float, float], second: tuple[float, float]
-) -> float:
+def interval_iou(first: tuple[float, float], second: tuple[float, float]) -> float:
     """Return temporal intersection-over-union for two valid intervals."""
 
     if first[1] <= first[0] or second[1] <= second[0]:
@@ -590,7 +697,7 @@ def build_controller_messages(
         '"end_time":30.0,"nframes":16,"resize":0.75,'
         '"evidence_request":"a precise visual question"}}</tool_call>. '
         "Use exactly one of nframes or fps and do not repeat an observed interval. "
-        'Only when the ledger is ready for an independent completeness check, output '
+        "Only when the ledger is ready for an independent completeness check, output "
         'exactly {"action":"stop"}.'
     )
     user = (
@@ -774,7 +881,11 @@ def parse_evidence_decision(
             return None
         answer = str(payload["answer"]).strip().upper()
         ids = _string_list(payload["evidence_ids"], "evidence_ids")
-        if answer not in letters or not ids or any(item not in evidence for item in ids):
+        if (
+            answer not in letters
+            or not ids
+            or any(item not in evidence for item in ids)
+        ):
             return None
         return EvidenceDecision(answer, tuple(dict.fromkeys(ids)))
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -825,11 +936,17 @@ def _visual_tokens(usage: Mapping[str, Any]) -> int | None:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return int(value)
         if isinstance(value, Mapping):
-            numbers = [item for item in value.values() if isinstance(item, (int, float))]
+            numbers = [
+                item for item in value.values() if isinstance(item, (int, float))
+            ]
             if len(numbers) == len(value):
                 return int(sum(numbers))
     value = usage.get("visual_tokens")
-    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    return (
+        int(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else None
+    )
 
 
 class PerceptionMemoryEvaEvaluator:
@@ -866,6 +983,11 @@ class PerceptionMemoryEvaEvaluator:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
         self.client = client
+        self.local_media_transport = (
+            "path"
+            if bool(getattr(client, "local_file_urls_as_paths", False))
+            else "file_url"
+        )
         self.model = model
         self.index = VideoIndex(video_root)
         self.frame_tool = frame_tool or FrameTool(
@@ -938,6 +1060,7 @@ class PerceptionMemoryEvaEvaluator:
         return {
             "backend": self.backend,
             "agent_version": self.version,
+            "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
             "model": self.model,
             "implementation_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "implementation_bundle_sha256": implementation_bundle_sha256,
@@ -955,6 +1078,7 @@ class PerceptionMemoryEvaEvaluator:
             "manifest_sha256": self.manifest_sha256,
             "experiment_config_sha256": self.experiment_config_sha256,
             "diagnostics_gate_sha256": self.diagnostics_gate_sha256,
+            "local_media_transport": self.local_media_transport,
             "scoring_deferred": self.scoring_deferred,
             "train600_manifest_sha256": self.train600_manifest_sha256,
             "trajectory_schedule_id": self.trajectory_schedule_id,
@@ -1174,10 +1298,12 @@ class PerceptionMemoryEvaEvaluator:
                             perception_states[-1]["evidence_complete"] = True
                         break
                     request_trace[-2]["action_accepted"] = False
-                    request_trace[-2]["action_rejection_reason"] = (
-                        "incomplete_evidence"
+                    request_trace[-2]["action_rejection_reason"] = "incomplete_evidence"
+                    missing = (
+                        decision.missing_evidence
+                        if decision
+                        else ("invalid completeness response",)
                     )
-                    missing = decision.missing_evidence if decision else ("invalid completeness response",)
                     feedback = "Stop rejected; missing evidence: " + "; ".join(missing)
                     continue
 
@@ -1188,9 +1314,7 @@ class PerceptionMemoryEvaEvaluator:
                 )
                 if duplicate_interval(requested_interval, memory.observed_intervals):
                     request_trace[-1]["action_accepted"] = False
-                    request_trace[-1]["action_rejection_reason"] = (
-                        "duplicate_interval"
-                    )
+                    request_trace[-1]["action_rejection_reason"] = "duplicate_interval"
                     feedback = "Requested interval duplicates prior evidence; choose a different interval."
                     continue
                 observation = session.select(action.request)
@@ -1254,7 +1378,9 @@ class PerceptionMemoryEvaEvaluator:
                 )
                 if complete and perception_states:
                     perception_states[-1]["evidence_complete"] = True
-                stop_reason = "max_turns_complete" if complete else "max_turns_incomplete"
+                stop_reason = (
+                    "max_turns_complete" if complete else "max_turns_incomplete"
+                )
 
             if complete:
                 first = self._judge(
@@ -1263,7 +1389,9 @@ class PerceptionMemoryEvaEvaluator:
                     request_trace,
                     1001,
                     "evidence_judge",
-                    step_index=(len(perception_states) - 1 if perception_states else None),
+                    step_index=(
+                        len(perception_states) - 1 if perception_states else None
+                    ),
                     prefix_index=len(perception_states) - 1,
                 )
                 if perception_states:
@@ -1273,11 +1401,17 @@ class PerceptionMemoryEvaEvaluator:
                             "prediction": first.answer if first else None,
                             "evidence_complete": True,
                             "annotation_leak_check": "passed",
-                            "error": None if first else "invalid evidence judge response",
+                            "error": None
+                            if first
+                            else "invalid evidence judge response",
                         }
                     )
                 confirmation = None
-                if first is not None and candidate is not None and first.answer != candidate:
+                if (
+                    first is not None
+                    and candidate is not None
+                    and first.answer != candidate
+                ):
                     confirmation_text = self._chat(
                         request_trace,
                         build_confirmation_controller_messages(
@@ -1346,9 +1480,7 @@ class PerceptionMemoryEvaEvaluator:
                                 "frame_paths": list(
                                     confirmation_observation.frame_paths
                                 ),
-                                "timestamps": list(
-                                    confirmation_observation.timestamps
-                                ),
+                                "timestamps": list(confirmation_observation.timestamps),
                                 "perception": confirmation_state.to_dict(),
                                 "perception_response": confirmation_state.to_dict(),
                                 "memory_after": memory.to_dict(),
@@ -1389,10 +1521,14 @@ class PerceptionMemoryEvaEvaluator:
                         perception_states[-1]["judge_confirmations"].append(
                             {
                                 "seed": self.seed + 2004,
-                                "prediction": confirmation.answer if confirmation else None,
+                                "prediction": confirmation.answer
+                                if confirmation
+                                else None,
                                 "evidence_complete": confirmation is not None,
                                 "annotation_leak_check": "passed",
-                                "error": None if confirmation else "visual confirmation failed",
+                                "error": None
+                                if confirmation
+                                else "visual confirmation failed",
                             }
                         )
                 final = apply_candidate_gate(
@@ -1413,16 +1549,14 @@ class PerceptionMemoryEvaEvaluator:
             stop_reason = "runtime_error"
 
         prompt_tokens = sum(
-            int(item["usage"].get("prompt_tokens", 0) or 0)
-            for item in request_trace
+            int(item["usage"].get("prompt_tokens", 0) or 0) for item in request_trace
         )
         completion_tokens = sum(
             int(item["usage"].get("completion_tokens", 0) or 0)
             for item in request_trace
         )
         total_tokens = sum(
-            int(item["usage"].get("total_tokens", 0) or 0)
-            for item in request_trace
+            int(item["usage"].get("total_tokens", 0) or 0) for item in request_trace
         )
         visual_values = [
             (
@@ -1461,8 +1595,7 @@ class PerceptionMemoryEvaEvaluator:
             "manifest_sha256": self.manifest_sha256,
             "dataset_manifest_sha256": self.manifest_sha256,
             "train600_manifest_sha256": self.train600_manifest_sha256,
-            "config_sha256": self.experiment_config_sha256
-            or self.run_fingerprint(),
+            "config_sha256": self.experiment_config_sha256 or self.run_fingerprint(),
             "scoring_deferred": self.scoring_deferred,
             "dataset": sample.dataset,
             "sample_id": sample.sample_id,
@@ -1528,6 +1661,7 @@ __all__ = [
     "OptionObservation",
     "PerceptionMemoryEvaEvaluator",
     "PerceptionState",
+    "PERCEPTION_NORMALIZATION_VERSION",
     "RESCUE_TRAJECTORY_VARIANTS",
     "TimestampedFact",
     "apply_candidate_gate",
@@ -1543,6 +1677,7 @@ __all__ = [
     "parse_controller_action",
     "parse_evidence_decision",
     "parse_perception_state",
+    "normalize_perception_state",
     "rescue_frame_request",
     "validate_perception_state_observation",
 ]

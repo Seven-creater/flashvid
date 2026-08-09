@@ -15,6 +15,7 @@ from flashvid_eval.perception_memory_prefix_judge import (
     parse_prefix_judge_response,
     implementation_dependency_hashes,
 )
+from flashvid_eval.perception_memory_eva import PERCEPTION_NORMALIZATION_VERSION
 from scripts import judge_perception_memory_prefixes as judge_script
 
 
@@ -63,6 +64,7 @@ def _trajectory(trajectory_id: str = "lvbench:s1:family:0") -> dict:
         "scoring_deferred": True,
         "annotation_leak_check": "passed",
         "candidate_rerun": 0,
+        "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
         # Candidate may exist in the deferred trace, but it must never enter a job.
         "candidate_answer": "A",
         "public_sample": {
@@ -77,6 +79,14 @@ def _trajectory(trajectory_id: str = "lvbench:s1:family:0") -> dict:
             {"step_index": 1, "memory_after": _memory(complete=True)},
         ],
     }
+
+
+def test_prefix_jobs_reject_incompatible_perception_normalization() -> None:
+    trajectory = _trajectory()
+    trajectory["perception_normalization_version"] = "legacy_normalization"
+
+    with pytest.raises(ValueError, match="incompatible perception normalization"):
+        bind_prefix_jobs([trajectory])
 
 
 class FakeClient:

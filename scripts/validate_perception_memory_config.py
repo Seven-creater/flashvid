@@ -129,6 +129,11 @@ def validate_config(config: Mapping[str, Any]) -> list[str]:
 
     runtime = _mapping(config.get("runtime"), "runtime", errors)
     _require(runtime.get("backend") == "perception_memory_eva", "wrong backend", errors)
+    _require(
+        runtime.get("local_media_transport") == "path",
+        "Transformers serve requires explicit path local-media transport",
+        errors,
+    )
     _require(runtime.get("allowed_models") == ["Qwen3.5-9B"], "only Qwen3.5-9B is allowed", errors)
     _require(runtime.get("controller_media_count") == 0, "Controller must be text-only", errors)
     _require(runtime.get("max_evidence_steps") == 6, "max evidence steps must be 6", errors)

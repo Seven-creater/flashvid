@@ -182,6 +182,16 @@ def _candidate_superset_allowed(
     )
 
 
+def _local_media_transport(backend: str, enabled: bool) -> str:
+    """Resolve the explicit Transformers local-media compatibility mode."""
+
+    if enabled and backend != "perception_memory_eva":
+        raise ValueError(
+            "--local-media-paths is only valid with perception_memory_eva"
+        )
+    return "path" if enabled else "file_url"
+
+
 def _stable_model_slug(model: str) -> str:
     readable = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-") or "model"
     identity = hashlib.sha256(model.encode("utf-8")).hexdigest()[:8]
@@ -621,6 +631,15 @@ def main() -> None:
         default="v2a",
     )
     parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument(
+        "--local-media-paths",
+        action="store_true",
+        help=(
+            "Send local file:// frame URLs as absolute paths on the wire for "
+            "Transformers serve. Valid only for perception_memory_eva; the "
+            "default keeps file:// URLs for other OpenAI-compatible servers."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument(
@@ -831,6 +850,9 @@ def main() -> None:
         help="Poll partial downloads until --sample accessible items exist.",
     )
     args = parser.parse_args()
+    local_media_transport = _local_media_transport(
+        args.backend, args.local_media_paths
+    )
     if args.defer_scoring and args.backend not in {
         "qwen_agent",
         "fast_hybrid_eva",
@@ -902,7 +924,12 @@ def main() -> None:
             f"manifest SHA-256 mismatch: expected {args.expected_manifest_sha256}, "
             f"got {manifest_hash}"
         )
-    client = OpenAICompatibleClient(args.base_url, args.api_key, args.timeout)
+    client = OpenAICompatibleClient(
+        args.base_url,
+        args.api_key,
+        args.timeout,
+        local_file_urls_as_paths=args.local_media_paths,
+    )
     if args.backend == "qwen_baseline":
         if args.baseline_mode is None:
             raise ValueError("qwen_baseline requires --baseline-mode")
@@ -1538,6 +1565,7 @@ def main() -> None:
                 "teacher_model_artifact_sha256": teacher_model_artifact_sha256,
                 "train600_manifest_sha256": train600_manifest_sha256,
                 "diagnostics_gate_sha256": diagnostics_gate_sha256,
+                "local_media_transport": local_media_transport,
                 "trajectory_schedule_id": args.trajectory_schedule_id,
                 "trajectory_variant_id": args.trajectory_variant_id,
                 "trajectory_replica_id": args.trajectory_replica_id,

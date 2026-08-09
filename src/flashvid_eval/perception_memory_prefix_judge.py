@@ -25,6 +25,7 @@ from .perception_memory_eva import (
     EvidenceEvent,
     EvidenceMemory,
     OptionLedger,
+    PERCEPTION_NORMALIZATION_VERSION,
     build_judge_messages,
     messages_have_media,
 )
@@ -373,6 +374,13 @@ def bind_prefix_jobs(
             raise ValueError("trajectory failed annotation leak audit")
         if int(raw_row.get("candidate_rerun") or 0) != 0:
             raise ValueError("trajectory reran its frozen candidate")
+        if (
+            raw_row.get("perception_normalization_version")
+            != PERCEPTION_NORMALIZATION_VERSION
+        ):
+            raise ValueError(
+                "trajectory has incompatible perception normalization"
+            )
         trajectory_id = _text(raw_row.get("trajectory_id"), "trajectory_id")
         if trajectory_id in seen_trajectories:
             raise ValueError("duplicate trajectory_id")
@@ -407,6 +415,9 @@ def bind_prefix_jobs(
                 "memory_after": memory_dict,
                 "config_sha256": raw_row.get("config_sha256"),
                 "run_fingerprint": raw_row.get("run_fingerprint"),
+                "perception_normalization_version": (
+                    PERCEPTION_NORMALIZATION_VERSION
+                ),
             }
             prefix_id = f"{trajectory_id}#prefix-{prefix_index:03d}"
             if prefix_id in seen_prefixes:

@@ -7,7 +7,10 @@ from pathlib import Path
 import pytest
 
 from flashvid_eval.client import ChatResult
-from flashvid_eval.perception_memory_eva import PerceptionMemoryEvaEvaluator
+from flashvid_eval.perception_memory_eva import (
+    PERCEPTION_NORMALIZATION_VERSION,
+    PerceptionMemoryEvaEvaluator,
+)
 from flashvid_eval.perception_memory_sft import (
     build_perception_memory_sft_records,
     enforce_perception_memory_selection_gate,
@@ -92,7 +95,9 @@ def _trajectory(tmp_path: Path) -> dict:
         '{"start_time":10,"end_time":20,"nframes":8,"resize":1.0}}'
         "</tool_call>"
     )
-    initial_tool = tool.replace('"start_time":10,"end_time":20', '"start_time":0,"end_time":10')
+    initial_tool = tool.replace(
+        '"start_time":10,"end_time":20', '"start_time":0,"end_time":10'
+    )
     states = [
         {
             "step_index": 0,
@@ -156,9 +161,7 @@ def _trajectory(tmp_path: Path) -> dict:
                     "request_messages": _messages(
                         "Choose from the options using only the evidence ledger."
                     ),
-                    "raw_response": (
-                        '{"answer":"B","evidence_ids":["e0","e1"]}'
-                    ),
+                    "raw_response": ('{"answer":"B","evidence_ids":["e0","e1"]}'),
                     "finish_reason": "stop",
                     "usage": {"total_tokens": 10},
                 }
@@ -171,6 +174,14 @@ def _trajectory(tmp_path: Path) -> dict:
         "sample_id": "sample-1",
         "trajectory_id": "lvbench:sample-1:family:0",
         "family_id": "family",
+        "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
+        "public_sample": {
+            "dataset": "lvbench",
+            "sample_id": "sample-1",
+            "video": "video.mp4",
+            "question": "What does the person do?",
+            "choices": {"A": "waits", "B": "opens the door"},
+        },
         "manifest_sha256": "a" * 64,
         "train600_manifest_sha256": "a" * 64,
         "dataset_manifest_sha256": "b" * 64,
@@ -325,7 +336,11 @@ def test_rejected_stop_is_not_exported_from_incomplete_prefix(tmp_path: Path) ->
     assert [record["metadata"]["episode_target_type"] for record in records].count(
         "stop"
     ) == 1
-    assert all(record["metadata"]["prefix_index"] != 0 for record in records if record["metadata"]["episode_target_type"] == "stop")
+    assert all(
+        record["metadata"]["prefix_index"] != 0
+        for record in records
+        if record["metadata"]["episode_target_type"] == "stop"
+    )
 
 
 def test_complete_prefix_requires_three_unique_complete_judges(tmp_path: Path) -> None:
@@ -349,7 +364,37 @@ def test_only_resolved_interval_may_differ_from_raw_perception(tmp_path: Path) -
         build_perception_memory_sft_records(trajectory)
 
 
-def test_runtime_judge_with_evidence_ids_preserves_runtime_protocol(tmp_path: Path) -> None:
+def test_perception_export_strictly_binds_public_choices_and_tool_step(
+    tmp_path: Path,
+) -> None:
+    trajectory = _trajectory(tmp_path)
+    trajectory["request_trace"][1]["content"] = (
+        "explanation\n" + trajectory["request_trace"][1]["content"]
+    )
+    with pytest.raises(ValueError, match="failed the frozen parser"):
+        build_perception_memory_sft_records(trajectory)
+
+    trajectory = _trajectory(tmp_path)
+    trajectory["public_sample"]["choices"]["C"] = "leaves"
+    with pytest.raises(ValueError, match="failed the frozen parser"):
+        build_perception_memory_sft_records(trajectory)
+
+    trajectory = _trajectory(tmp_path)
+    trajectory["tool_steps"][0]["actual_timestamps"] = [2.0]
+    with pytest.raises(ValueError, match="state/tool timestamps differ"):
+        build_perception_memory_sft_records(trajectory)
+
+    trajectory = _trajectory(tmp_path)
+    trajectory["tool_steps"][0]["frame_paths"] = [
+        trajectory["tool_steps"][1]["frame_paths"][0]
+    ]
+    with pytest.raises(ValueError, match="state/tool frame paths differ"):
+        build_perception_memory_sft_records(trajectory)
+
+
+def test_runtime_judge_with_evidence_ids_preserves_runtime_protocol(
+    tmp_path: Path,
+) -> None:
     trajectory = _trajectory(tmp_path)
     trajectory["request_trace"][-1]["content"] = (
         '{"answer":"B","evidence_ids":["e0","e1"]}'
@@ -423,9 +468,7 @@ def test_complete_prefix_does_not_synthesize_stop_from_confirmation_controller(
     trajectory["request_trace"] = [
         request
         for request in trajectory["request_trace"]
-        if not (
-            request["stage"] == "controller" and request["prefix_index"] == 0
-        )
+        if not (request["stage"] == "controller" and request["prefix_index"] == 0)
     ]
     trajectory["request_trace"].append(
         _request(
@@ -571,16 +614,14 @@ def test_persisted_runtime_trace_exports_without_schema_translation(
                 "prediction": "A",
                 "evidence_ids": ["E0001"],
                 "evidence_complete": True,
-                    "annotation_leak_check": "passed",
-                    "request_messages": deepcopy(
-                        trajectory["request_trace"][-1]["messages"]
-                    ),
-                    "raw_response": (
-                        '{"answer":"A","evidence_ids":["E0001"]}'
-                    ),
-                    "finish_reason": "stop",
-                    "usage": {"total_tokens": 10},
-                    "error": None,
+                "annotation_leak_check": "passed",
+                "request_messages": deepcopy(
+                    trajectory["request_trace"][-1]["messages"]
+                ),
+                "raw_response": ('{"answer":"A","evidence_ids":["E0001"]}'),
+                "finish_reason": "stop",
+                "usage": {"total_tokens": 10},
+                "error": None,
             }
         )
         request = deepcopy(trajectory["request_trace"][-1])

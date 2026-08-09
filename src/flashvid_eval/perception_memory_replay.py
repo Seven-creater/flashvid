@@ -16,23 +16,25 @@ import os
 import re
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .perception_memory_eva import (
     EvidenceMemory,
+    PERCEPTION_NORMALIZATION_VERSION,
     build_controller_messages,
     build_perception_messages,
     parse_perception_state,
+    validate_perception_state_observation,
 )
 from .privacy import AnnotationLeakError, assert_annotation_free_request
 from .qwen_agents.core import ChatClient, FrameObservation, FrameRequest, ToolStep
 from .schemas import ModelSample
 
 
-REPLAY_VERSION = "perception_memory_replay_v1"
+REPLAY_VERSION = "perception_memory_replay_v2"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
 _CHOICE_LINE = re.compile(r"(?m)^([A-H]):\s*(.+?)\s*$")
 _FLIP_GROUPS = frozenset(
@@ -115,7 +117,9 @@ def _finite(value: Any, field: str) -> float:
 
 def _sha256_text(value: Any, field: str) -> str:
     text = _nonempty(value, field).lower()
-    if len(text) != 64 or any(character not in "0123456789abcdef" for character in text):
+    if len(text) != 64 or any(
+        character not in "0123456789abcdef" for character in text
+    ):
         raise ValueError(f"{field} must be a SHA-256")
     return text
 
@@ -157,15 +161,16 @@ def validate_badcase_audit_summary(path: Path) -> tuple[dict[str, Any], str]:
         if not isinstance(value, Mapping) or value.get("samples") != 100:
             raise ValueError(f"paired audit {dataset} scope must be exactly 100")
         if set(value.get("funnel") or {}) != _FUNNEL_STAGES:
-            raise ValueError(f"paired audit {dataset} has an incomplete evidence funnel")
+            raise ValueError(
+                f"paired audit {dataset} has an incomplete evidence funnel"
+            )
     if set(payload.get("flip_totals") or {}) != _FLIP_GROUPS:
         raise ValueError("paired audit has incomplete flip groups")
     if set(payload.get("failure_mode_totals") or {}) != _FAILURE_GROUPS:
         raise ValueError("paired audit has incomplete failure taxonomy")
-    if (
-        payload.get("taxonomy_coverage_passed") is not True
-        or payload.get("taxonomy_classified") != payload.get("taxonomy_required")
-    ):
+    if payload.get("taxonomy_coverage_passed") is not True or payload.get(
+        "taxonomy_classified"
+    ) != payload.get("taxonomy_required"):
         raise ValueError("paired audit has unclassified failures")
     for key in (
         "duplicate_ids",
@@ -222,7 +227,9 @@ def _problem_from_trace(row: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
     parsed: dict[str, tuple[str, dict[str, str]]] = {}
     trace = row.get("request_trace")
     if not isinstance(trace, list):
-        raise ValueError("source trajectory lacks public_sample/question and request_trace")
+        raise ValueError(
+            "source trajectory lacks public_sample/question and request_trace"
+        )
     for request in trace:
         if not isinstance(request, Mapping):
             continue
@@ -236,7 +243,9 @@ def _problem_from_trace(row: Mapping[str, Any]) -> tuple[str, dict[str, str]]:
             if result is not None:
                 parsed[canonical_sha256(result)] = result
     if len(parsed) != 1:
-        raise ValueError("source request trace does not contain one unambiguous public problem")
+        raise ValueError(
+            "source request trace does not contain one unambiguous public problem"
+        )
     return next(iter(parsed.values()))
 
 
@@ -252,7 +261,9 @@ def public_model_sample(row: Mapping[str, Any]) -> ModelSample:
             "question",
             "choices",
         }:
-            raise ValueError("public_sample must contain exactly the public sample fields")
+            raise ValueError(
+                "public_sample must contain exactly the public sample fields"
+            )
         source: Mapping[str, Any] = public
         question = source.get("question")
         choices = source.get("choices")
@@ -335,7 +346,9 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
         has_nframes = raw.get("nframes") is not None
         has_fps = raw.get("fps") is not None
         if has_nframes == has_fps:
-            raise ValueError(f"tool step {index} must contain exactly one of nframes/fps")
+            raise ValueError(
+                f"tool step {index} must contain exactly one of nframes/fps"
+            )
         nframes = int(raw["nframes"]) if has_nframes else None
         fps = _finite(raw["fps"], f"tool step {index} fps") if has_fps else None
         if nframes is not None and nframes != len(paths):
@@ -384,9 +397,11 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
 
 def _tool_target(request: FrameRequest) -> str:
     payload = {"tool": "frame_select", "arguments": request.to_tool_arguments()}
-    return "<tool_call>" + json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ) + "</tool_call>"
+    return (
+        "<tool_call>"
+        + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "</tool_call>"
+    )
 
 
 def _prompt_hash(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -408,7 +423,9 @@ class ReplayConfig:
         if self.perception_max_tokens <= 0:
             raise ValueError("perception_max_tokens must be positive")
         if self.temperature != 0.0 or self.enable_thinking:
-            raise ValueError("cached Perception replay must be greedy with thinking disabled")
+            raise ValueError(
+                "cached Perception replay must be greedy with thinking disabled"
+            )
         if self.local_media_transport not in {"file_url", "path"}:
             raise ValueError("local_media_transport must be file_url or path")
 
@@ -416,6 +433,7 @@ class ReplayConfig:
         return canonical_sha256(
             {
                 "version": REPLAY_VERSION,
+                "perception_normalization_version": (PERCEPTION_NORMALIZATION_VERSION),
                 "model": self.model,
                 "seed": self.seed,
                 "perception_max_tokens": self.perception_max_tokens,
@@ -535,17 +553,13 @@ class PerceptionMemoryReplay:
             }
             trace.append(perception_trace)
             if result.finish_reason == "length":
-                raise RuntimeError(f"perception step {step_index} response was truncated")
+                raise RuntimeError(
+                    f"perception step {step_index} response was truncated"
+                )
             state = parse_perception_state(result.content, sample.option_letters)
             if state is None:
                 raise ValueError(f"perception step {step_index} returned invalid JSON")
-            state = replace(
-                state,
-                interval=(
-                    cached.observation.resolved_start_time,
-                    cached.observation.resolved_end_time,
-                ),
-            )
+            state = validate_perception_state_observation(state, cached.observation)
             memory.merge(state)
             states.append(
                 {
@@ -564,17 +578,24 @@ class PerceptionMemoryReplay:
                     "source_perception_evidence_sufficient": state.evidence_sufficient,
                 }
             )
-            tool_steps.append(asdict(ToolStep.from_observation("perception", cached.observation)))
+            tool_steps.append(
+                asdict(ToolStep.from_observation("perception", cached.observation))
+            )
 
-        prompt_tokens = sum(int(item["usage"].get("prompt_tokens", 0) or 0) for item in trace)
+        prompt_tokens = sum(
+            int(item["usage"].get("prompt_tokens", 0) or 0) for item in trace
+        )
         completion_tokens = sum(
             int(item["usage"].get("completion_tokens", 0) or 0) for item in trace
         )
-        total_tokens = sum(int(item["usage"].get("total_tokens", 0) or 0) for item in trace)
+        total_tokens = sum(
+            int(item["usage"].get("total_tokens", 0) or 0) for item in trace
+        )
         return {
             "schema_version": 1,
             "backend": "perception_memory_replay",
             "agent_version": REPLAY_VERSION,
+            "perception_normalization_version": (PERCEPTION_NORMALIZATION_VERSION),
             "dataset": sample.dataset,
             "sample_id": sample.sample_id,
             "trajectory_id": trajectory_id,
@@ -683,6 +704,7 @@ def _failure_row(
         "schema_version": 1,
         "backend": "perception_memory_replay",
         "agent_version": REPLAY_VERSION,
+        "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
         "dataset": dataset,
         "sample_id": sample_id,
         "trajectory_id": f"{source_id}:{REPLAY_VERSION}",
@@ -745,15 +767,23 @@ def replay_jsonl(
         if not resume:
             raise RuntimeError("output exists; pass --resume to continue")
         for row in _read_jsonl(output_path):
-            source_id = _nonempty(row.get("source_trajectory_id"), "source_trajectory_id")
+            source_id = _nonempty(
+                row.get("source_trajectory_id"), "source_trajectory_id"
+            )
             if source_id in existing:
-                raise RuntimeError("resume output contains duplicate source_trajectory_id")
+                raise RuntimeError(
+                    "resume output contains duplicate source_trajectory_id"
+                )
             if row.get("run_fingerprint") != expected_fingerprint:
-                raise RuntimeError("resume fingerprint mismatch; source/audit/config changed")
+                raise RuntimeError(
+                    "resume fingerprint mismatch; source/audit/config changed"
+                )
             existing[source_id] = row
         extras = sorted(set(existing) - set(source_ids))
         if extras:
-            raise RuntimeError(f"resume output contains trajectories outside source: {extras[:3]}")
+            raise RuntimeError(
+                f"resume output contains trajectories outside source: {extras[:3]}"
+            )
     elif resume:
         existing = {}
 

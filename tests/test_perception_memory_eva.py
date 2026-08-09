@@ -13,6 +13,7 @@ from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_eva import (
     EvidenceDecision,
     EvidenceMemory,
+    PERCEPTION_NORMALIZATION_VERSION,
     PerceptionMemoryEvaEvaluator,
     RESCUE_TRAJECTORY_VARIANTS,
     apply_candidate_gate,
@@ -137,7 +138,9 @@ def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
     assert not content[0]["text"].startswith("<tool_response>")
     assert all(item.get("text") != "</tool_response>" for item in content)
     assert "at most 12 timestamped_facts" in messages[0]["content"]
-    assert "at most one support and one contradiction per option" in messages[0]["content"]
+    assert (
+        "at most one support and one contradiction per option" in messages[0]["content"]
+    )
     assert_annotation_free_request({"messages": messages})
 
 
@@ -146,6 +149,90 @@ def test_perception_parser_accepts_only_an_exact_json_fence() -> None:
     assert parse_perception_state(fenced, ("A", "B")) is not None
     assert parse_perception_state(f"explanation\n{fenced}", ("A", "B")) is None
     assert parse_perception_state(f"{fenced}\nextra", ("A", "B")) is None
+
+
+def test_perception_validation_compacts_long_states_deterministically() -> None:
+    payload = json.loads(_state_json())
+    payload["interval"] = [0.0, 30.0]
+    payload["timestamped_facts"] = [
+        {"time": float(index), "fact": f"visible event number {index}"}
+        for index in range(20)
+    ]
+    payload["option_evidence"]["A"]["supports"] = [
+        "visible event number 11",
+        "second",
+    ]
+    payload["temporal_changes"] = [
+        " ".join([f"change-{index}"] * 30) for index in range(8)
+    ]
+    payload["unresolved"] = ["缺" * 300 for _index in range(6)]
+    payload["next_evidence_needed"] = " ".join(["later"] * 30)
+
+    parsed = parse_perception_state(json.dumps(payload), ("A", "B"))
+    assert parsed is not None
+    request = FrameRequest(
+        start_time=0.0,
+        end_time=30.0,
+        nframes=20,
+        resize=1.0,
+        evidence_request="Observe the full interval.",
+    )
+    observation = FrameObservation(
+        request=request,
+        resolved_start_time=0.0,
+        resolved_end_time=30.0,
+        resolved_nframes=20,
+        frame_paths=tuple(f"frame-{index}" for index in range(20)),
+        timestamps=tuple(float(index) for index in range(20)),
+        backend="test",
+        cache_hit=False,
+        estimated_visual_tokens=0,
+        latency_s=0.0,
+    )
+
+    state = validate_perception_state_observation(parsed, observation)
+
+    assert len(state.timestamped_facts) == 12
+    assert [item.time for item in state.timestamped_facts] == [
+        0.0,
+        2.0,
+        4.0,
+        5.0,
+        7.0,
+        9.0,
+        11.0,
+        12.0,
+        14.0,
+        15.0,
+        17.0,
+        19.0,
+    ]
+    assert state.option_evidence["A"].supports == ("visible event number 11",)
+    assert len(state.temporal_changes) == 4
+    assert len(state.unresolved) == 3
+    assert all(len(item.split()) == 20 for item in state.temporal_changes)
+    assert all(len(item) == 240 for item in state.unresolved)
+    assert len(state.next_evidence_needed.split()) == 20
+
+    payload["timestamped_facts"].reverse()
+    reparsed = parse_perception_state(json.dumps(payload), ("A", "B"))
+    assert reparsed is not None
+    assert validate_perception_state_observation(reparsed, observation) == state
+
+
+def test_perception_validation_checks_every_fact_before_compaction(
+    tmp_path: Path,
+) -> None:
+    payload = json.loads(_state_json())
+    payload["timestamped_facts"] = [
+        {"time": 15.0, "fact": f"visible fact {index}"} for index in range(20)
+    ]
+    payload["timestamped_facts"][10]["time"] = 9999.0
+    parsed = parse_perception_state(json.dumps(payload), ("A", "B"))
+    assert parsed is not None
+
+    with pytest.raises(ValueError, match="outside the resolved perception interval"):
+        validate_perception_state_observation(parsed, _observation(tmp_path))
 
 
 def test_official_controller_parser_is_strict() -> None:
@@ -189,7 +276,9 @@ def test_memory_merge_persists_and_deduplicates_evidence() -> None:
     assert len(memory.event_ledger) == before
 
 
-def test_memory_keeps_repeated_actions_at_distinct_times_intervals_and_sources() -> None:
+def test_memory_keeps_repeated_actions_at_distinct_times_intervals_and_sources() -> (
+    None
+):
     repeated = json.loads(
         _state_json(fact="The person places a plate.", fact_time=12.0)
     )
@@ -236,9 +325,7 @@ def test_memory_keeps_repeated_actions_at_distinct_times_intervals_and_sources()
 
 
 def test_perception_timestamp_binds_to_actual_sampled_frame(tmp_path: Path) -> None:
-    state = parse_perception_state(
-        _state_json(fact_time=15.0004), ("A", "B")
-    )
+    state = parse_perception_state(_state_json(fact_time=15.0004), ("A", "B"))
     assert state is not None
 
     validated = validate_perception_state_observation(state, _observation(tmp_path))
@@ -305,9 +392,12 @@ def test_completeness_and_judge_prompts_remain_candidate_blind() -> None:
     )
     assert "PRIVATE_CANDIDATE_SENTINEL" not in json.dumps(messages)
     assert not messages_have_media(messages)
-    assert parse_completeness(
-        '{"evidence_complete":false,"missing_evidence":["later action"]}'
-    ).evidence_complete is False  # type: ignore[union-attr]
+    assert (
+        parse_completeness(
+            '{"evidence_complete":false,"missing_evidence":["later action"]}'
+        ).evidence_complete
+        is False
+    )  # type: ignore[union-attr]
 
 
 def test_confirmation_controller_hides_direct_branch_identity() -> None:
@@ -484,7 +574,11 @@ def test_rescue_first_action_is_private_free_then_controller_resumes_and_is_sft_
     assert result["error"] is None
     assert len(session.requests) == 1
     first_request = session.requests[0]
-    assert (first_request.start_time, first_request.end_time, first_request.nframes) == (
+    assert (
+        first_request.start_time,
+        first_request.end_time,
+        first_request.nframes,
+    ) == (
         0.0,
         50.0,
         64,
@@ -549,15 +643,18 @@ def test_rescue_variant_is_fail_closed_and_changes_run_fingerprint(
         "trajectory_schedule_id": "rescue-schedule-v1",
     }
     base = PerceptionMemoryEvaEvaluator(
-        **common, trajectory_variant_id="base"  # type: ignore[arg-type]
+        **common,
+        trajectory_variant_id="base",  # type: ignore[arg-type]
     )
     rescue = PerceptionMemoryEvaEvaluator(
-        **common, trajectory_variant_id="rescue_global32"  # type: ignore[arg-type]
+        **common,
+        trajectory_variant_id="rescue_global32",  # type: ignore[arg-type]
     )
     assert base.run_fingerprint() != rescue.run_fingerprint()
     with pytest.raises(ValueError, match="unsupported"):
         PerceptionMemoryEvaEvaluator(
-            **common, trajectory_variant_id="rescue_custom"  # type: ignore[arg-type]
+            **common,
+            trajectory_variant_id="rescue_custom",  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="require scoring_deferred"):
         PerceptionMemoryEvaEvaluator(
@@ -570,14 +667,10 @@ def test_rescue_variant_is_fail_closed_and_changes_run_fingerprint(
         )
     with pytest.raises(ValueError, match="unsupported"):
         rescue_frame_request("rescue_custom", 100.0)
-    assert _validate_perception_memory_variant("rescue_global64") == (
-        "rescue_global64"
-    )
+    assert _validate_perception_memory_variant("rescue_global64") == ("rescue_global64")
     with pytest.raises(ValueError, match="trajectory-variant-id"):
         _validate_perception_memory_variant("rescue_custom")
-    assert _candidate_superset_allowed(
-        "perception_memory_eva", True, "rescue_global64"
-    )
+    assert _candidate_superset_allowed("perception_memory_eva", True, "rescue_global64")
     assert not _candidate_superset_allowed(
         "perception_memory_eva", False, "rescue_global64"
     )
@@ -652,6 +745,93 @@ def test_evaluator_keeps_images_out_of_later_controller_and_judge(
     assert audit["backend"] == "perception_memory_eva"
     assert len(audit["implementation_sha256"]) == 64
     assert len(audit["implementation_bundle_sha256"]) == 64
+
+
+def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    payload = json.loads(_state_json())
+    payload["timestamped_facts"] = [
+        {"time": 15.0, "fact": f"visible fact {index}"} for index in range(20)
+    ]
+    payload["option_evidence"]["B"]["supports"] = [
+        "visible fact 19",
+        "redundant support",
+    ]
+    payload["option_evidence"]["A"]["contradicts"] = [
+        "visible fact 19",
+        "redundant contradiction",
+    ]
+    client = _FakeClient(
+        [
+            tool_call,
+            json.dumps(payload),
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert (
+        result["perception_normalization_version"] == PERCEPTION_NORMALIZATION_VERSION
+    )
+    state = result["perception_states"][0]["perception_response"]
+    assert len(state["timestamped_facts"]) == 12
+    assert any(item["fact"] == "visible fact 19" for item in state["timestamped_facts"])
+    raw = json.loads(
+        next(
+            item["content"]
+            for item in result["request_trace"]
+            if item["stage"] == "perception"
+        )
+    )
+    assert len(raw["timestamped_facts"]) == 20
+
+    judge_trace = next(
+        item for item in result["request_trace"] if item["stage"] == "evidence_judge"
+    )
+    result["perception_states"][0]["judge_confirmations"] = [
+        {
+            "judge_seed": seed,
+            "prediction": "A",
+            "evidence_ids": ["E0001"],
+            "request_messages": judge_trace["messages"],
+            "raw_response": judge_trace["content"],
+            "evidence_complete": True,
+            "annotation_leak_check": "passed",
+            "error": None,
+        }
+        for seed in (17, 42, 73)
+    ]
+    result["_selection_stable"] = True
+    records = build_perception_memory_sft_records(result)
+    memory_target = next(
+        record
+        for record in records
+        if record["metadata"]["episode_target_type"] == "memory"
+    )
+    assert (
+        len(json.loads(memory_target["messages"][-1]["content"])["timestamped_facts"])
+        == 12
+    )
 
 
 @pytest.mark.parametrize(

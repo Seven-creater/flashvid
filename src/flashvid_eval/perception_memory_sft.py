@@ -8,6 +8,7 @@ tool, media, and historical assistant turns stay masked by the shared builder.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -17,6 +18,11 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
+from .perception_memory_eva import (
+    PERCEPTION_NORMALIZATION_VERSION,
+    normalize_perception_state,
+    parse_perception_state,
+)
 from .qwen_sft import (
     build_sft_record,
     canonical_sha256,
@@ -45,9 +51,7 @@ _ANSWER_RE = re.compile(r"(?:Answer:\s*)?([A-H])", re.IGNORECASE)
 _OBSERVATION_STAGES = frozenset(
     {"perception", "observation", "observer", "confirmation_perception"}
 )
-_CONTROLLER_STAGES = frozenset(
-    {"controller", "planner", "confirmation_controller"}
-)
+_CONTROLLER_STAGES = frozenset({"controller", "planner", "confirmation_controller"})
 _PRIMARY_CONTROLLER_STAGES = frozenset({"controller", "planner"})
 _FINAL_STAGES = frozenset({"evidence_judge", "final_judge", "judge", "final"})
 
@@ -70,7 +74,9 @@ def _private_path(value: Any, path: str = "$") -> str | None:
             found = _private_path(item, f"{path}[{index}]")
             if found:
                 return found
-    elif isinstance(value, str) and any(marker in value for marker in _PRIVATE_SENTINELS):
+    elif isinstance(value, str) and any(
+        marker in value for marker in _PRIVATE_SENTINELS
+    ):
         return path
     return None
 
@@ -83,7 +89,9 @@ def _assert_public_messages(messages: Any, *, candidate_blind: bool) -> None:
         serialized = json.dumps(messages, ensure_ascii=False).casefold()
         marker = next((item for item in _CANDIDATE_MARKERS if item in serialized), None)
         if marker:
-            raise ValueError(f"candidate leaked into candidate-blind messages: {marker}")
+            raise ValueError(
+                f"candidate leaked into candidate-blind messages: {marker}"
+            )
 
 
 def _request_messages(request: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -122,7 +130,9 @@ def _media_paths(messages: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
                 continue
             item_type = str(item.get("type") or "")
             if item_type == "video_url":
-                raise ValueError("Perception-Memory SFT accepts frames, not video inputs")
+                raise ValueError(
+                    "Perception-Memory SFT accepts frames, not video inputs"
+                )
             if item_type != "image_url":
                 continue
             image_url = item.get("image_url")
@@ -183,10 +193,15 @@ def _validate_perception_response(value: Any) -> dict[str, Any]:
     if (
         not isinstance(interval, list)
         or len(interval) != 2
-        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in interval)
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in interval
+        )
         or float(interval[1]) <= float(interval[0])
     ):
-        raise ValueError("perception_response.interval must be an increasing numeric pair")
+        raise ValueError(
+            "perception_response.interval must be an increasing numeric pair"
+        )
     facts = response["timestamped_facts"]
     if not isinstance(facts, list):
         raise ValueError("timestamped_facts must be a list")
@@ -204,21 +219,116 @@ def _validate_perception_response(value: Any) -> dict[str, Any]:
     for option, evidence in option_evidence.items():
         if len(str(option)) != 1 or not "A" <= str(option).upper() <= "H":
             raise ValueError("option_evidence keys must be A-H letters")
-        if not isinstance(evidence, Mapping) or set(evidence) != {"supports", "contradicts"}:
+        if not isinstance(evidence, Mapping) or set(evidence) != {
+            "supports",
+            "contradicts",
+        }:
             raise ValueError(f"option_evidence[{option}] has invalid schema")
         for relation in ("supports", "contradicts"):
             values = evidence[relation]
-            if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
-                raise ValueError(f"option_evidence[{option}].{relation} must be a string list")
+            if not isinstance(values, list) or any(
+                not isinstance(item, str) for item in values
+            ):
+                raise ValueError(
+                    f"option_evidence[{option}].{relation} must be a string list"
+                )
     for field in ("temporal_changes", "unresolved"):
         values = response[field]
-        if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
+        if not isinstance(values, list) or any(
+            not isinstance(item, str) for item in values
+        ):
             raise ValueError(f"perception_response.{field} must be a string list")
     if not isinstance(response["evidence_sufficient"], bool):
         raise ValueError("evidence_sufficient must be boolean")
     if not isinstance(response["next_evidence_needed"], str):
         raise ValueError("next_evidence_needed must be text")
     return response
+
+
+def _normalize_raw_perception_response(
+    value: Any,
+    *,
+    valid_letters: Sequence[str],
+    resolved_start_time: Any,
+    resolved_end_time: Any,
+    actual_timestamps: Sequence[Any],
+) -> dict[str, Any]:
+    """Apply the runtime's exact validation/compaction to one raw response."""
+
+    if not isinstance(value, str):
+        raise ValueError("perception response must be raw JSON text")
+    state = parse_perception_state(value, valid_letters)
+    if state is None:
+        raise ValueError("raw perception response failed the frozen parser")
+    private = _private_path(state.to_dict(), "$.raw_perception_response")
+    if private:
+        raise ValueError(f"private annotation in perception response at {private}")
+    normalized = normalize_perception_state(
+        state,
+        resolved_start_time=resolved_start_time,
+        resolved_end_time=resolved_end_time,
+        actual_timestamps=actual_timestamps,
+    )
+    return normalized.to_dict()
+
+
+def _public_option_letters(trajectory: Mapping[str, Any]) -> tuple[str, ...]:
+    public = trajectory.get("public_sample")
+    choices = public.get("choices") if isinstance(public, Mapping) else None
+    if not isinstance(choices, Mapping) or not choices:
+        raise ValueError("selected trajectory requires public_sample.choices")
+    letters = tuple(str(item).strip().upper() for item in choices)
+    if len(letters) != len(set(letters)) or any(
+        len(item) != 1 or not "A" <= item <= "H" for item in letters
+    ):
+        raise ValueError("public_sample.choices has invalid option labels")
+    return letters
+
+
+def _numeric_tuple(value: Any, field: str) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be a numeric array")
+    result: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise ValueError(f"{field} must be a numeric array")
+        number = float(item)
+        if not math.isfinite(number):
+            raise ValueError(f"{field} must contain finite numbers")
+        result.append(number)
+    return tuple(result)
+
+
+def _tool_state_contract(
+    tool_steps: Sequence[Any], state: Mapping[str, Any], step_index: int
+) -> tuple[float, float, tuple[float, ...]]:
+    if step_index >= len(tool_steps) or not isinstance(tool_steps[step_index], Mapping):
+        raise ValueError(f"prefix {step_index} has no corresponding tool_step")
+    tool = tool_steps[step_index]
+    state_paths = tuple(str(Path(str(item)).resolve()) for item in state["frame_paths"])
+    tool_paths_raw = tool.get("frame_paths")
+    if not isinstance(tool_paths_raw, (list, tuple)):
+        raise ValueError(f"tool_steps[{step_index}].frame_paths must be an array")
+    tool_paths = tuple(str(Path(str(item)).resolve()) for item in tool_paths_raw)
+    if state_paths != tool_paths:
+        raise ValueError(f"prefix {step_index} state/tool frame paths differ")
+    state_timestamps = _numeric_tuple(state["timestamps"], "state timestamps")
+    tool_timestamps = _numeric_tuple(
+        tool.get("actual_timestamps", tool.get("timestamps")),
+        f"tool_steps[{step_index}] timestamps",
+    )
+    if state_timestamps != tool_timestamps or len(tool_timestamps) != len(tool_paths):
+        raise ValueError(f"prefix {step_index} state/tool timestamps differ")
+    start = tool.get("resolved_start_time", tool.get("start_time"))
+    end = tool.get("resolved_end_time", tool.get("end_time"))
+    if (
+        isinstance(start, bool)
+        or not isinstance(start, (int, float))
+        or isinstance(end, bool)
+        or not isinstance(end, (int, float))
+    ):
+        raise ValueError(f"tool_steps[{step_index}] has invalid resolved interval")
+    return float(start), float(end), tool_timestamps
 
 
 def _state_memory(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -244,12 +354,18 @@ def _state_memory(state: Mapping[str, Any]) -> dict[str, Any]:
     return memory
 
 
-def _terminal_requests(trace: Sequence[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+def _terminal_requests(
+    trace: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
     groups: dict[tuple[str, int, int, str, str], list[tuple[int, dict[str, Any]]]] = {}
     for index, raw in enumerate(trace):
         request = dict(raw)
         step_index = request.get("step_index", request.get("prefix_index"))
-        if isinstance(step_index, bool) or not isinstance(step_index, int) or step_index < 0:
+        if (
+            isinstance(step_index, bool)
+            or not isinstance(step_index, int)
+            or step_index < 0
+        ):
             raise ValueError(f"request_trace[{index}] has invalid step_index")
         prefix_index = request.get("prefix_index")
         if (
@@ -275,7 +391,9 @@ def _terminal_requests(trace: Sequence[Mapping[str, Any]]) -> tuple[dict[str, An
             raise ValueError("request attempt_index must be an integer")
         if len(indices) != len(set(indices)):
             raise ValueError("request retries require unique attempt_index values")
-        position, request = max(attempts, key=lambda item: int(item[1].get("attempt_index", 0)))
+        position, request = max(
+            attempts, key=lambda item: int(item[1].get("attempt_index", 0))
+        )
         if request.get("finish_reason") == "length":
             raise ValueError("terminal process-SFT request is truncated")
         if any(request.get(field) for field in _ERROR_FIELDS):
@@ -290,14 +408,18 @@ def _official_tool_target(content: Any) -> str | None:
     matches = list(_TOOL_CALL_RE.finditer(content))
     if not matches:
         return None
-    if content.count("<tool_call>") != len(matches) or content.count("</tool_call>") != len(matches):
+    if content.count("<tool_call>") != len(matches) or content.count(
+        "</tool_call>"
+    ) != len(matches):
         raise ValueError("controller response has malformed tool markup")
     blocks: list[str] = []
     for match in matches:
         try:
             payload = json.loads(match.group(1))
         except json.JSONDecodeError as error:
-            raise ValueError("controller frame_select call is not valid JSON") from error
+            raise ValueError(
+                "controller frame_select call is not valid JSON"
+            ) from error
         if not isinstance(payload, Mapping) or payload.get("tool") != "frame_select":
             raise ValueError("controller may only call official frame_select")
         arguments = payload.get("arguments")
@@ -307,7 +429,9 @@ def _official_tool_target(content: Any) -> str | None:
             raise ValueError("frame_select requires exactly one of nframes or fps")
         blocks.append(
             "<tool_call>"
-            + json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
             + "</tool_call>"
         )
     return "\n".join(blocks)
@@ -422,7 +546,9 @@ def _accepted_controller_requests(
 
 
 def _confirmation_gate(state: Mapping[str, Any], prediction: str) -> None:
-    confirmations = state.get("judge_confirmations", state.get("completion_confirmations"))
+    confirmations = state.get(
+        "judge_confirmations", state.get("completion_confirmations")
+    )
     if not isinstance(confirmations, list) or len(confirmations) != 3:
         raise ValueError("complete prefix requires exactly 3 Judge confirmations")
     memory = _state_memory(state)
@@ -440,9 +566,15 @@ def _confirmation_gate(state: Mapping[str, Any], prediction: str) -> None:
         if not seed or seed in seeds:
             raise ValueError("complete prefix requires 3 unique Judge seeds")
         seeds.add(seed)
-        answer = str(
-            raw.get("final_prediction", raw.get("prediction", raw.get("answer", "")))
-        ).strip().upper()
+        answer = (
+            str(
+                raw.get(
+                    "final_prediction", raw.get("prediction", raw.get("answer", ""))
+                )
+            )
+            .strip()
+            .upper()
+        )
         if answer != prediction or raw.get("evidence_complete") is not True:
             raise ValueError("complete prefix is not 3/3 evidence-correct")
         evidence_ids = raw.get("evidence_ids")
@@ -532,7 +664,9 @@ def _episode_record(
             "prefix_complete": prefix_complete,
             "process_role": role,
             "stage": _stage(request),
-            "prompt_hash": str(request.get("prompt_hash") or canonical_sha256(request.get("messages"))),
+            "prompt_hash": str(
+                request.get("prompt_hash") or canonical_sha256(request.get("messages"))
+            ),
             "finish_reason": request.get("finish_reason"),
             "episode_target_type": target_type,
             "evidence_memory_sha256": canonical_sha256(memory),
@@ -546,19 +680,32 @@ def _episode_record(
 def validate_selected_trajectory(trajectory: Mapping[str, Any]) -> None:
     """Enforce the per-trajectory gate before process-SFT export."""
 
+    if (
+        trajectory.get("perception_normalization_version")
+        != PERCEPTION_NORMALIZATION_VERSION
+    ):
+        raise ValueError(
+            "selected trajectory has incompatible perception normalization"
+        )
+    _public_option_letters(trajectory)
     if trajectory.get("_selection_stable") is not True:
         raise ValueError("process SFT requires a stable selected trajectory")
     if trajectory.get("annotation_leak_check") != "passed":
         raise ValueError("selected trajectory failed annotation leak audit")
     if int(trajectory.get("candidate_rerun") or 0) != 0:
         raise ValueError("selected trajectory reran its frozen candidate")
-    if trajectory.get("fallback_used") is True or trajectory.get("fallback_to_candidate") is True:
+    if (
+        trajectory.get("fallback_used") is True
+        or trajectory.get("fallback_to_candidate") is True
+    ):
         raise ValueError("selected trajectory may not depend on candidate fallback")
     if any(trajectory.get(field) for field in _ERROR_FIELDS):
         raise ValueError("selected trajectory contains an engineering error")
-    prediction = str(
-        trajectory.get("final_prediction", trajectory.get("prediction", ""))
-    ).strip().upper()
+    prediction = (
+        str(trajectory.get("final_prediction", trajectory.get("prediction", "")))
+        .strip()
+        .upper()
+    )
     if len(prediction) != 1 or not "A" <= prediction <= "H":
         raise ValueError("selected trajectory has no A-H final_prediction")
     tool_steps = trajectory.get("tool_steps")
@@ -566,8 +713,15 @@ def validate_selected_trajectory(trajectory: Mapping[str, Any]) -> None:
     trace = trajectory.get("request_trace")
     if not isinstance(tool_steps, list) or not tool_steps:
         raise ValueError("selected trajectory requires at least one frame_select")
-    if not isinstance(states, list) or not states or not isinstance(trace, list) or not trace:
-        raise ValueError("selected trajectory requires perception_states and request_trace")
+    if (
+        not isinstance(states, list)
+        or not states
+        or not isinstance(trace, list)
+        or not trace
+    ):
+        raise ValueError(
+            "selected trajectory requires perception_states and request_trace"
+        )
     for index, raw in enumerate(states):
         if not isinstance(raw, Mapping):
             raise ValueError(f"perception_states[{index}] must be an object")
@@ -594,7 +748,9 @@ def validate_selected_trajectory(trajectory: Mapping[str, Any]) -> None:
     for state in states:
         if state.get("evidence_complete") is True:
             _confirmation_gate(state, prediction)
-    _terminal_requests([dict(item) if isinstance(item, Mapping) else item for item in trace])
+    _terminal_requests(
+        [dict(item) if isinstance(item, Mapping) else item for item in trace]
+    )
 
 
 def build_perception_memory_sft_records(
@@ -604,12 +760,16 @@ def build_perception_memory_sft_records(
 
     validate_selected_trajectory(trajectory)
     states = trajectory["perception_states"]
+    valid_letters = _public_option_letters(trajectory)
+    tool_steps = trajectory["tool_steps"]
     first_complete_index = next(
         index for index, state in enumerate(states) if state["evidence_complete"]
     )
     training_states = states[: first_complete_index + 1]
     requests = _terminal_requests(trajectory["request_trace"])
-    prediction = str(trajectory.get("final_prediction", trajectory.get("prediction"))).upper()
+    prediction = str(
+        trajectory.get("final_prediction", trajectory.get("prediction"))
+    ).upper()
     records: list[dict[str, Any]] = []
     initial_requests = _accepted_controller_requests(requests, -1)
     initial_actions: list[tuple[Mapping[str, Any], str, str]] = []
@@ -651,13 +811,17 @@ def build_perception_memory_sft_records(
             raise ValueError(
                 f"prefix {step_index} perception request does not contain only current frames"
             )
-        response = _validate_perception_response(state["perception_response"])
-        observed_payload = _validate_perception_response(
-            _json_object(observation.get("content"), "perception response")
+        resolved_start, resolved_end, actual_timestamps = _tool_state_contract(
+            tool_steps, state, step_index
         )
-        # The runtime replaces the model-reported interval with the frame
-        # tool's resolved bounds.  That is the only permitted normalization.
-        observed_payload["interval"] = deepcopy(response["interval"])
+        response = _validate_perception_response(state["perception_response"])
+        observed_payload = _normalize_raw_perception_response(
+            observation.get("content"),
+            valid_letters=valid_letters,
+            resolved_start_time=resolved_start,
+            resolved_end_time=resolved_end,
+            actual_timestamps=actual_timestamps,
+        )
         if canonical_sha256(observed_payload) != canonical_sha256(response):
             raise ValueError("perception state differs from the actual model response")
         complete = bool(state["evidence_complete"])
@@ -760,7 +924,9 @@ def build_perception_memory_sft_records(
     if target_counts["final"] != 1:
         raise ValueError("selected trajectory must export exactly one final target")
     if target_counts["memory"] != len(training_states):
-        raise ValueError("every retained perception prefix must export one memory target")
+        raise ValueError(
+            "every retained perception prefix must export one memory target"
+        )
     return tuple(records)
 
 
@@ -806,8 +972,12 @@ def summarize_perception_memory_sft(
             )
             for row in rows
         )
-        if targets["memory"] != expected_memory_targets or targets["final"] != len(rows):
-            raise ValueError("process-SFT target coverage does not match selected prefixes")
+        if targets["memory"] != expected_memory_targets or targets["final"] != len(
+            rows
+        ):
+            raise ValueError(
+                "process-SFT target coverage does not match selected prefixes"
+            )
     return {
         "selected_trajectories": len(rows),
         "selected_by_dataset": dict(sorted(by_dataset.items())),
@@ -837,7 +1007,10 @@ def enforce_perception_memory_selection_gate(
         minimum_candidate_fixes,
         minimum_candidate_fixes_per_dataset,
     )
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in limits):
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in limits
+    ):
         raise ValueError("selection gate thresholds must be non-negative integers")
     summary = summarize_perception_memory_sft(trajectories, records)
     failures: list[str] = []
@@ -850,7 +1023,9 @@ def enforce_perception_memory_selection_gate(
             summary["candidate_fixes_by_dataset"].get(dataset, 0)
             < minimum_candidate_fixes_per_dataset
         ):
-            failures.append(f"{dataset}_candidate_fixes<{minimum_candidate_fixes_per_dataset}")
+            failures.append(
+                f"{dataset}_candidate_fixes<{minimum_candidate_fixes_per_dataset}"
+            )
     if summary["candidate_fixes"] < minimum_candidate_fixes:
         failures.append(f"candidate_fixes<{minimum_candidate_fixes}")
     if failures:

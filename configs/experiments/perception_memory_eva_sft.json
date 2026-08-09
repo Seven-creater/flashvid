@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "experiment_id": "perception-memory-eva-process-sft-v1",
+  "result_root": "/data02/usr/wangqihao/Demo/test/qwen_agent_search_sft/results/eval/perception_memory_eva_sft",
+  "datasets": {
+    "lvbench": {
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_train.jsonl",
+        "sha256": "5e0ec526ba3645a0c230943fbed50e0c302a7a519dfb29371f54777875b29cc2",
+        "samples": 200
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_dev.jsonl",
+        "sha256": "c1fb73c070dac5a99c1d1f66a7b50ccc3475b520c8595f451e30d755e5d357f1",
+        "samples": 50
+      },
+      "final": {
+        "role": "fixed_engineering_test",
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl",
+        "sha256": "2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb",
+        "samples": 100,
+        "replacement_forbidden": true
+      }
+    },
+    "lsdbench": {
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_train.jsonl",
+        "sha256": "5bd1d9c6be5bdc44c7a9bd796e2110863b4df8e1b3435d84bcff51ca2d491cd1",
+        "samples": 200
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_dev.jsonl",
+        "sha256": "c6e1840e055e53fe48fa831ab4b193267af87054155e1b87abcfb12260e31b39",
+        "samples": 50
+      },
+      "final": {
+        "role": "fixed_engineering_test",
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lsdbench_manifest_42_100.jsonl",
+        "sha256": "37dbd946d8abe870ac4eec7d8d1f787c99c148f43546a97371cb13a8856e68d2",
+        "samples": 100,
+        "replacement_forbidden": true
+      }
+    },
+    "cgbench": {
+      "train": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_train.jsonl",
+        "sha256": "1c7d631c17cfbd578056a2616539bd4e20d24acf1c22ead86ada69197dcaf6c8",
+        "samples": 200
+      },
+      "dev": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_dev.jsonl",
+        "sha256": "fb9239f0243db7abd9b007bd53315abf2fa637540ddf8fee2cee5b9bdec23815",
+        "samples": 50
+      },
+      "final": {
+        "role": "fixed_engineering_test",
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/cgbench_manifest_42_100.jsonl",
+        "sha256": "4f60b2876d896741529733841e9497b123c75fee0f5a428c761ac689d8b1b0a6",
+        "samples": 100,
+        "replacement_forbidden": true
+      }
+    }
+  },
+  "train600": {
+    "path": "/data02/usr/wangqihao/Demo/test/qwen_agent_search/results/eval/qwen_agent_search/frozen/train600.jsonl",
+    "sha256": "3995454d973aeb6efe6887e821cd5197e0f17a5b9cc32d7c719e6583b487e6c0",
+    "samples": 600,
+    "per_dataset": 200
+  },
+  "data_isolation": {
+    "unit": "video_uid",
+    "train_dev_final_pairwise_disjoint": true,
+    "cross_dataset_absolute_video_disjoint": true,
+    "test_manifest_mutation_forbidden": true,
+    "test_sample_replacement_forbidden": true
+  },
+  "diagnostics_gate": {
+    "hard_gate_before_runtime_or_trajectory_generation": true,
+    "summary_path": "results/eval/perception_memory_eva_sft/diagnostics/current_sft_badcases/summary.json",
+    "paired_rows_path": "results/eval/perception_memory_eva_sft/diagnostics/current_sft_badcases/paired_badcases.jsonl",
+    "required_paired_samples": 300,
+    "required_samples_per_dataset": 100,
+    "required_flip_groups": [
+      "untrained_correct_sft_wrong",
+      "untrained_wrong_sft_correct",
+      "both_correct",
+      "both_wrong"
+    ],
+    "required_failure_taxonomy": [
+      "localization",
+      "visual_fact_extraction",
+      "cross_interval_memory",
+      "incomplete_evidence_early_stop",
+      "judging",
+      "candidate_gate",
+      "engineering"
+    ],
+    "required_funnel": [
+      "target_hit",
+      "evidence_state_valid",
+      "evidence_complete",
+      "judge_correct"
+    ],
+    "old_v4_rows_may_not_satisfy_gate": true
+  },
+  "runtime": {
+    "backend": "perception_memory_eva",
+    "agent_version": "perception_memory_v1",
+    "model": "Qwen3.5-9B",
+    "model_path": "/data02/usr/wangqihao/Demo/test/eva_baseline/models/Qwen3.5-9B",
+    "allowed_models": ["Qwen3.5-9B"],
+    "official_eva_commit": "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a",
+    "allowed_frame_tools": ["official_eva_frame_select", "ffmpeg", "decord"],
+    "forbidden_semantic_tools": [
+      "clip",
+      "ocr",
+      "asr",
+      "object_detector",
+      "external_retrieval_model"
+    ],
+    "candidate_rerun": false,
+    "max_evidence_steps": 6,
+    "temperature": 0.0,
+    "controller_media_count": 0,
+    "perception_current_frame_batch_only": true,
+    "perception_candidate_blind": true,
+    "retrieval_candidate_blind": true,
+    "completeness_candidate_blind": true,
+    "judge_candidate_blind": true,
+    "drop_images_after_perception": true,
+    "retain_text_ledgers": ["event_ledger", "option_ledger"],
+    "targeted_confirmation_before_candidate_change": true,
+    "candidate_change_requires_two_blind_judges": true,
+    "candidate_change_requires_valid_evidence_ids": true,
+    "fallback_to_frozen_candidate_on_failure": true,
+    "private_request_fields_forbidden": [
+      "answer",
+      "time_range",
+      "clue_intervals",
+      "question_type"
+    ]
+  },
+  "process_sft_data": {
+    "source_split": "train600_only",
+    "reuse_cached_teacher_intervals_and_frames": true,
+    "regenerate_perception_state_for_every_tool_step": true,
+    "coverage_variants_for_samples_without_stable_positive": 4,
+    "coverage_variant_ids": [
+      "rescue_global32",
+      "rescue_global64",
+      "rescue_first_half64",
+      "rescue_second_half64"
+    ],
+    "stable_judge_seeds": [17, 42, 73],
+    "stable_evidence_only_judges_required": 3,
+    "minimum_stable_questions": 360,
+    "minimum_stable_per_dataset": 100,
+    "minimum_candidate_fixes": 90,
+    "minimum_candidate_fixes_per_dataset": 20,
+    "candidate_fix_oversampling_max": 2.0,
+    "prefix_stages": [
+      "unobserved",
+      "irrelevant_observation",
+      "partial_evidence",
+      "complete_evidence"
+    ],
+    "incomplete_prefix_target": "continue_and_next_frame_select",
+    "complete_prefix_may_target_stop_only_after_3_of_3": true,
+    "retain_failed_tail_deletion_as_continue_example": true,
+    "rank_cost_only_among_stable_correct_trajectories": true,
+    "ground_truth_join_after_all_model_requests": true
+  },
+  "sft": {
+    "framework": "ms-swift==4.4.2",
+    "base_model": "Qwen3.5-9B",
+    "lora_rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": "lm_all_linear",
+    "freeze_vit": true,
+    "freeze_aligner": true,
+    "dtype": "bf16",
+    "gradient_checkpointing": true,
+    "max_length": 16384,
+    "effective_batch_size": 32,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.05,
+    "weight_decay": 0.01,
+    "epochs": 3,
+    "save_each_epoch": true,
+    "loss_targets": [
+      "perception_state",
+      "event_ledger_update",
+      "option_ledger_update",
+      "frame_select",
+      "continue_stop",
+      "final_answer"
+    ],
+    "masked_inputs": [
+      "system",
+      "user",
+      "images",
+      "timestamps",
+      "tool_response",
+      "hidden_reasoning"
+    ]
+  },
+  "dev_selection": {
+    "baseline": "same_runtime_untrained_qwen3.5_9b",
+    "initial_seeds": [42],
+    "promotion_seeds": [17, 73],
+    "aggregate_seeds": [17, 42, 73],
+    "minimum_mean_correct_gain_out_of_150": 3,
+    "per_dataset_non_decrease": true,
+    "maximum_mean_total_token_ratio": 0.7,
+    "maximum_mean_visual_token_ratio": 0.7,
+    "incomplete_evidence_stops_must_decrease": true,
+    "maximum_engineering_failure_rate": 0.01,
+    "annotation_leak_required": 0,
+    "candidate_rerun_required": 0,
+    "duplicate_sample_id_required": 0,
+    "freeze_one_winner_only": true
+  },
+  "final_test": {
+    "requires_dev_gate_passed": true,
+    "run_once": true,
+    "checkpoint_selection_from_test_forbidden": true,
+    "minimum_correct_gain_vs_same_runtime_untrained_out_of_300": 6,
+    "minimum_total_correct_out_of_300": 157,
+    "minimum_dataset_correct": {
+      "lvbench": 45,
+      "lsdbench": 63,
+      "cgbench": 43
+    },
+    "per_dataset_non_decrease_vs_same_runtime_untrained": true,
+    "maximum_mean_total_token_ratio": 0.7,
+    "maximum_mean_visual_token_ratio": 0.7,
+    "report_runtime_and_sft_token_effects_separately": true
+  },
+  "network_policy": {
+    "execution_host": "server_only",
+    "local_pc_downloads_forbidden": true,
+    "hf_endpoint": "https://hf-mirror.com",
+    "remote_model_or_data_downloads_must_use_hf_mirror": true,
+    "pypi_index_url": "https://pypi.tuna.tsinghua.edu.cn/simple"
+  },
+  "orchestration": {
+    "setsid": true,
+    "nohup": true,
+    "resume": true,
+    "config_fingerprint_required": true,
+    "stage_order": [
+      "validate_config_and_split_isolation",
+      "audit_current_sft_badcases",
+      "freeze_untrained_dev_baseline",
+      "generate_observation_states",
+      "build_and_gate_prefix_sft_data",
+      "train_three_epochs",
+      "evaluate_dev_seed_42",
+      "evaluate_promoted_checkpoints_seeds_17_73",
+      "freeze_unique_dev_winner",
+      "run_test300_once_if_dev_gate_passed"
+    ],
+    "stop_on_failed_gate": true,
+    "automatic_test_run_on_failed_dev_gate": false,
+    "periodic_monitoring_required": false,
+    "check_at_stage_completion_or_failure": true
+  }
+}

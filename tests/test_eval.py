@@ -402,6 +402,61 @@ def test_fast_hybrid_records_missing_source_without_model_leak(tmp_path: Path) -
     assert record["candidate_rerun"] == 0
 
 
+def test_perception_memory_backend_uses_annotation_free_model_sample(
+    tmp_path: Path,
+) -> None:
+    class FakeEvaluator:
+        def run_fingerprint(self) -> str:
+            return "perception-memory-test"
+
+        def run(self, sample: ModelSample) -> dict[str, object]:
+            assert not hasattr(sample, "metadata")
+            assert sample.candidate_answer == "B"
+            return {
+                "prediction": "A",
+                "final_prediction": "A",
+                "candidate_answer": "B",
+                "candidate_rerun": 0,
+                "annotation_leak_check": "passed",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                },
+                "visual_tokens": 4,
+                "visual_usage_complete": True,
+                "agent_total_tokens_complete": True,
+            }
+
+    sample = Sample(
+        "lvbench",
+        "pm-1",
+        "v.mp4",
+        "Q",
+        {"A": "yes", "B": "no"},
+        "A",
+        metadata={"time_range": "SECRET_ANNOTATION_SENTINEL"},
+    )
+    output_dir = tmp_path / "pm"
+    evaluate(
+        [sample],
+        FakeEvaluator(),
+        "perception_memory_eva",
+        output_dir,
+        candidate_answers={"pm-1": "B"},
+        candidate_sources={"pm-1": "parsed"},
+    )
+    record = json.loads(
+        (output_dir / "lvbench_perception_memory_eva.jsonl").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert record["correct"] is True
+    assert record["candidate_rerun"] == 0
+    assert record["candidate_source"] == "parsed"
+    assert record["run_fingerprint"] == "perception-memory-test"
+
+
 def test_fast_hybrid_resume_stamps_legacy_missing_fingerprint(tmp_path: Path) -> None:
     class FrozenEvaluator:
         calls = 0

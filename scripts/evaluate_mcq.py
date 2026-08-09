@@ -18,6 +18,10 @@ from flashvid_eval.flashvid_hybrid import (
     evaluate_flashvid_trajectories,
 )
 from flashvid_eval.fast_hybrid_eva import FastHybridEvaEvaluator, OFFICIAL_EVA_COMMIT
+from flashvid_eval.perception_memory_eva import (
+    RESCUE_TRAJECTORY_VARIANTS,
+    PerceptionMemoryEvaEvaluator,
+)
 from flashvid_eval.offline_budget import normalize_candidate
 from flashvid_eval.answers import extract_strict_answer_letter
 from flashvid_eval.qwen_evaluation import (
@@ -92,6 +96,90 @@ def _validated_sha256(value: str | None, label: str) -> str:
     ):
         raise ValueError(f"{label} must be 64 hexadecimal characters")
     return value.lower()
+
+
+def _validate_perception_memory_diagnostics_gate(path: Path) -> str:
+    """Fail closed unless the current Fast-Hybrid Test300 audit is complete."""
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Perception-Memory diagnostics summary must be an object")
+    if payload.get("status") != "passed" or payload.get("scope_passed") is not True:
+        raise ValueError("Perception-Memory paired badcase audit did not pass")
+    if payload.get("paired_samples", payload.get("samples")) != 300:
+        raise ValueError("Perception-Memory paired badcase audit must contain 300 samples")
+    datasets = payload.get("datasets")
+    expected_datasets = {"lvbench", "lsdbench", "cgbench"}
+    if not isinstance(datasets, dict) or set(datasets) != expected_datasets:
+        raise ValueError("Perception-Memory paired badcase audit has the wrong dataset scope")
+    if any(
+        not isinstance(datasets[name], dict) or datasets[name].get("samples") != 100
+        for name in expected_datasets
+    ):
+        raise ValueError("Perception-Memory paired badcase audit requires 100 samples per dataset")
+    required_flips = {
+        "untrained_correct_sft_wrong",
+        "untrained_wrong_sft_correct",
+        "both_correct",
+        "both_wrong",
+    }
+    required_failures = {
+        "localization",
+        "visual_fact_extraction",
+        "cross_interval_memory",
+        "incomplete_evidence_early_stop",
+        "judging",
+        "candidate_gate",
+        "engineering",
+    }
+    if set(payload.get("flip_totals") or {}) != required_flips:
+        raise ValueError("Perception-Memory paired badcase audit has incomplete flip groups")
+    if set(payload.get("failure_mode_totals") or {}) != required_failures:
+        raise ValueError("Perception-Memory paired badcase audit has incomplete failure taxonomy")
+    if (
+        payload.get("taxonomy_coverage_passed") is not True
+        or payload.get("taxonomy_classified") != payload.get("taxonomy_required")
+    ):
+        raise ValueError("Perception-Memory paired badcase audit has unclassified failures")
+    required_funnel = {
+        "target_hit",
+        "evidence_state_valid",
+        "evidence_complete",
+        "judge_correct",
+    }
+    if any(
+        set((datasets[name].get("funnel") or {})) != required_funnel
+        for name in expected_datasets
+    ):
+        raise ValueError("Perception-Memory paired badcase audit has an incomplete funnel")
+    return _file_sha256(path)
+
+
+def _validate_perception_memory_variant(value: str) -> str:
+    """Accept only the base schedule or a pre-registered duration-only rescue."""
+
+    variant = str(value).strip()
+    allowed = {"base", *RESCUE_TRAJECTORY_VARIANTS}
+    if variant not in allowed:
+        raise ValueError(
+            "perception_memory_eva trajectory-variant-id must be one of: "
+            + ", ".join(sorted(allowed))
+        )
+    return variant
+
+
+def _candidate_superset_allowed(
+    backend: str, defer_scoring: bool, trajectory_variant_id: str
+) -> bool:
+    """Allow a frozen Train200 candidate file for a label-free rescue subset."""
+
+    return bool(
+        backend == "perception_memory_eva"
+        and defer_scoring
+        and trajectory_variant_id in RESCUE_TRAJECTORY_VARIANTS
+    )
 
 
 def _stable_model_slug(model: str) -> str:
@@ -487,6 +575,7 @@ def main() -> None:
             "hybrid",
             "hybrid_frozen",
             "fast_hybrid_eva",
+            "perception_memory_eva",
             "flashvid_hybrid",
             "qwen_baseline",
             "qwen_agent",
@@ -505,6 +594,7 @@ def main() -> None:
     parser.add_argument("--frame-root", type=Path)
     parser.add_argument("--concurrency", type=int, default=32)
     parser.add_argument("--max-turns", type=int)
+    parser.add_argument("--max-frames-per-call", type=int, default=128)
     parser.add_argument("--max-call-visual-tokens", type=int, default=4000)
     parser.add_argument("--max-total-visual-tokens", type=int, default=8000)
     parser.add_argument(
@@ -525,6 +615,7 @@ def main() -> None:
             "hybrid_v3g",
             "fast_hybrid_v1",
             "fast_hybrid_v2",
+            "perception_memory_v1",
             "flashvid_budget_v1",
         ),
         default="v2a",
@@ -579,6 +670,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--diagnostics-gate-summary",
+        type=Path,
+        help=(
+            "Passed 300-sample paired badcase audit. Required by "
+            "perception_memory_eva before any model request."
+        ),
+    )
+    parser.add_argument(
         "--trajectory-schedule-id",
         help="Stable schedule identity for a label-free Qwen trajectory run.",
     )
@@ -594,8 +693,8 @@ def main() -> None:
         "--trajectory-variant-id",
         default="base",
         help=(
-            "Trajectory family variant. Normal 12-schedule generation uses 'base'; "
-            "the frozen dense A4 recovery path uses 'rescue'."
+            "Trajectory family variant. Perception-Memory accepts base plus its four "
+            "pre-registered duration-only rescue coverage variants."
         ),
     )
     parser.add_argument("--candidate-results", type=Path)
@@ -732,9 +831,14 @@ def main() -> None:
         help="Poll partial downloads until --sample accessible items exist.",
     )
     args = parser.parse_args()
-    if args.defer_scoring and args.backend not in {"qwen_agent", "fast_hybrid_eva"}:
+    if args.defer_scoring and args.backend not in {
+        "qwen_agent",
+        "fast_hybrid_eva",
+        "perception_memory_eva",
+    }:
         raise ValueError(
-            "--defer-scoring is supported only by qwen_agent and fast_hybrid_eva"
+            "--defer-scoring is supported only by qwen_agent, fast_hybrid_eva, "
+            "and perception_memory_eva"
         )
     if args.perception_temperature != 0.0:
         raise ValueError("FlashVID perception temperature is frozen at 0")
@@ -1185,27 +1289,50 @@ def main() -> None:
                     },
             },
         )
-    elif args.backend == "fast_hybrid_eva":
-        if args.agent_version not in {"fast_hybrid_v1", "fast_hybrid_v2"}:
+    elif args.backend in {"fast_hybrid_eva", "perception_memory_eva"}:
+        diagnostics_gate_sha256 = None
+        if (
+            args.backend == "fast_hybrid_eva"
+            and args.agent_version not in {"fast_hybrid_v1", "fast_hybrid_v2"}
+        ):
             raise ValueError(
                 "fast_hybrid_eva requires --agent-version fast_hybrid_v1 or fast_hybrid_v2"
             )
+        if (
+            args.backend == "perception_memory_eva"
+            and args.agent_version != "perception_memory_v1"
+        ):
+            raise ValueError(
+                "perception_memory_eva requires --agent-version perception_memory_v1"
+            )
+        if args.backend == "perception_memory_eva":
+            args.trajectory_variant_id = _validate_perception_memory_variant(
+                args.trajectory_variant_id
+            )
+            if args.diagnostics_gate_summary is None:
+                raise ValueError(
+                    "perception_memory_eva requires --diagnostics-gate-summary"
+                )
+            diagnostics_gate_sha256 = _validate_perception_memory_diagnostics_gate(
+                args.diagnostics_gate_summary
+            )
         if args.candidate_results is None or not args.candidate_results.is_file():
             raise ValueError(
-                "fast_hybrid_eva requires --candidate-results with frozen clean Direct output"
+                f"{args.backend} requires --candidate-results with frozen clean Direct output"
             )
         if args.defer_scoring:
             if args.trajectory_schedule_id is None:
                 raise ValueError(
-                    "fast_hybrid_eva --defer-scoring requires --trajectory-schedule-id"
+                    f"{args.backend} --defer-scoring requires --trajectory-schedule-id"
                 )
             if args.expected_agent_config_sha256 is not None:
                 raise ValueError(
-                    "fast_hybrid_eva uses its pinned implementation, not --expected-agent-config-sha256"
+                    f"{args.backend} uses its pinned implementation, not "
+                    "--expected-agent-config-sha256"
                 )
             if args.train600_manifest_sha256 is None:
                 raise ValueError(
-                    "fast_hybrid_eva --defer-scoring requires --train600-manifest-sha256"
+                    f"{args.backend} --defer-scoring requires --train600-manifest-sha256"
                 )
             if args.trajectory_replica_id < 0:
                 raise ValueError("trajectory-replica-id must be non-negative")
@@ -1280,7 +1407,9 @@ def main() -> None:
             )
         sample_by_id = {sample.sample_id: sample for sample in samples}
         unexpected = sorted(set(candidate_records).difference(sample_by_id))
-        if unexpected:
+        if unexpected and not _candidate_superset_allowed(
+            args.backend, args.defer_scoring, args.trajectory_variant_id
+        ):
             raise ValueError(
                 "frozen clean Direct contains samples outside the active manifest: "
                 + ", ".join(unexpected[:10])
@@ -1333,37 +1462,58 @@ def main() -> None:
             for sample_id in sample_by_id
         }
         candidate_hash = _file_sha256(args.candidate_results)
-        evaluator = FastHybridEvaEvaluator(
-            client,
-            args.model,
-            args.video_root,
-            frame_root,
-            version=args.agent_version,
-            max_turns=args.max_turns or 6,
-            max_call_visual_tokens=args.max_call_visual_tokens,
-            max_total_visual_tokens=args.max_total_visual_tokens,
-            candidate_results_sha256=candidate_hash,
-            teacher_model_sha256=teacher_model_artifact_sha256,
-            served_model_sha256=model_artifact_sha256,
-            manifest_sha256=manifest_hash,
-            experiment_config_sha256=experiment_config_sha256,
-            scoring_deferred=args.defer_scoring,
-            teacher_temperature=args.controller_temperature,
-            generation_seed=args.seed,
-            trajectory_context=(
-                {
-                    "experiment_config_sha256": experiment_config_sha256,
-                    "model_artifact_sha256": model_artifact_sha256,
-                    "manifest_sha256": manifest_hash,
-                    "train600_manifest_sha256": train600_manifest_sha256,
-                    "trajectory_schedule_id": str(args.trajectory_schedule_id),
-                    "trajectory_variant_id": args.trajectory_variant_id,
-                    "trajectory_replica_id": args.trajectory_replica_id,
-                }
-                if args.defer_scoring
-                else None
-            ),
-        )
+        if args.backend == "fast_hybrid_eva":
+            evaluator = FastHybridEvaEvaluator(
+                client,
+                args.model,
+                args.video_root,
+                frame_root,
+                version=args.agent_version,
+                max_turns=args.max_turns or 6,
+                max_call_visual_tokens=args.max_call_visual_tokens,
+                max_total_visual_tokens=args.max_total_visual_tokens,
+                candidate_results_sha256=candidate_hash,
+                teacher_model_sha256=teacher_model_artifact_sha256,
+                served_model_sha256=model_artifact_sha256,
+                manifest_sha256=manifest_hash,
+                experiment_config_sha256=experiment_config_sha256,
+                scoring_deferred=args.defer_scoring,
+                teacher_temperature=args.controller_temperature,
+                generation_seed=args.seed,
+                trajectory_context=(
+                    {
+                        "experiment_config_sha256": experiment_config_sha256,
+                        "model_artifact_sha256": model_artifact_sha256,
+                        "manifest_sha256": manifest_hash,
+                        "train600_manifest_sha256": train600_manifest_sha256,
+                        "trajectory_schedule_id": str(args.trajectory_schedule_id),
+                        "trajectory_variant_id": args.trajectory_variant_id,
+                        "trajectory_replica_id": args.trajectory_replica_id,
+                    }
+                    if args.defer_scoring
+                    else None
+                ),
+            )
+        else:
+            evaluator = PerceptionMemoryEvaEvaluator(
+                client,
+                args.model,
+                args.video_root,
+                frame_root,
+                max_turns=args.max_turns or 6,
+                max_frames_per_call=args.max_frames_per_call,
+                seed=args.seed,
+                candidate_results_sha256=candidate_hash,
+                model_artifact_sha256=model_artifact_sha256,
+                manifest_sha256=manifest_hash,
+                experiment_config_sha256=experiment_config_sha256,
+                diagnostics_gate_sha256=diagnostics_gate_sha256,
+                scoring_deferred=args.defer_scoring,
+                train600_manifest_sha256=train600_manifest_sha256,
+                trajectory_schedule_id=args.trajectory_schedule_id,
+                trajectory_variant_id=args.trajectory_variant_id,
+                trajectory_replica_id=args.trajectory_replica_id,
+            )
         _write_frozen_json(
             args.output_dir / f"frozen_inputs_{args.dataset}.json",
             {
@@ -1387,6 +1537,7 @@ def main() -> None:
                 "model_artifact_sha256": model_artifact_sha256,
                 "teacher_model_artifact_sha256": teacher_model_artifact_sha256,
                 "train600_manifest_sha256": train600_manifest_sha256,
+                "diagnostics_gate_sha256": diagnostics_gate_sha256,
                 "trajectory_schedule_id": args.trajectory_schedule_id,
                 "trajectory_variant_id": args.trajectory_variant_id,
                 "trajectory_replica_id": args.trajectory_replica_id,
@@ -1580,7 +1731,7 @@ def main() -> None:
             candidate_sources=candidate_sources,
             candidate_records=(
                 candidate_records
-                if args.backend == "fast_hybrid_eva"
+                if args.backend in {"fast_hybrid_eva", "perception_memory_eva"}
                 else None
             ),
             defer_scoring=args.defer_scoring,

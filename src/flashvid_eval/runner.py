@@ -1680,6 +1680,8 @@ def evaluate(
                 result = evaluator.hybrid_frozen(sample, candidate)
             elif backend == "fast_hybrid_eva":
                 result = evaluator.fast_hybrid_eva(sample, candidate)
+            elif backend == "perception_memory_eva":
+                result = evaluator.run(ModelSample.from_sample(sample, candidate))
             elif backend == "flashvid_hybrid":
                 model_sample = ModelSample.from_sample(sample, candidate)
                 result = evaluator.flashvid_hybrid(model_sample)
@@ -1709,7 +1711,11 @@ def evaluate(
                 "decision_source": "candidate_fallback" if fallback else "no_valid_answer",
                 "annotation_leak_check": "not_run",
             }
-            if backend in {"fast_hybrid_eva", "flashvid_hybrid"}:
+            if backend in {
+                "fast_hybrid_eva",
+                "perception_memory_eva",
+                "flashvid_hybrid",
+            }:
                 # An exception can escape before the backend constructs its
                 # normal result object.  Preserve immutable run provenance on
                 # the failed row so bulk audits can distinguish an ordinary
@@ -1717,7 +1723,11 @@ def evaluate(
                 static_audit_fields = getattr(evaluator, "static_audit_fields", None)
                 if callable(static_audit_fields):
                     result.update(static_audit_fields())
-            if backend in {"fast_hybrid_eva", "flashvid_hybrid"} and data_unavailable:
+            if backend in {
+                "fast_hybrid_eva",
+                "perception_memory_eva",
+                "flashvid_hybrid",
+            } and data_unavailable:
                 # Video resolution fails before any model request.  This is
                 # the one exceptional path whose leak check can be certified
                 # without inspecting a request trace.
@@ -1752,7 +1762,12 @@ def evaluate(
                 }
             )
         result.setdefault("turn_count", result.get("rounds", 0))
-        if backend in {"hybrid_frozen", "fast_hybrid_eva", "flashvid_hybrid"}:
+        if backend in {
+            "hybrid_frozen",
+            "fast_hybrid_eva",
+            "perception_memory_eva",
+            "flashvid_hybrid",
+        }:
             result.setdefault(
                 "candidate_source",
                 (candidate_sources or {}).get(

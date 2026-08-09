@@ -136,6 +136,8 @@ def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
     content = messages[-1]["content"]
     assert not content[0]["text"].startswith("<tool_response>")
     assert all(item.get("text") != "</tool_response>" for item in content)
+    assert "at most 12 timestamped_facts" in messages[0]["content"]
+    assert "at most one support and one contradiction per option" in messages[0]["content"]
     assert_annotation_free_request({"messages": messages})
 
 

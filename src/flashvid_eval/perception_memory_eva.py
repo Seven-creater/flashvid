@@ -619,8 +619,11 @@ def build_perception_messages(
         "time and string fact; temporal_changes and unresolved are string arrays; "
         "evidence_sufficient is boolean; next_evidence_needed is one string, empty only "
         "when no further evidence is needed. evidence_sufficient describes only the "
-        "current accumulated visual question, not benchmark correctness. Return raw "
-        "JSON only, with no markdown or code fences."
+        "current accumulated visual question, not benchmark correctness. Keep the state "
+        "short: at most 12 timestamped_facts (the most discriminative facts, at most 20 "
+        "words each), at most one support and one contradiction per option, at most four "
+        "temporal_changes, at most three unresolved items, and at most 20 words in "
+        "next_evidence_needed. Return raw JSON only, with no markdown or code fences."
     )
     instruction = (
         f"{_question_text(sample)}\nVisual evidence request: {evidence_request}\n"

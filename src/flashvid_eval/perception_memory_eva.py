@@ -719,19 +719,30 @@ def build_perception_messages(
     sample: ModelSample,
     observation: FrameObservation,
     evidence_request: str,
+    *,
+    use_frame_indices: bool = False,
 ) -> list[dict[str, Any]]:
     """Build a candidate-blind request containing only the current-step frames."""
 
     letters = ", ".join(sample.option_letters)
+    fact_schema = "{frame_index,fact}" if use_frame_indices else "{time,fact}"
+    fact_reference = (
+        f"frame_index must be a zero-based integer from 0 to "
+        f"{len(observation.timestamps) - 1}; do not copy or estimate timestamps"
+        if use_frame_indices
+        else "time must be the numeric timestamp printed beside an observed frame"
+    )
     system = (
         "You are the visual perception role. Report only facts directly visible in "
         "the current timestamped frames. Do not guess missing actions. Return one JSON "
         "object with exactly: interval, timestamped_facts, option_evidence, "
         "temporal_changes, unresolved, evidence_sufficient, next_evidence_needed. "
-        "timestamped_facts is an array of {time,fact}. option_evidence must contain "
+        f"timestamped_facts is an array of {fact_schema}; {fact_reference}. "
+        "option_evidence must contain "
         f"exactly these option labels: {letters}; each has supports and contradicts "
-        "string arrays. interval is two numbers; timestamped_facts contains numeric "
-        "time and string fact; temporal_changes and unresolved are string arrays; "
+        "string arrays. interval is two numbers; each timestamped fact contains its "
+        "required frame reference and a string fact; temporal_changes and unresolved "
+        "are string arrays; "
         "evidence_sufficient is boolean; next_evidence_needed is one string, empty only "
         "when no further evidence is needed. evidence_sufficient describes only the "
         "current accumulated visual question, not benchmark correctness. Keep the state "

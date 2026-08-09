@@ -111,7 +111,7 @@ def _overflow_state(interval: tuple[float, float]) -> str:
 
 
 class FakeClient:
-    def __init__(self, outputs: list[str]) -> None:
+    def __init__(self, outputs: list[str | tuple[str, str]]) -> None:
         self.outputs = list(outputs)
         self.calls: list[dict[str, Any]] = []
 
@@ -124,8 +124,12 @@ class FakeClient:
                 **kwargs,
             }
         )
+        output = self.outputs.pop(0)
+        content, finish_reason = (
+            output if isinstance(output, tuple) else (output, "stop")
+        )
         return ChatResult(
-            content=self.outputs.pop(0),
+            content=content,
             usage={
                 "prompt_tokens": 100,
                 "completion_tokens": 20,
@@ -133,7 +137,7 @@ class FakeClient:
             },
             raw={},
             latency_s=0.1,
-            finish_reason="stop",
+            finish_reason=finish_reason,
         )
 
 
@@ -263,6 +267,76 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(
     assert "frame-1.jpg" in second_serialized and "frame-0.jpg" not in second_serialized
 
 
+def test_replay_binds_frame_index_to_exact_cached_timestamp(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+    source["tool_steps"][0]["actual_timestamps"] = [1.23456789]
+    payload = json.loads(
+        _state((0.0, 10.0), "The person opens the door.", sufficient=True)
+    )
+    payload["timestamped_facts"] = [
+        {"frame_index": 0, "fact": "The person opens the door."}
+    ]
+    client = FakeClient([json.dumps(payload)])
+
+    result = PerceptionMemoryReplay(client).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    assert result["perception_states"][0]["perception"]["timestamped_facts"] == [
+        {"time": 1.23456789, "fact": "The person opens the door."}
+    ]
+    assert result["request_trace"][1]["timestamp_reference_mode"] == "frame_index"
+    assert "frame_index" in client.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("first_output", "finish_reason", "retry_reason"),
+    [
+        ('{"interval":[0', "length", "finish_reason_length"),
+        ("not json", "stop", "invalid_json_or_schema"),
+    ],
+)
+def test_replay_retries_one_malformed_response_with_audit_trace(
+    tmp_path: Path,
+    first_output: str,
+    finish_reason: str,
+    retry_reason: str,
+) -> None:
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+    payload = json.loads(
+        _state((0.0, 10.0), "The person opens the door.", sufficient=True)
+    )
+    payload["timestamped_facts"] = [
+        {"frame_index": 0, "fact": "The person opens the door."}
+    ]
+    client = FakeClient([(first_output, finish_reason), (json.dumps(payload), "stop")])
+
+    result = PerceptionMemoryReplay(client).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    attempts = [
+        request
+        for request in result["request_trace"]
+        if request["stage"] == "perception"
+    ]
+    assert [request["attempt_index"] for request in attempts] == [0, 1]
+    assert attempts[0]["retry_triggered"] is True
+    assert attempts[0]["retry_reason"] == retry_reason
+    assert attempts[1]["retry_of_attempt"] == 0
+    assert attempts[1]["retry_reason"] == retry_reason
+    assert attempts[1]["retry_triggered"] is False
+    assert result["perception_states"][0]["perception_attempts"] == 2
+    assert result["perception_states"][0]["perception_retry_reason"] == retry_reason
+    assert [call["max_tokens"] for call in client.calls] == [1024, 2048]
+
+
 def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
     tmp_path: Path,
 ) -> None:
@@ -386,16 +460,17 @@ def test_cached_replay_fails_on_missing_or_mismatched_frames(tmp_path: Path) -> 
 def test_replay_validates_every_raw_fact_before_compaction(tmp_path: Path) -> None:
     payload = json.loads(_overflow_state((0.0, 10.0)))
     payload["timestamped_facts"][10]["time"] = 2.0
-    client = FakeClient([json.dumps(payload)])
+    client = FakeClient([json.dumps(payload), json.dumps(payload)])
     source = _source(tmp_path)
     source["tool_steps"] = source["tool_steps"][:1]
 
-    with pytest.raises(ValueError, match="does not match an actual sampled frame"):
+    with pytest.raises(ValueError, match="invalid_frame_reference"):
         PerceptionMemoryReplay(client).replay(
             source,
             source_file_sha256="a" * 64,
             audit_summary_sha256="b" * 64,
         )
+    assert len(client.calls) == 2
 
 
 def test_cached_replay_frame_cap_is_boundary_safe_and_deterministic(
@@ -457,9 +532,10 @@ def test_capped_tool_target_and_frames_round_trip_to_process_sft(
     assert result["tool_steps"][0]["visual_tokens"] == 1280
     assert result["perception_states"][0]["source_frame_count"] == 129
     assert result["perception_states"][0]["frame_cap_applied"] is True
-    assert result["perception_states"][0]["subsample_indices"] == result[
-        "tool_steps"
-    ][0]["subsample_indices"]
+    assert (
+        result["perception_states"][0]["subsample_indices"]
+        == result["tool_steps"][0]["subsample_indices"]
+    )
     assert (
         sum(
             item.get("type") == "image_url"

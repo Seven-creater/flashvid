@@ -414,7 +414,9 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
     return tuple(steps)
 
 
-def _uniform_subsample_indices(source_count: int, retained_count: int) -> tuple[int, ...]:
+def _uniform_subsample_indices(
+    source_count: int, retained_count: int
+) -> tuple[int, ...]:
     if source_count <= 0 or retained_count <= 0 or retained_count > source_count:
         raise ValueError("frame subsample counts are invalid")
     if retained_count == source_count:
@@ -422,8 +424,7 @@ def _uniform_subsample_indices(source_count: int, retained_count: int) -> tuple[
     if retained_count == 1:
         return ((source_count - 1) // 2,)
     return tuple(
-        (index * (source_count - 1) + (retained_count - 1) // 2)
-        // (retained_count - 1)
+        (index * (source_count - 1) + (retained_count - 1) // 2) // (retained_count - 1)
         for index in range(retained_count)
     )
 
@@ -479,6 +480,50 @@ def _prompt_hash(messages: Sequence[Mapping[str, Any]]) -> str:
     return canonical_sha256(messages)
 
 
+def _parse_replay_perception_state(
+    text: str,
+    valid_letters: Iterable[str],
+    actual_timestamps: Sequence[float],
+) -> tuple[Any, str]:
+    """Bind zero-based frame references to immutable cached timestamps."""
+
+    try:
+        payload = json.loads((text or "").strip())
+    except json.JSONDecodeError:
+        return None, "invalid"
+    if not isinstance(payload, dict):
+        return None, "invalid"
+    facts = payload.get("timestamped_facts")
+    if not isinstance(facts, list):
+        return None, "invalid"
+    if not facts:
+        return parse_perception_state(text, valid_letters), "none"
+    if all(
+        isinstance(item, dict) and set(item) == {"frame_index", "fact"}
+        for item in facts
+    ):
+        timestamps = tuple(float(value) for value in actual_timestamps)
+        rebound: list[dict[str, Any]] = []
+        for item in facts:
+            frame_index = item["frame_index"]
+            if (
+                isinstance(frame_index, bool)
+                or not isinstance(frame_index, int)
+                or not 0 <= frame_index < len(timestamps)
+            ):
+                return None, "invalid"
+            rebound.append({"time": timestamps[frame_index], "fact": item["fact"]})
+        payload = dict(payload)
+        payload["timestamped_facts"] = rebound
+        return (
+            parse_perception_state(
+                json.dumps(payload, ensure_ascii=False), valid_letters
+            ),
+            "frame_index",
+        )
+    return parse_perception_state(text, valid_letters), "timestamp"
+
+
 @dataclass(frozen=True)
 class ReplayConfig:
     model: str = "Qwen3.5-9B"
@@ -489,6 +534,10 @@ class ReplayConfig:
     local_media_transport: str = "file_url"
     max_frames_per_call: int = 128
     request_timeout_s: float = 300.0
+
+    @property
+    def perception_retry_max_tokens(self) -> int:
+        return self.perception_max_tokens * 2
 
     def __post_init__(self) -> None:
         if not self.model.strip():
@@ -519,6 +568,7 @@ class ReplayConfig:
                 "model": self.model,
                 "seed": self.seed,
                 "perception_max_tokens": self.perception_max_tokens,
+                "perception_retry_max_tokens": self.perception_retry_max_tokens,
                 "temperature": self.temperature,
                 "enable_thinking": self.enable_thinking,
                 "local_media_transport": self.local_media_transport,
@@ -545,7 +595,9 @@ class PerceptionMemoryReplay:
         if client_timeout is not None and not math.isclose(
             float(client_timeout), float(self.config.request_timeout_s)
         ):
-            raise ValueError("client timeout differs from ReplayConfig.request_timeout_s")
+            raise ValueError(
+                "client timeout differs from ReplayConfig.request_timeout_s"
+            )
 
     def replay(
         self,
@@ -619,41 +671,85 @@ class PerceptionMemoryReplay:
                 }
             )
             perception_messages = build_perception_messages(
-                sample, cached.observation, cached.request.evidence_request
+                sample,
+                cached.observation,
+                cached.request.evidence_request,
+                use_frame_indices=True,
             )
             assert_annotation_free_request({"messages": perception_messages})
-            result = self.client.chat(
-                self.config.model,
-                perception_messages,
-                max_tokens=self.config.perception_max_tokens,
-                temperature=0.0,
-                seed=self.config.seed + step_index * 10 + 2,
-                response_format={"type": "json_object"},
-                chat_template_kwargs={"enable_thinking": False},
-            )
-            perception_trace = {
-                "stage": "perception",
-                "model": self.config.model,
-                "messages": copy.deepcopy(perception_messages),
-                "content": result.content,
-                "reasoning_content": result.reasoning_content,
-                "finish_reason": result.finish_reason,
-                "usage": copy.deepcopy(result.usage),
-                "latency_s": float(result.latency_s),
-                "seed": self.config.seed + step_index * 10 + 2,
-                "step_index": step_index,
-                "prefix_index": step_index,
-                "prompt_hash": _prompt_hash(perception_messages),
-            }
-            trace.append(perception_trace)
-            if result.finish_reason == "length":
-                raise RuntimeError(
-                    f"perception step {step_index} response was truncated"
+            state = None
+            retry_reason: str | None = None
+            timestamp_reference_mode = "invalid"
+            for attempt_index in range(2):
+                max_tokens = (
+                    self.config.perception_max_tokens
+                    if attempt_index == 0
+                    else self.config.perception_retry_max_tokens
                 )
-            state = parse_perception_state(result.content, sample.option_letters)
+                result = self.client.chat(
+                    self.config.model,
+                    perception_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    seed=self.config.seed + step_index * 10 + 2,
+                    response_format={"type": "json_object"},
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+                parsed, timestamp_reference_mode = _parse_replay_perception_state(
+                    result.content,
+                    sample.option_letters,
+                    cached.observation.timestamps,
+                )
+                attempt_failure: str | None = None
+                if result.finish_reason == "length":
+                    attempt_failure = "finish_reason_length"
+                elif parsed is None:
+                    attempt_failure = "invalid_json_or_schema"
+                else:
+                    try:
+                        state = validate_perception_state_observation(
+                            parsed, cached.observation
+                        )
+                    except ValueError as error:
+                        if "timestamp" not in str(error):
+                            raise
+                        attempt_failure = "invalid_frame_reference"
+                trace.append(
+                    {
+                        "stage": "perception",
+                        "model": self.config.model,
+                        "messages": copy.deepcopy(perception_messages),
+                        "content": result.content,
+                        "reasoning_content": result.reasoning_content,
+                        "finish_reason": result.finish_reason,
+                        "usage": copy.deepcopy(result.usage),
+                        "latency_s": float(result.latency_s),
+                        "seed": self.config.seed + step_index * 10 + 2,
+                        "step_index": step_index,
+                        "prefix_index": step_index,
+                        "prompt_hash": _prompt_hash(perception_messages),
+                        "attempt_index": attempt_index,
+                        "retry_of_attempt": 0 if attempt_index else None,
+                        "retry_reason": attempt_failure or retry_reason,
+                        "retry_triggered": attempt_index == 0
+                        and attempt_failure is not None,
+                        "timestamp_reference_mode": timestamp_reference_mode,
+                        "max_tokens": max_tokens,
+                    }
+                )
+                if attempt_failure is None:
+                    break
+                retry_reason = attempt_failure
+                state = None
             if state is None:
-                raise ValueError(f"perception step {step_index} returned invalid JSON")
-            state = validate_perception_state_observation(state, cached.observation)
+                if retry_reason == "finish_reason_length":
+                    raise RuntimeError(
+                        f"perception step {step_index} response was truncated after retry"
+                    )
+                raise ValueError(
+                    f"perception step {step_index} returned invalid evidence after retry: "
+                    f"{retry_reason}"
+                )
             memory.merge(state)
             states.append(
                 {
@@ -675,6 +771,8 @@ class PerceptionMemoryReplay:
                     "evidence_complete": False,
                     "judge_confirmations": [],
                     "source_perception_evidence_sufficient": state.evidence_sufficient,
+                    "perception_attempts": attempt_index + 1,
+                    "perception_retry_reason": retry_reason,
                 }
             )
             tool_step = asdict(

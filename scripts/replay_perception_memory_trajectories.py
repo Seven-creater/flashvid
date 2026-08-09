@@ -27,7 +27,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
         help="Passed 300-sample paired badcase summary; replay is blocked without it.",
     )
-    parser.add_argument("--base-url", default="http://127.0.0.1:8200/v1")
+    parser.add_argument(
+        "--base-url",
+        action="append",
+        dest="base_urls",
+        help=(
+            "OpenAI-compatible endpoint; repeat to distribute trajectories "
+            "deterministically across endpoints. Defaults to 8200."
+        ),
+    )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "no"))
     parser.add_argument("--model", default="Qwen3.5-9B")
     parser.add_argument("--seed", type=int, default=42)
@@ -51,15 +59,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_timeout_s=args.timeout,
             local_media_transport="path" if args.local_media_paths else "file_url",
         )
-        replayer = PerceptionMemoryReplay(
+        base_urls = args.base_urls or ["http://127.0.0.1:8200/v1"]
+        clients = [
             OpenAICompatibleClient(
-                args.base_url,
+                base_url,
                 api_key=args.api_key,
                 timeout=args.timeout,
                 local_file_urls_as_paths=args.local_media_paths,
-            ),
-            config,
-        )
+            )
+            for base_url in base_urls
+        ]
+        replayer = PerceptionMemoryReplay(clients, config)
         summary = replay_jsonl(
             input_path=args.input,
             output_path=args.output,

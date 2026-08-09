@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -899,6 +900,105 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
         "different_normalization",
     )
     assert ReplayConfig().fingerprint() != baseline
+
+
+def test_multi_endpoint_selection_is_stable_and_not_semantic() -> None:
+    clients = [FakeClient([]) for _ in range(8)]
+    replayer = PerceptionMemoryReplay(clients, ReplayConfig())
+    source_ids = [f"dataset:sample-{index}:trajectory" for index in range(64)]
+
+    first = [replayer._client_for_source(source_id) for source_id in source_ids]
+    second = [replayer._client_for_source(source_id) for source_id in source_ids]
+
+    assert first == second
+    assert set(first).issubset(set(clients))
+    assert len(set(first)) > 1
+    assert replayer.endpoint_count == 8
+    assert (
+        replayer.config.fingerprint()
+        == PerceptionMemoryReplay(clients[0], ReplayConfig()).config.fingerprint()
+    )
+
+
+def test_multi_endpoint_count_is_audited_without_url_leak(tmp_path: Path) -> None:
+    first = FakeClient(
+        [
+            _indexed_state((0.0, 10.0), 0, "The person approaches the door."),
+            _indexed_state((20.0, 30.0), 0, "The person opens the door."),
+        ]
+    )
+    second = FakeClient(
+        [
+            _indexed_state((0.0, 10.0), 0, "The person approaches the door."),
+            _indexed_state((20.0, 30.0), 0, "The person opens the door."),
+        ]
+    )
+    first.endpoint = "http://secret-8200/v1/chat/completions"
+    second.endpoint = "http://secret-8201/v1/chat/completions"
+    result = PerceptionMemoryReplay([first, second]).replay(
+        _source(tmp_path),
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["endpoint_count"] == 2
+    assert "secret-8200" not in serialized
+    assert "secret-8201" not in serialized
+
+
+def test_replay_cli_accepts_repeated_base_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "replay_perception_memory_trajectories.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "replay_perception_memory_cli", script_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    seen_urls: list[str] = []
+    captured: dict[str, Any] = {}
+
+    class CliClient:
+        def __init__(self, base_url: str, **kwargs: Any) -> None:
+            seen_urls.append(base_url)
+            self.timeout = kwargs["timeout"]
+
+        def chat(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("CLI wiring test must not call the endpoint")
+
+    def fake_replay_jsonl(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"status": "passed", "endpoint_count": kwargs["replayer"].endpoint_count}
+
+    monkeypatch.setattr(module, "OpenAICompatibleClient", CliClient)
+    monkeypatch.setattr(module, "replay_jsonl", fake_replay_jsonl)
+    exit_code = module.main(
+        [
+            "--input",
+            str(tmp_path / "input.jsonl"),
+            "--output",
+            str(tmp_path / "output.jsonl"),
+            "--audit-summary",
+            str(tmp_path / "audit.json"),
+            "--base-url",
+            "http://127.0.0.1:8200/v1",
+            "--base-url",
+            "http://127.0.0.1:8201/v1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen_urls == [
+        "http://127.0.0.1:8200/v1",
+        "http://127.0.0.1:8201/v1",
+    ]
+    assert captured["replayer"].endpoint_count == 2
 
 
 def test_audit_gate_requires_exact_passed_test300_scope(tmp_path: Path) -> None:

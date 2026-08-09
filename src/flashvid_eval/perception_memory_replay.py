@@ -725,16 +725,35 @@ class ReplayConfig:
 class PerceptionMemoryReplay:
     """Regenerate only visual observation states from immutable cached frames."""
 
-    def __init__(self, client: ChatClient, config: ReplayConfig | None = None) -> None:
-        self.client = client
+    def __init__(
+        self,
+        client: ChatClient | Sequence[ChatClient],
+        config: ReplayConfig | None = None,
+    ) -> None:
+        clients = tuple(client) if isinstance(client, Sequence) else (client,)
+        if not clients or any(not isinstance(item, ChatClient) for item in clients):
+            raise ValueError("replay requires one or more ChatClient instances")
+        self.clients = clients
+        # Preserve the old single-client attribute for callers that inspect it.
+        self.client = clients[0]
         self.config = config or ReplayConfig()
-        client_timeout = getattr(client, "timeout", None)
-        if client_timeout is not None and not math.isclose(
-            float(client_timeout), float(self.config.request_timeout_s)
-        ):
-            raise ValueError(
-                "client timeout differs from ReplayConfig.request_timeout_s"
-            )
+        for item in clients:
+            client_timeout = getattr(item, "timeout", None)
+            if client_timeout is not None and not math.isclose(
+                float(client_timeout), float(self.config.request_timeout_s)
+            ):
+                raise ValueError(
+                    "client timeout differs from ReplayConfig.request_timeout_s"
+                )
+
+    @property
+    def endpoint_count(self) -> int:
+        return len(self.clients)
+
+    def _client_for_source(self, source_trajectory_id: str) -> ChatClient:
+        digest = hashlib.sha256(source_trajectory_id.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:8], "big") % self.endpoint_count
+        return self.clients[index]
 
     def replay(
         self,
@@ -749,6 +768,7 @@ class PerceptionMemoryReplay:
         source_trajectory_id = _nonempty(
             source.get("trajectory_id"), "source trajectory_id"
         )
+        client = self._client_for_source(source_trajectory_id)
         manifest_sha256 = _sha256_text(
             source.get("manifest_sha256", source.get("train600_manifest_sha256")),
             "manifest_sha256",
@@ -840,7 +860,7 @@ class PerceptionMemoryReplay:
                     if attempt_index == 0
                     else self.config.perception_retry_max_tokens
                 )
-                result = self.client.chat(
+                result = client.chat(
                     self.config.model,
                     attempt_messages,
                     max_tokens=max_tokens,
@@ -996,6 +1016,7 @@ class PerceptionMemoryReplay:
             },
             "model": self.config.model,
             "request_timeout_s": float(self.config.request_timeout_s),
+            "endpoint_count": self.endpoint_count,
             "candidate_answer": sample.candidate_answer,
             "candidate_rerun": 0,
             "annotation_leak_check": "passed",
@@ -1072,6 +1093,7 @@ def _failure_row(
     source_file_sha256: str,
     audit_summary_sha256: str,
     config: ReplayConfig,
+    endpoint_count: int,
 ) -> dict[str, Any]:
     dataset, sample_id, source_id = _source_identity(source)
     annotation = "failed" if isinstance(error, AnnotationLeakError) else "passed"
@@ -1091,6 +1113,7 @@ def _failure_row(
         "audit_summary_sha256": audit_summary_sha256,
         "config_sha256": config.fingerprint(),
         "request_timeout_s": float(config.request_timeout_s),
+        "endpoint_count": endpoint_count,
         "run_fingerprint": canonical_sha256(
             {
                 "config_sha256": config.fingerprint(),
@@ -1196,6 +1219,7 @@ def replay_jsonl(
                 source_file_sha256=source_sha,
                 audit_summary_sha256=audit_sha,
                 config=replayer.config,
+                endpoint_count=replayer.endpoint_count,
             )
 
     pending = [source_id for source_id in source_ids if source_id not in results]
@@ -1223,6 +1247,7 @@ def replay_jsonl(
         "diagnostics_gate_sha256": audit_sha,
         "audit_summary_sha256": audit_sha,
         "config_sha256": replayer.config.fingerprint(),
+        "endpoint_count": replayer.endpoint_count,
         "run_fingerprint": expected_fingerprint,
         "output": str(output_path.resolve()),
     }

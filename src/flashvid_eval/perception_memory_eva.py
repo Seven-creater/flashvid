@@ -37,6 +37,10 @@ from .schemas import ModelSample
 _TOOL_CALL_RE = re.compile(
     r"^\s*<tool_call>\s*(\{.*\})\s*</tool_call>\s*$", re.DOTALL
 )
+_JSON_FENCE_RE = re.compile(
+    r"^\s*```(?:json)?\s*\n(\{.*\})\n```\s*$",
+    re.DOTALL | re.IGNORECASE,
+)
 _SPACE_RE = re.compile(r"\s+")
 RESCUE_TRAJECTORY_VARIANTS = frozenset(
     {
@@ -263,8 +267,12 @@ def parse_perception_state(
     """Strictly parse one perception observation without guessing fields."""
 
     letters = tuple(str(item).strip().upper() for item in valid_letters)
+    raw_text = text or ""
+    fenced = _JSON_FENCE_RE.fullmatch(raw_text)
+    if fenced is not None:
+        raw_text = fenced.group(1)
     try:
-        payload = json.loads((text or "").strip())
+        payload = json.loads(raw_text.strip())
         required = {
             "interval",
             "timestamped_facts",

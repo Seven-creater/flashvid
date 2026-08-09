@@ -141,6 +141,13 @@ def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
     assert_annotation_free_request({"messages": messages})
 
 
+def test_perception_parser_accepts_only_an_exact_json_fence() -> None:
+    fenced = f"```json\n{_state_json()}\n```"
+    assert parse_perception_state(fenced, ("A", "B")) is not None
+    assert parse_perception_state(f"explanation\n{fenced}", ("A", "B")) is None
+    assert parse_perception_state(f"{fenced}\nextra", ("A", "B")) is None
+
+
 def test_official_controller_parser_is_strict() -> None:
     call = (
         '<tool_call>{"tool":"frame_select","arguments":'

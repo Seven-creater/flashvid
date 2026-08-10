@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +57,85 @@ def test_commands_preserve_frozen_judges_and_selection_gate(tmp_path: Path) -> N
     assert build[build.index("--minimum-per-dataset") + 1] == "100"
     assert build[build.index("--minimum-candidate-fixes") + 1] == "90"
     assert build[build.index("--minimum-candidate-fixes-per-dataset") + 1] == "20"
+
+
+def _audit_confirmation(
+    seed: int, *, parsed_valid: bool, error: str | None = None
+) -> dict[str, object]:
+    return {
+        "judge_seed": seed,
+        "parsed_valid": parsed_valid,
+        "prediction": None if not parsed_valid else "B",
+        "evidence_ids": [] if not parsed_valid else ["E0001"],
+        "error": error,
+        "error_type": "TimeoutError" if error else None,
+        "failure_class": "infrastructure_error" if error else "model_parse_failure",
+        "annotation_leak_check": "passed",
+    }
+
+
+def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trajectories = tmp_path / "merged.jsonl"
+    trajectories.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "judgments.jsonl"
+    monkeypatch.setattr(
+        autopilot, "bind_prefix_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
+    )
+    row = {
+        "prefix_id": "p1",
+        "annotation_leak_check": "passed",
+        "judge_status": "complete_with_failures",
+        "judge_confirmations": [
+            _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 73)
+        ],
+    }
+    _write_jsonl(output, [row])
+
+    semantic = autopilot._audit_judgments(trajectories, output)
+    assert semantic["failures"] == 0
+    assert semantic["infrastructure_errors"] == 0
+    assert semantic["evidence_insufficient"] == 1
+
+    row["judge_confirmations"][0] = _audit_confirmation(
+        17, parsed_valid=False, error="TimeoutError: request timed out"
+    )
+    _write_jsonl(output, [row])
+    timed_out = autopilot._audit_judgments(trajectories, output)
+    assert timed_out["failures"] == 1
+    assert timed_out["infrastructure_errors"] == 1
+    assert timed_out["persistent_infrastructure_failures"] == 1
+    assert timed_out["evidence_insufficient"] == 0
+
+
+def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trajectories = tmp_path / "merged.jsonl"
+    trajectories.write_text("{}\n", encoding="utf-8")
+    output = tmp_path / "judgments.jsonl"
+    monkeypatch.setattr(
+        autopilot, "bind_prefix_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
+    )
+    row = {
+        "prefix_id": "p1",
+        "annotation_leak_check": "passed",
+        "judge_confirmations": [
+            _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 42)
+        ],
+    }
+    _write_jsonl(output, [row])
+    with pytest.raises(RuntimeError, match="seeds must be exactly"):
+        autopilot._audit_judgments(trajectories, output)
+
+    row["judge_confirmations"] = [
+        _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 73)
+    ]
+    row["judge_confirmations"][0]["annotation_leak_check"] = "failed"
+    _write_jsonl(output, [row])
+    with pytest.raises(RuntimeError, match="annotation leak"):
+        autopilot._audit_judgments(trajectories, output)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:

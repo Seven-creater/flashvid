@@ -383,11 +383,48 @@ def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
     actual_ids = [str(row.get("prefix_id") or "") for row in rows]
     if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected_ids:
         raise RuntimeError("prefix Judge output does not exactly cover the merged input")
-    failures = [row for row in rows if row.get("judge_status") != "complete"]
+    infrastructure_errors = 0
+    evidence_insufficient = 0
+    required_seeds = {17, 42, 73}
+    for row in rows:
+        if row.get("annotation_leak_check") != "passed":
+            raise RuntimeError("prefix Judge row failed annotation leak audit")
+        confirmations = row.get("judge_confirmations")
+        if not isinstance(confirmations, list) or len(confirmations) != len(
+            required_seeds
+        ):
+            raise RuntimeError("prefix Judge row lacks exactly three confirmations")
+        if any(not isinstance(item, Mapping) for item in confirmations):
+            raise RuntimeError("prefix Judge confirmation must be an object")
+        seeds = [int(item.get("judge_seed")) for item in confirmations]
+        if len(seeds) != len(set(seeds)) or set(seeds) != required_seeds:
+            raise RuntimeError("prefix Judge seeds must be exactly 17/42/73")
+        if any(
+            item.get("annotation_leak_check") != "passed"
+            or item.get("failure_class") == "annotation_leak"
+            for item in confirmations
+        ):
+            raise RuntimeError("prefix Judge confirmation failed annotation leak audit")
+        errors = [
+            item
+            for item in confirmations
+            if item.get("error") is not None
+        ]
+        infrastructure_errors += len(errors)
+        if errors:
+            continue
+        if any(
+            item.get("parsed_valid") is not True
+            for item in confirmations
+        ):
+            evidence_insufficient += 1
     return {
         "expected_prefixes": len(expected_ids),
         "rows": len(rows),
-        "failures": len(failures),
+        "failures": infrastructure_errors,
+        "infrastructure_errors": infrastructure_errors,
+        "persistent_infrastructure_failures": infrastructure_errors,
+        "evidence_insufficient": evidence_insufficient,
         "output_sha256": _file_sha256(output),
     }
 
@@ -623,26 +660,30 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             if _run_command(command, cwd=args.repo_root, log_path=args.run_root / "logs/prefix_judge.log"):
                 raise RuntimeError("prefix Judge command failed")
             judge_audit = _audit_judgments(merged, judgments)
-            if judge_audit["failures"]:
+            if judge_audit.get("infrastructure_errors", judge_audit["failures"]):
                 if judge_stage.get("retry_started"):
-                    raise RuntimeError(
-                        "prefix Judge retry was already consumed and failures remain"
+                    judge_stage["persistent_infrastructure_failures"] = judge_audit.get(
+                        "infrastructure_errors", judge_audit["failures"]
                     )
-                retry = _judge_command(
-                    args, merged, judgments, resume=True, retry_errors=True
-                )
-                judge_stage["retry_started"] = True
-                judge_stage["retry_command"] = _command_record(retry)
-                _save_state(status_path, state)
-                if _run_command(
-                    retry,
-                    cwd=args.repo_root,
-                    log_path=args.run_root / "logs/prefix_judge_retry.log",
-                ):
-                    raise RuntimeError("prefix Judge retry command failed")
-                judge_audit = _audit_judgments(merged, judgments)
-            if judge_audit["failures"]:
-                raise RuntimeError("prefix Judge still has failed seeds after one retry")
+                else:
+                    retry = _judge_command(
+                        args, merged, judgments, resume=True, retry_errors=True
+                    )
+                    judge_stage["retry_started"] = True
+                    judge_stage["retry_command"] = _command_record(retry)
+                    _save_state(status_path, state)
+                    if _run_command(
+                        retry,
+                        cwd=args.repo_root,
+                        log_path=args.run_root / "logs/prefix_judge_retry.log",
+                    ):
+                        raise RuntimeError("prefix Judge retry command failed")
+                    judge_audit = _audit_judgments(merged, judgments)
+                    judge_stage["persistent_infrastructure_failures"] = (
+                        judge_audit.get(
+                            "infrastructure_errors", judge_audit["failures"]
+                        )
+                    )
             judge_stage.update(
                 {"status": "passed", "ended_at": _now(), "audit": judge_audit}
             )

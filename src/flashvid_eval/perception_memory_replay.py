@@ -25,9 +25,10 @@ from .perception_memory_eva import (
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
     PerceptionState,
+    bind_perception_state,
     build_controller_messages,
     build_perception_messages,
-    parse_perception_state,
+    perception_model_target,
     validate_perception_state_observation,
 )
 from .privacy import AnnotationLeakError, assert_annotation_free_request
@@ -41,10 +42,6 @@ FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
 FRAME_SUBSAMPLE_VERSION = "v1"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
 _CHOICE_LINE = re.compile(r"(?m)^([A-H]):\s*(.+?)\s*$")
-_STRICT_JSON_FENCE = re.compile(
-    r"\A\s*```(?:json)?[ \t]*\r?\n(?P<body>\{.*\})\r?\n```[ \t]*\s*\Z",
-    re.DOTALL | re.IGNORECASE,
-)
 _FLIP_GROUPS = frozenset(
     {
         "untrained_correct_sft_wrong",
@@ -524,70 +521,15 @@ def bind_replay_perception_state(
     valid_letters: Iterable[str],
     actual_timestamps: Sequence[float],
 ) -> tuple[PerceptionState | None, str]:
-    """Bind zero-based frame references to immutable cached timestamps."""
+    """Backward-compatible alias for the shared frame-reference binder."""
 
-    candidate = (text or "").strip()
-    fenced = _STRICT_JSON_FENCE.fullmatch(candidate)
-    if fenced is not None:
-        candidate = fenced.group("body")
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        return None, "invalid"
-    if not isinstance(payload, dict):
-        return None, "invalid"
-    facts = payload.get("timestamped_facts")
-    if not isinstance(facts, list):
-        return None, "invalid"
-    if not facts:
-        return parse_perception_state(text, valid_letters), "none"
-    if all(
-        isinstance(item, dict) and set(item) == {"frame_index", "fact"}
-        for item in facts
-    ):
-        timestamps = tuple(float(value) for value in actual_timestamps)
-        rebound: list[dict[str, Any]] = []
-        for item in facts:
-            frame_index = item["frame_index"]
-            if (
-                isinstance(frame_index, bool)
-                or not isinstance(frame_index, int)
-                or not 0 <= frame_index < len(timestamps)
-            ):
-                return None, "invalid"
-            rebound.append({"time": timestamps[frame_index], "fact": item["fact"]})
-        payload = dict(payload)
-        payload["timestamped_facts"] = rebound
-        return (
-            parse_perception_state(
-                json.dumps(payload, ensure_ascii=False), valid_letters
-            ),
-            "frame_index",
-        )
-    return parse_perception_state(text, valid_letters), "timestamp"
+    return bind_perception_state(text, valid_letters, actual_timestamps)
 
 
 def _perception_model_target(
     state: PerceptionState, actual_timestamps: Sequence[float]
 ) -> str:
-    timestamps = tuple(float(value) for value in actual_timestamps)
-    payload = state.to_dict()
-    indexed_facts: list[dict[str, Any]] = []
-    for fact in state.timestamped_facts:
-        matches = [
-            index
-            for index, timestamp in enumerate(timestamps)
-            if timestamp == fact.time
-        ]
-        if not matches:
-            raise ValueError(
-                "normalized perception fact is not bound to a cached frame"
-            )
-        indexed_facts.append({"frame_index": matches[0], "fact": fact.fact})
-    payload["timestamped_facts"] = indexed_facts
-    return json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    return perception_model_target(state, actual_timestamps)
 
 
 def _retry_perception_messages(

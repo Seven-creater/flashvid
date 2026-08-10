@@ -493,6 +493,97 @@ def parse_perception_state(
         return None
 
 
+def bind_perception_state(
+    text: str,
+    valid_letters: Iterable[str],
+    actual_timestamps: Sequence[float],
+    *,
+    allow_timestamp_schema: bool = True,
+) -> tuple[PerceptionState | None, str]:
+    """Bind zero-based frame references to exact sampled-frame timestamps.
+
+    The shared binder keeps replay/SFT backward-compatible with legacy
+    ``{time,fact}`` observations.  A runtime using the indexed prompt can set
+    ``allow_timestamp_schema=False`` so its accepted outputs match the SFT
+    target protocol exactly.
+    """
+
+    candidate = (text or "").strip()
+    fenced = _JSON_FENCE_RE.fullmatch(candidate)
+    if fenced is not None:
+        candidate = fenced.group(1)
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None, "invalid"
+    if not isinstance(payload, dict):
+        return None, "invalid"
+    facts = payload.get("timestamped_facts")
+    if not isinstance(facts, list):
+        return None, "invalid"
+    if not facts:
+        return parse_perception_state(text, valid_letters), "none"
+    if all(
+        isinstance(item, dict) and set(item) == {"frame_index", "fact"}
+        for item in facts
+    ):
+        try:
+            timestamps = tuple(
+                _finite_number(value, "actual frame timestamp")
+                for value in actual_timestamps
+            )
+        except (TypeError, ValueError):
+            return None, "invalid"
+        rebound: list[dict[str, Any]] = []
+        for item in facts:
+            frame_index = item["frame_index"]
+            if (
+                isinstance(frame_index, bool)
+                or not isinstance(frame_index, int)
+                or not 0 <= frame_index < len(timestamps)
+            ):
+                return None, "invalid"
+            rebound.append({"time": timestamps[frame_index], "fact": item["fact"]})
+        payload = dict(payload)
+        payload["timestamped_facts"] = rebound
+        return (
+            parse_perception_state(
+                json.dumps(payload, ensure_ascii=False), valid_letters
+            ),
+            "frame_index",
+        )
+    parsed = parse_perception_state(text, valid_letters)
+    if parsed is None or not allow_timestamp_schema:
+        return None, "timestamp" if parsed is not None else "invalid"
+    return parsed, "timestamp"
+
+
+def perception_model_target(
+    state: PerceptionState, actual_timestamps: Sequence[float]
+) -> str:
+    """Serialize a validated perception state using zero-based frame indices."""
+
+    timestamps = tuple(
+        _finite_number(value, "actual frame timestamp")
+        for value in actual_timestamps
+    )
+    payload = state.to_dict()
+    indexed_facts: list[dict[str, Any]] = []
+    for fact in state.timestamped_facts:
+        matches = [
+            index
+            for index, timestamp in enumerate(timestamps)
+            if timestamp == fact.time
+        ]
+        if not matches:
+            raise ValueError("perception fact is not bound to an actual frame")
+        indexed_facts.append({"frame_index": matches[0], "fact": fact.fact})
+    payload["timestamped_facts"] = indexed_facts
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
 def normalize_perception_state(
     state: PerceptionState,
     *,
@@ -1815,6 +1906,7 @@ __all__ = [
     "RESCUE_TRAJECTORY_VARIANTS",
     "TimestampedFact",
     "apply_candidate_gate",
+    "bind_perception_state",
     "build_completeness_messages",
     "build_confirmation_controller_messages",
     "build_controller_messages",
@@ -1828,6 +1920,7 @@ __all__ = [
     "parse_controller_action",
     "parse_evidence_decision",
     "parse_perception_state",
+    "perception_model_target",
     "normalize_perception_state",
     "rescue_frame_request",
     "validate_perception_state_observation",

@@ -20,9 +20,9 @@ from urllib.request import url2pathname
 
 from .perception_memory_eva import (
     PERCEPTION_NORMALIZATION_VERSION,
+    bind_perception_state,
     normalize_perception_state,
 )
-from .perception_memory_replay import bind_replay_perception_state
 from .qwen_sft import (
     build_sft_record,
     canonical_sha256,
@@ -257,7 +257,7 @@ def _normalize_raw_perception_response(
 
     if not isinstance(value, str):
         raise ValueError("perception response must be raw JSON text")
-    state, _reference_mode = bind_replay_perception_state(
+    state, _reference_mode = bind_perception_state(
         value, valid_letters, actual_timestamps
     )
     if state is None:

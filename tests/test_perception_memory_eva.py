@@ -20,6 +20,7 @@ from flashvid_eval.perception_memory_eva import (
     REPAIR_ONLY_TRAJECTORY_VARIANTS,
     RESCUE_TRAJECTORY_VARIANTS,
     apply_candidate_gate,
+    bind_perception_state,
     build_completeness_messages,
     build_confirmation_controller_messages,
     build_controller_messages,
@@ -32,6 +33,7 @@ from flashvid_eval.perception_memory_eva import (
     parse_completeness,
     parse_controller_action,
     parse_perception_state,
+    perception_model_target,
     rescue_frame_request,
     validate_perception_state_observation,
 )
@@ -153,6 +155,48 @@ def test_perception_parser_accepts_only_an_exact_json_fence() -> None:
     assert parse_perception_state(fenced, ("A", "B")) is not None
     assert parse_perception_state(f"explanation\n{fenced}", ("A", "B")) is None
     assert parse_perception_state(f"{fenced}\nextra", ("A", "B")) is None
+
+
+def test_frame_index_protocol_binds_first_and_last_exact_timestamps() -> None:
+    payload = json.loads(_state_json())
+    payload["timestamped_facts"] = [
+        {"frame_index": 0, "fact": "The door is closed."},
+        {"frame_index": 2, "fact": "The person walks outside."},
+    ]
+    timestamps = (10.123456, 15.0, 19.987654)
+
+    state, mode = bind_perception_state(
+        json.dumps(payload),
+        ("A", "B"),
+        timestamps,
+        allow_timestamp_schema=False,
+    )
+
+    assert state is not None
+    assert mode == "frame_index"
+    assert [fact.time for fact in state.timestamped_facts] == [
+        timestamps[0],
+        timestamps[-1],
+    ]
+    target = json.loads(perception_model_target(state, timestamps))
+    assert target["timestamped_facts"] == payload["timestamped_facts"]
+
+
+def test_runtime_frame_index_protocol_explicitly_rejects_legacy_time_schema() -> None:
+    legacy = _state_json(fact_time=15.0)
+
+    compatible, compatible_mode = bind_perception_state(
+        legacy, ("A", "B"), (15.0,)
+    )
+    strict, strict_mode = bind_perception_state(
+        legacy,
+        ("A", "B"),
+        (15.0,),
+        allow_timestamp_schema=False,
+    )
+
+    assert compatible is not None and compatible_mode == "timestamp"
+    assert strict is None and strict_mode == "timestamp"
 
 
 def test_perception_validation_compacts_long_states_deterministically() -> None:

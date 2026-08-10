@@ -78,6 +78,31 @@ def _observation(tmp_path: Path) -> FrameObservation:
     )
 
 
+def _two_frame_observation(tmp_path: Path) -> FrameObservation:
+    frames = (tmp_path / "first.png", tmp_path / "last.png")
+    for frame in frames:
+        frame.write_bytes(b"not-decoded-by-unit-test")
+    request = FrameRequest(
+        start_time=10.0,
+        end_time=20.0,
+        nframes=2,
+        resize=0.75,
+        evidence_request="Observe the full action sequence.",
+    )
+    return FrameObservation(
+        request=request,
+        resolved_start_time=10.0,
+        resolved_end_time=20.0,
+        resolved_nframes=2,
+        frame_paths=tuple(str(frame) for frame in frames),
+        timestamps=(10.123456, 19.987654),
+        backend="official_eva_select_frame_fallback",
+        cache_hit=False,
+        estimated_visual_tokens=256,
+        latency_s=0.1,
+    )
+
+
 def _state_json(
     *,
     interval: tuple[float, float] = (10.0, 20.0),
@@ -107,6 +132,31 @@ def _state_json(
             "next_evidence_needed": "" if sufficient else "Observe later frames.",
         }
     )
+
+
+def _indexed_state_json(
+    *,
+    interval: tuple[float, float] = (10.0, 20.0),
+    fact: str = "The person walks outside.",
+    frame_indices: tuple[int, ...] = (0,),
+    support_b: bool = True,
+    contradict_a: bool = True,
+    sufficient: bool = True,
+) -> str:
+    payload = json.loads(
+        _state_json(
+            interval=interval,
+            fact=fact,
+            support_b=support_b,
+            contradict_a=contradict_a,
+            sufficient=sufficient,
+        )
+    )
+    payload["timestamped_facts"] = [
+        {"frame_index": frame_index, "fact": fact}
+        for frame_index in frame_indices
+    ]
+    return json.dumps(payload)
 
 
 def test_controller_is_candidate_blind_and_text_only() -> None:
@@ -666,9 +716,8 @@ def test_explicit_time_rescue_is_private_free_official_and_controller_resumes(
     session = _DurationOnlySession(tmp_path, duration=4000.0)
     client = _FakeClient(
         [
-            _state_json(
+            _indexed_state_json(
                 interval=(3901.0, 3903.0),
-                fact_time=3901.0,
             ),
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
@@ -737,7 +786,7 @@ def test_rescue_first_action_is_private_free_then_controller_resumes_and_is_sft_
     session = _DurationOnlySession(tmp_path)
     client = _FakeClient(
         [
-            _state_json(interval=(0.0, 50.0), fact_time=0.0),
+            _indexed_state_json(interval=(0.0, 50.0)),
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"A","evidence_ids":["E0001"]}',
@@ -877,7 +926,7 @@ def test_evaluator_keeps_images_out_of_later_controller_and_judge(
     client = _FakeClient(
         [
             tool_call,
-            _state_json(),
+            _indexed_state_json(),
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"A","evidence_ids":["E0001"]}',
@@ -934,6 +983,115 @@ def test_evaluator_keeps_images_out_of_later_controller_and_judge(
     assert len(audit["implementation_bundle_sha256"]) == 64
 
 
+def test_runtime_binds_indexed_perception_to_first_and_last_frame(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":2,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    perception = _indexed_state_json(frame_indices=(0, 1))
+    client = _FakeClient(
+        [
+            tool_call,
+            perception,
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    observation = _two_frame_observation(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(observation),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    state = result["perception_states"][0]
+    assert [item["time"] for item in state["perception_response"]["timestamped_facts"]] == [
+        observation.timestamps[0],
+        observation.timestamps[-1],
+    ]
+    assert state["timestamp_reference_mode"] == "frame_index"
+    assert json.loads(state["perception_model_target"])["timestamped_facts"] == [
+        {"fact": "The person walks outside.", "frame_index": 0},
+        {"fact": "The person walks outside.", "frame_index": 1},
+    ]
+    perception_request = next(
+        item for item in result["request_trace"] if item["stage"] == "perception"
+    )
+    assert perception_request["timestamp_reference_mode"] == "frame_index"
+    serialized = json.dumps(perception_request["messages"], ensure_ascii=False)
+    assert "frame_index must be a zero-based integer" in serialized
+    assert "Frame index 0, timestamp 10.123 seconds" in serialized
+    assert "Frame index 1, timestamp 19.988 seconds" in serialized
+
+
+def test_confirmation_runtime_uses_the_same_indexed_perception_protocol(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":2,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    indexed = _indexed_state_json(frame_indices=(0, 1))
+    client = _FakeClient(
+        [
+            tool_call,
+            indexed,
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+            tool_call,
+            indexed,
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+        ]
+    )
+    observation = _two_frame_observation(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(observation),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["final_prediction"] == "B"
+    confirmation = result["perception_states"][1]
+    assert confirmation["stage"] == "change_confirmation"
+    assert confirmation["timestamp_reference_mode"] == "frame_index"
+    assert [
+        item["time"]
+        for item in confirmation["perception_response"]["timestamped_facts"]
+    ] == [observation.timestamps[0], observation.timestamps[-1]]
+    confirmation_request = next(
+        item
+        for item in result["request_trace"]
+        if item["stage"] == "confirmation_perception"
+    )
+    assert confirmation_request["timestamp_reference_mode"] == "frame_index"
+    assert "frame_index" in json.dumps(
+        confirmation_request["messages"], ensure_ascii=False
+    )
+
+
 def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
     tmp_path: Path,
 ) -> None:
@@ -946,7 +1104,8 @@ def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
     )
     payload = json.loads(_state_json())
     payload["timestamped_facts"] = [
-        {"time": 15.0, "fact": f"visible fact {index}"} for index in range(20)
+        {"frame_index": 0, "fact": f"visible fact {index}"}
+        for index in range(20)
     ]
     payload["option_evidence"]["B"]["supports"] = [
         "visible fact 19",
@@ -1021,17 +1180,8 @@ def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
     )
 
 
-@pytest.mark.parametrize(
-    ("fact_time", "expected_error"),
-    [
-        (9999.0, "outside the resolved perception interval"),
-        (16.0, "does not match an actual sampled frame timestamp"),
-    ],
-)
-def test_evaluator_rejects_unbound_perception_timestamps_and_falls_back(
+def test_runtime_rejects_legacy_time_schema_after_one_bounded_retry(
     tmp_path: Path,
-    fact_time: float,
-    expected_error: str,
 ) -> None:
     video = tmp_path / "video.mp4"
     video.write_bytes(b"placeholder")
@@ -1040,7 +1190,8 @@ def test_evaluator_rejects_unbound_perception_timestamps_and_falls_back(
         '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
         '"evidence_request":"check the action"}}</tool_call>'
     )
-    client = _FakeClient([tool_call, _state_json(fact_time=fact_time)])
+    legacy = _state_json(fact_time=15.0)
+    client = _FakeClient([tool_call, legacy, legacy])
     evaluator = PerceptionMemoryEvaEvaluator(
         client,
         "Qwen3.5-9B",
@@ -1054,13 +1205,22 @@ def test_evaluator_rejects_unbound_perception_timestamps_and_falls_back(
 
     assert result["final_prediction"] == "A"
     assert result["fallback_to_candidate"] is True
-    assert result["error_type"] == "ValueError"
-    assert expected_error in result["error"]
+    assert result["error_type"] == "PerceptionModelFailure"
+    assert result["failure_class"] == "model_parse_failure"
+    assert "legacy_timestamp_schema" in result["error"]
     assert result["event_ledger"] == []
     assert result["perception_states"] == []
-    perception_request = result["request_trace"][-1]
-    assert perception_request["stage"] == "perception"
-    assert expected_error in perception_request["state_validation_error"]
+    perception_requests = [
+        item for item in result["request_trace"] if item["stage"] == "perception"
+    ]
+    assert len(perception_requests) == 2
+    assert all(
+        item["timestamp_reference_mode"] == "timestamp"
+        for item in perception_requests
+    )
+    assert perception_requests[0]["retry_triggered"] is True
+    assert perception_requests[0]["retry_reason"] == "legacy_timestamp_schema"
+    assert perception_requests[1]["retry_triggered"] is False
 
 
 def test_deferred_trajectory_provenance_is_part_of_fingerprint(
@@ -1100,7 +1260,7 @@ def test_rejected_stop_does_not_create_a_gap_in_perception_prefixes(
             '{"action":"stop"}',
             '{"evidence_complete":false,"missing_evidence":["visual action"]}',
             tool_call,
-            _state_json(),
+            _indexed_state_json(),
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"A","evidence_ids":["E0001"]}',

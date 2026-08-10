@@ -553,6 +553,9 @@ def test_persisted_runtime_trace_exports_without_schema_translation(
     video.write_bytes(b"video")
     frame.write_bytes(b"frame")
     observation = _observation((0.0, 10.0), sufficient=True)
+    observation["timestamped_facts"] = [
+        {"frame_index": 0, "fact": "A person opens the left door."}
+    ]
     tool = (
         '<tool_call>{"tool":"frame_select","arguments":'
         '{"start_time":0,"end_time":10,"nframes":1,"resize":1.0,'
@@ -640,6 +643,14 @@ def test_persisted_runtime_trace_exports_without_schema_translation(
     assert records[-1]["messages"][-1]["content"] == (
         '{"answer":"A","evidence_ids":["E0001"]}'
     )
+    memory_record = next(
+        record
+        for record in records
+        if record["metadata"]["episode_target_type"] == "memory"
+    )
+    assert json.loads(memory_record["messages"][-1]["content"])[
+        "timestamped_facts"
+    ] == [{"fact": "A person opens the left door.", "frame_index": 0}]
 
 
 def test_export_rejects_private_annotations_and_candidate_leak(tmp_path: Path) -> None:

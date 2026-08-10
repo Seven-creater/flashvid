@@ -448,11 +448,27 @@ class PerceptionMemoryPrefixJudge:
 
     def __init__(
         self,
-        client: PrefixJudgeClient,
+        client: PrefixJudgeClient | Sequence[PrefixJudgeClient],
         config: PrefixJudgeConfig | None = None,
     ) -> None:
-        self.client = client
+        clients = tuple(client) if isinstance(client, Sequence) else (client,)
+        if not clients or any(
+            not callable(getattr(item, "chat", None)) for item in clients
+        ):
+            raise ValueError("prefix Judge requires one or more clients")
+        self.clients = clients
+        # Preserve the single-client attribute for compatible callers.
+        self.client = clients[0]
         self.config = config or PrefixJudgeConfig()
+
+    @property
+    def endpoint_count(self) -> int:
+        return len(self.clients)
+
+    def _client_for_prefix(self, prefix_id: str) -> PrefixJudgeClient:
+        digest = hashlib.sha256(prefix_id.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:8], "big") % self.endpoint_count
+        return self.clients[index]
 
     def _base_row(self, job: PrefixJudgeJob) -> dict[str, Any]:
         return {
@@ -464,6 +480,7 @@ class PerceptionMemoryPrefixJudge:
             "prefix_index": job.prefix_index,
             "source_sha256": job.source_sha256,
             "prefix_judge_config_sha256": self.config.fingerprint(),
+            "endpoint_count": self.endpoint_count,
             "scoring_deferred": True,
             "candidate_blind": True,
             "tools_disabled": True,
@@ -511,6 +528,7 @@ class PerceptionMemoryPrefixJudge:
                 for item in confirmations
                 if item.get("error") is None and item.get("parsed_valid") is True
             ]
+        row["endpoint_count"] = self.endpoint_count
         self._finalize(row)
         return row
 
@@ -583,7 +601,7 @@ class PerceptionMemoryPrefixJudge:
             assert_annotation_free_request(
                 {"messages": messages, "request_kwargs": request_kwargs}
             )
-            result = self.client.chat(
+            result = self._client_for_prefix(job.prefix_id).chat(
                 self.config.model,
                 messages,
                 max_tokens=self.config.max_tokens,

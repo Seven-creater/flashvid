@@ -65,12 +65,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         temperature=args.temperature,
         enable_thinking=False,
     )
-    judge = PerceptionMemoryPrefixJudge(
-        OpenAICompatibleClient(
-            args.base_url, api_key=args.api_key, timeout=args.timeout
-        ),
-        config,
-    )
+    configured_urls = getattr(args, "base_urls", None)
+    if configured_urls is None:
+        legacy_url = getattr(args, "base_url", None)
+        configured_urls = [legacy_url or "http://127.0.0.1:8200/v1"]
+    clients = [
+        OpenAICompatibleClient(url, api_key=args.api_key, timeout=args.timeout)
+        for url in configured_urls
+    ]
+    judge = PerceptionMemoryPrefixJudge(clients, config)
 
     progress_path = args.output.with_suffix(args.output.suffix + ".progress.jsonl")
     if (args.output.is_file() or progress_path.is_file()) and not args.resume:
@@ -144,6 +147,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for row in rows.values()
         ),
         "retry_errors": retry_errors,
+        "endpoint_count": judge.endpoint_count,
         "output": str(args.output.resolve()),
     }
 
@@ -152,7 +156,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trajectories", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--base-url", default="http://127.0.0.1:8200/v1")
+    parser.add_argument(
+        "--base-url",
+        action="append",
+        dest="base_urls",
+        help=(
+            "OpenAI-compatible endpoint; repeat to distribute prefixes "
+            "deterministically across endpoints. Defaults to 8200."
+        ),
+    )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "no"))
     parser.add_argument("--model", default="Qwen3.5-9B")
     parser.add_argument("--judge-seed", type=int, action="append", default=None)

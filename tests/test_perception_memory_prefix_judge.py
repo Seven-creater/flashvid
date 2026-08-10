@@ -192,6 +192,47 @@ def test_three_seed_judge_disables_tools_records_requests_and_resumes() -> None:
     assert resumed_client.calls == []
 
 
+def test_multi_endpoint_prefix_selection_is_stable_and_not_semantic() -> None:
+    clients = [FakeClient() for _ in range(8)]
+    judge = PerceptionMemoryPrefixJudge(clients, PrefixJudgeConfig())
+    jobs = [
+        bind_prefix_jobs([_trajectory(f"lvbench:s1:family:{index}")])[0]
+        for index in range(64)
+    ]
+
+    first = [judge._client_for_prefix(job.prefix_id) for job in jobs]
+    second = [judge._client_for_prefix(job.prefix_id) for job in jobs]
+
+    assert first == second
+    assert set(first).issubset(set(clients))
+    assert len(set(first)) > 1
+    assert judge.endpoint_count == 8
+    assert (
+        judge.config.fingerprint()
+        == PerceptionMemoryPrefixJudge(
+            clients[0], PrefixJudgeConfig()
+        ).config.fingerprint()
+    )
+
+
+def test_endpoint_count_is_audited_without_url_leak_and_resume_is_compatible() -> None:
+    clients = [FakeClient(), FakeClient()]
+    clients[0].endpoint = "http://secret-8200/v1/chat/completions"
+    clients[1].endpoint = "http://secret-8201/v1/chat/completions"
+    job = bind_prefix_jobs([_trajectory()])[0]
+    result = PerceptionMemoryPrefixJudge(clients).judge(job)
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert result["endpoint_count"] == 2
+    assert "secret-8200" not in serialized
+    assert "secret-8201" not in serialized
+
+    resumed_clients = [FakeClient(), FakeClient(), FakeClient()]
+    resumed = PerceptionMemoryPrefixJudge(resumed_clients).judge(job, existing=result)
+    assert resumed["endpoint_count"] == 3
+    assert all(client.calls == [] for client in resumed_clients)
+
+
 def test_retry_errors_replaces_only_failed_seed_and_preserves_successes() -> None:
     job = bind_prefix_jobs([_trajectory()])[0]
     complete = PerceptionMemoryPrefixJudge(FakeClient()).judge(job)
@@ -326,6 +367,67 @@ def test_concurrent_script_compacts_progress_and_resume_skips_network(
     resumed = judge_script.run(args(True))
     assert resumed["complete"] == 2
     assert clients[1].calls == []
+
+
+def test_prefix_cli_accepts_repeated_base_urls_without_persisting_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    trajectory_path = tmp_path / "trajectories.jsonl"
+    trajectory_path.write_text(
+        json.dumps(_trajectory(), ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    output = tmp_path / "prefix_judgments.jsonl"
+    seen_urls: list[str] = []
+
+    def client_factory(base_url: str, **_kwargs):
+        seen_urls.append(base_url)
+        client = FakeClient()
+        client.endpoint = base_url
+        return client
+
+    monkeypatch.setattr(judge_script, "OpenAICompatibleClient", client_factory)
+    exit_code = judge_script.main(
+        [
+            "--trajectories",
+            str(trajectory_path),
+            "--output",
+            str(output),
+            "--base-url",
+            "http://secret-8200/v1",
+            "--base-url",
+            "http://secret-8201/v1",
+            "--concurrency",
+            "2",
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen_urls == ["http://secret-8200/v1", "http://secret-8201/v1"]
+    stdout = capsys.readouterr().out
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert all(row["endpoint_count"] == 2 for row in rows)
+    assert '"endpoint_count": 2' in stdout
+    assert "secret-8200" not in output.read_text(encoding="utf-8")
+    assert "secret-8201" not in output.read_text(encoding="utf-8")
+
+    seen_urls.clear()
+    default_output = tmp_path / "prefix_judgments_default.jsonl"
+    assert (
+        judge_script.main(
+            [
+                "--trajectories",
+                str(trajectory_path),
+                "--output",
+                str(default_output),
+                "--concurrency",
+                "2",
+            ]
+        )
+        == 0
+    )
+    assert seen_urls == ["http://127.0.0.1:8200/v1"]
 
 
 def test_concurrent_script_retry_errors_only_reissues_failed_seed(

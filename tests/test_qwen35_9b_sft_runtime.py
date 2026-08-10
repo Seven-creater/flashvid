@@ -111,6 +111,8 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "--reuse-valid",
         "preflight_qwen35_9b_lora.py",
         "smoke_one_sample.jsonl",
+        'value.get("images")',
+        "Prefer a real multimodal record",
         "--max_steps 1",
         "--logging_steps 1",
         "--save_steps 1",

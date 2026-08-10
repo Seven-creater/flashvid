@@ -233,19 +233,29 @@ copies = int(sys.argv[3])
 if copies < 1:
     raise SystemExit("smoke rank padding must be positive")
 with source.open(encoding="utf-8") as handle:
+    fallback = None
+    selected = None
     for line_number, line in enumerate(handle, 1):
         if not line.strip():
             continue
         value = json.loads(line)
         if not isinstance(value, dict):
             raise SystemExit(f"row {line_number}: expected an object")
-        # One unique logical sample is repeated only so every data-parallel rank
-        # receives a complete gradient-accumulation window for the 1-step smoke.
-        encoded = json.dumps(value, ensure_ascii=False) + "\n"
-        output.write_text(encoded * copies, encoding="utf-8")
-        break
-    else:
+        if fallback is None:
+            fallback = value
+        images = value.get("images")
+        if isinstance(images, list) and images:
+            selected = value
+            break
+    if selected is None:
+        selected = fallback
+    if selected is None:
         raise SystemExit("SFT data is empty")
+    # Prefer a real multimodal record so the smoke exercises frozen vision
+    # loading and image collation. One logical sample is repeated only so every
+    # data-parallel rank receives a complete accumulation window.
+    encoded = json.dumps(selected, ensure_ascii=False) + "\n"
+    output.write_text(encoded * copies, encoding="utf-8")
 PY
   loss_mask_samples=1
 fi

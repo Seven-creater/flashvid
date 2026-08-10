@@ -128,9 +128,7 @@ def explicit_time_rescue_request(
         for source in source_intervals
     )
     if not source_mismatch:
-        raise ValueError(
-            "rescue_explicit_time requires a source interval mismatch"
-        )
+        raise ValueError("rescue_explicit_time requires a source interval mismatch")
 
     start = max(0.0, selected[0])
     end = min(duration, selected[1])
@@ -350,8 +348,10 @@ def _controller_retry_feedback(
     else:
         detail = "The previous response did not match the official EVA action schema."
     stop_action = (
-        'If the text ledger is ready for an independent completeness check, return '
-        'exactly {"action":"stop"}. Otherwise, ' if allow_stop else ""
+        "If the text ledger is ready for an independent completeness check, return "
+        'exactly {"action":"stop"}. Otherwise, '
+        if allow_stop
+        else ""
     )
     return (
         f"{detail} Retry without prose or markdown. {stop_action}return exactly one "
@@ -643,8 +643,7 @@ def perception_model_target(
     """Serialize a validated perception state using zero-based frame indices."""
 
     timestamps = tuple(
-        _finite_number(value, "actual frame timestamp")
-        for value in actual_timestamps
+        _finite_number(value, "actual frame timestamp") for value in actual_timestamps
     )
     payload = state.to_dict()
     indexed_facts: list[dict[str, Any]] = []
@@ -938,6 +937,151 @@ def _memory_json(memory: EvidenceMemory) -> str:
     )
 
 
+def _controller_reference_request(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    video_duration: float,
+) -> FrameRequest | None:
+    """Build one public-input-only action that is valid for the current state.
+
+    This is a format reference, but it is deliberately executable: models that
+    copy it still request a useful question-timestamp or coverage interval.  It
+    never uses the Direct candidate or private annotation fields.
+    """
+
+    duration = _finite_number(video_duration, "video_duration")
+    if duration <= 0.0:
+        raise ValueError("video_duration must be positive")
+
+    candidates: list[tuple[float, float, str]] = []
+    explicit = parse_question_time_range(sample.question, padding_s=1.0)
+    if explicit is not None:
+        start = max(0.0, explicit[0])
+        end = min(duration, explicit[1])
+        if end > start:
+            candidates.append(
+                (
+                    start,
+                    end,
+                    "Inspect the public question's stated time and record the "
+                    "directly visible option-discriminative event.",
+                )
+            )
+
+    if not memory.observed_intervals:
+        candidates.append(
+            (
+                0.0,
+                duration,
+                "Build a uniform visual overview and record directly visible facts "
+                "that distinguish the answer choices.",
+            )
+        )
+    else:
+        clipped = sorted(
+            (
+                max(0.0, float(start)),
+                min(duration, float(end)),
+            )
+            for start, end in memory.observed_intervals
+            if min(duration, float(end)) > max(0.0, float(start))
+        )
+        merged: list[list[float]] = []
+        for start, end in clipped:
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        cursor = 0.0
+        gaps: list[tuple[float, float]] = []
+        for start, end in merged:
+            if start > cursor:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < duration:
+            gaps.append((cursor, duration))
+        for start, end in sorted(
+            gaps, key=lambda item: item[1] - item[0], reverse=True
+        ):
+            candidates.append(
+                (
+                    start,
+                    end,
+                    "Observe the largest remaining time gap and resolve missing "
+                    "option-discriminative evidence.",
+                )
+            )
+
+        # A whole-video overview can cover every timestamp while still leaving a
+        # need for denser local inspection.  These public duration-relative windows
+        # remain non-duplicates under the runtime IoU rule and provide valid format
+        # references without a fixed 0-30 second anchor.
+        candidates.extend(
+            (
+                (
+                    0.0,
+                    duration / 2.0,
+                    "Inspect the first half for unresolved evidence.",
+                ),
+                (
+                    duration / 2.0,
+                    duration,
+                    "Inspect the second half for unresolved evidence.",
+                ),
+                (
+                    duration / 4.0,
+                    3.0 * duration / 4.0,
+                    "Inspect the middle half for unresolved evidence.",
+                ),
+            )
+        )
+
+    for start, end, evidence_request in candidates:
+        if end - start < 0.001:
+            continue
+        interval = (start, end)
+        if duplicate_interval(interval, memory.observed_intervals):
+            continue
+        span = end - start
+        nframes = min(64, max(8, int(math.ceil(span * 2.0))))
+        if explicit is None or interval != candidates[0][:2]:
+            nframes = min(nframes, 32)
+        return FrameRequest(
+            start_time=round(start, 3),
+            end_time=round(end, 3),
+            nframes=nframes,
+            resize=0.75,
+            evidence_request=evidence_request,
+        )
+    return None
+
+
+def _controller_reference_output(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    video_duration: float,
+    *,
+    allow_stop: bool,
+) -> str:
+    request = _controller_reference_request(sample, memory, video_duration)
+    if request is not None:
+        return _controller_tool_call(request)
+    if allow_stop:
+        return '{"action":"stop"}'
+    return _controller_tool_call(
+        FrameRequest(
+            start_time=0.0,
+            end_time=video_duration,
+            nframes=64,
+            resize=0.75,
+            evidence_request=(
+                "Re-check the decisive visual evidence symmetrically for both "
+                "hypotheses."
+            ),
+        )
+    )
+
+
 def build_controller_messages(
     sample: ModelSample,
     memory: EvidenceMemory,
@@ -950,6 +1094,7 @@ def build_controller_messages(
     duration = float(video_metadata["duration"])
     width = int(video_metadata.get("width", 0))
     height = int(video_metadata.get("height", 0))
+    reference = _controller_reference_output(sample, memory, duration, allow_stop=True)
     system = (
         "You are the text-only controller of a long-video evidence agent. Decide "
         "what visual evidence is still missing from the timestamped text ledger. "
@@ -957,15 +1102,18 @@ def build_controller_messages(
         "To observe, output only one official EVA <tool_call> JSON object whose tool "
         "is frame_select. Its arguments must contain numeric start_time, end_time, "
         "and resize; a precise evidence_request; and exactly one numeric nframes or "
-        "fps. Choose the interval from the question and current evidence gap; there "
-        "is no default interval. "
+        "fps. The user message contains one currently valid, public-input-only "
+        "reference action. Copy its wrapper and JSON key structure exactly; use the "
+        "reference action itself when it addresses the missing evidence, otherwise "
+        "change only its argument values. "
         "Use exactly one of nframes or fps and do not repeat an observed interval. "
         "Only when the ledger is ready for an independent completeness check, output "
         'exactly {"action":"stop"}.'
     )
     user = (
         f"{_question_text(sample)}\nVideo duration: {duration:.3f} seconds; "
-        f"resolution: {width}x{height}.\nEvidence memory: {_memory_json(memory)}"
+        f"resolution: {width}x{height}.\nEvidence memory: {_memory_json(memory)}\n"
+        f"Exact currently-valid output reference: {reference}"
     )
     if feedback:
         user += f"\nController feedback: {_SPACE_RE.sub(' ', feedback.strip())}"
@@ -1142,10 +1290,11 @@ def build_confirmation_controller_messages(
 
     first, second = sorted(str(item).strip().upper() for item in hypotheses)
     duration = float(video_metadata["duration"])
+    reference = _controller_reference_output(sample, memory, duration, allow_stop=False)
     user = (
         f"{_question_text(sample)}\nHypotheses (unordered): {first}, {second}. "
         f"Video duration: {duration:.3f} seconds.\nEvidence memory: "
-        f"{_memory_json(memory)}"
+        f"{_memory_json(memory)}\nExact official output reference: {reference}"
     )
     if feedback:
         user += f"\nController feedback: {_SPACE_RE.sub(' ', feedback.strip())}"
@@ -1158,7 +1307,8 @@ def build_confirmation_controller_messages(
                 "only with denser frames or wider before/after context. Return only one "
                 "official EVA frame_select tool call with start_time, end_time, exactly one "
                 "of nframes or fps, resize, and a symmetric evidence_request that tests "
-                "both hypotheses."
+                "both hypotheses. Copy the reference wrapper and JSON key structure "
+                "exactly; never return bare JSON, args, markdown, or prose."
             ),
         },
         {
@@ -1662,9 +1812,10 @@ class PerceptionMemoryEvaEvaluator:
                     )
                     raise
                 attempt_trace = trace[-1]
-                if not isinstance(exc, RuntimeError) or attempt_trace.get(
-                    "finish_reason"
-                ) != "length":
+                if (
+                    not isinstance(exc, RuntimeError)
+                    or attempt_trace.get("finish_reason") != "length"
+                ):
                     raise
                 content = str(attempt_trace.get("content") or "")
             attempts += 1
@@ -1829,8 +1980,7 @@ class PerceptionMemoryEvaEvaluator:
                 )
             elif (
                 self.scoring_deferred
-                and self.trajectory_variant_id
-                in DURATION_RESCUE_TRAJECTORY_VARIANTS
+                and self.trajectory_variant_id in DURATION_RESCUE_TRAJECTORY_VARIANTS
             ):
                 rescue_request = rescue_frame_request(
                     self.trajectory_variant_id, float(session.metadata["duration"])
@@ -1984,10 +2134,7 @@ class PerceptionMemoryEvaEvaluator:
                     feedback = "Stop rejected; missing evidence: " + "; ".join(missing)
                     last_controller_rejection = "incomplete_evidence"
                     no_novel_action_rejections += 1
-                    if (
-                        no_novel_action_rejections
-                        >= _MAX_NO_NOVEL_ACTION_REJECTIONS
-                    ):
+                    if no_novel_action_rejections >= _MAX_NO_NOVEL_ACTION_REJECTIONS:
                         stopped_without_novel_action = True
                         no_novel_action_reason = "incomplete_evidence"
                         stop_reason = "evidence_incomplete_no_novel_action"
@@ -2234,9 +2381,7 @@ class PerceptionMemoryEvaEvaluator:
                                     ),
                                 }
                             )
-                            confirmation_retry_reason = (
-                                "controller_response_truncated"
-                            )
+                            confirmation_retry_reason = "controller_response_truncated"
                             confirmation_feedback = _controller_retry_feedback(
                                 confirmation_retry_reason,
                                 float(session.metadata["duration"]),

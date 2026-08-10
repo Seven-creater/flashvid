@@ -153,8 +153,7 @@ def _indexed_state_json(
         )
     )
     payload["timestamped_facts"] = [
-        {"frame_index": frame_index, "fact": fact}
-        for frame_index in frame_indices
+        {"frame_index": frame_index, "fact": fact} for frame_index in frame_indices
     ]
     return json.dumps(payload)
 
@@ -235,9 +234,7 @@ def test_frame_index_protocol_binds_first_and_last_exact_timestamps() -> None:
 def test_runtime_frame_index_protocol_explicitly_rejects_legacy_time_schema() -> None:
     legacy = _state_json(fact_time=15.0)
 
-    compatible, compatible_mode = bind_perception_state(
-        legacy, ("A", "B"), (15.0,)
-    )
+    compatible, compatible_mode = bind_perception_state(legacy, ("A", "B"), (15.0,))
     strict, strict_mode = bind_perception_state(
         legacy,
         ("A", "B"),
@@ -653,7 +650,9 @@ def test_rescue_frame_request_is_duration_only_and_pre_registered(
     assert rescue_frame_request("base", 100.0) is None
 
 
-def test_explicit_time_rescue_uses_public_question_seconds_and_proves_mismatch() -> None:
+def test_explicit_time_rescue_uses_public_question_seconds_and_proves_mismatch() -> (
+    None
+):
     request, audit = explicit_time_rescue_request(
         "What happens at 65:02?",
         4000.0,
@@ -1020,7 +1019,9 @@ def test_runtime_binds_indexed_perception_to_first_and_last_frame(
 
     assert result["error"] is None
     state = result["perception_states"][0]
-    assert [item["time"] for item in state["perception_response"]["timestamped_facts"]] == [
+    assert [
+        item["time"] for item in state["perception_response"]["timestamped_facts"]
+    ] == [
         observation.timestamps[0],
         observation.timestamps[-1],
     ]
@@ -1107,8 +1108,7 @@ def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
     )
     payload = json.loads(_state_json())
     payload["timestamped_facts"] = [
-        {"frame_index": 0, "fact": f"visible fact {index}"}
-        for index in range(20)
+        {"frame_index": 0, "fact": f"visible fact {index}"} for index in range(20)
     ]
     payload["option_evidence"]["B"]["supports"] = [
         "visible fact 19",
@@ -1523,15 +1523,83 @@ def test_duplicate_stall_runs_blind_completeness_before_answering(
     assert not messages_have_media(completeness[0]["messages"])
 
 
-def test_controller_prompt_has_no_copyable_default_interval() -> None:
+def _controller_reference(messages: list[dict[str, object]], marker: str) -> str:
+    content = str(messages[-1]["content"])
+    return content.split(marker, 1)[1].split("\nController feedback:", 1)[0]
+
+
+def test_controller_prompt_has_dynamic_valid_official_reference() -> None:
     memory = EvidenceMemory(("A", "B"))
     messages = build_controller_messages(
         _sample(None), memory, {"duration": 100.0, "width": 1, "height": 1}
     )
     prompt = json.dumps(messages, ensure_ascii=False)
-    assert "there is no default interval" in prompt
-    assert '"end_time":30.0' not in prompt
-    assert '"start_time":0.0' not in prompt
+    reference = _controller_reference(
+        messages, "Exact currently-valid output reference: "
+    )
+    action = parse_controller_action(reference)
+    assert action is not None and action.request is not None
+    assert action.request.start_time == 0.0
+    assert action.request.end_time == 100.0
+    assert action.request.nframes == 32
+    assert action.request.resize == 0.75
+    assert reference.startswith("<tool_call>")
+    assert reference.endswith("</tool_call>")
+    assert '"arguments"' in reference
+    assert '"args"' not in reference
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in prompt
+
+
+def test_controller_reference_uses_public_explicit_time_and_avoids_observed() -> None:
+    sample = ModelSample(
+        dataset="lvbench",
+        sample_id="long-time",
+        video="video.mp4",
+        question="What happens from 65:02 to 65:08?",
+        choices={"A": "First", "B": "Second"},
+        candidate_answer="PRIVATE_CANDIDATE_SENTINEL",
+    )
+    memory = EvidenceMemory(("A", "B"))
+    messages = build_controller_messages(
+        sample, memory, {"duration": 4000.0, "width": 1, "height": 1}
+    )
+    reference = _controller_reference(
+        messages, "Exact currently-valid output reference: "
+    )
+    action = parse_controller_action(reference)
+    assert action is not None and action.request is not None
+    assert (action.request.start_time, action.request.end_time) == (3901.0, 3909.0)
+
+    memory.observed_intervals.append((3901.0, 3909.0))
+    retry_messages = build_controller_messages(
+        sample, memory, {"duration": 4000.0, "width": 1, "height": 1}
+    )
+    retry_reference = _controller_reference(
+        retry_messages, "Exact currently-valid output reference: "
+    )
+    retry_action = parse_controller_action(retry_reference)
+    assert retry_action is not None and retry_action.request is not None
+    assert not duplicate_interval(
+        (retry_action.request.start_time, retry_action.request.end_time),
+        memory.observed_intervals,
+    )
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in json.dumps(
+        retry_messages, ensure_ascii=False
+    )
+
+
+def test_confirmation_controller_contains_parseable_official_reference() -> None:
+    messages = build_confirmation_controller_messages(
+        _sample(None),
+        EvidenceMemory(("A", "B")),
+        {"duration": 100.0, "width": 1, "height": 1},
+        ("A", "B"),
+    )
+    reference = _controller_reference(messages, "Exact official output reference: ")
+    action = parse_controller_action(reference)
+    assert action is not None and action.request is not None
+    assert reference.startswith("<tool_call>")
+    assert reference.endswith("</tool_call>")
 
 
 def test_invalid_controller_interval_is_retried_without_rewriting_it(
@@ -1776,7 +1844,7 @@ def test_malformed_controller_attempt_limit_is_a_parse_failure(tmp_path: Path) -
             "official EVA action schema",
         ),
         (
-            ("{\"arguments\":{", "length"),
+            ('{"arguments":{', "length"),
             "controller_response_truncated",
             "previous response was truncated",
         ),

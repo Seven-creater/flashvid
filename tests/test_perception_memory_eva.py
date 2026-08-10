@@ -538,14 +538,17 @@ class _FakeFrameTool:
 
 
 class _FakeClient:
-    def __init__(self, outputs: list[str]) -> None:
+    def __init__(self, outputs: list[str | tuple[str, str]]) -> None:
         self.outputs = outputs
         self.messages: list[list[dict]] = []
 
     def chat(self, model: str, messages: list[dict], **kwargs: object) -> ChatResult:
         del model, kwargs
         self.messages.append(messages)
-        content = self.outputs.pop(0)
+        scripted = self.outputs.pop(0)
+        content, finish_reason = (
+            scripted if isinstance(scripted, tuple) else (scripted, "stop")
+        )
         has_media = messages_have_media(messages)
         return ChatResult(
             content=content,
@@ -557,7 +560,7 @@ class _FakeClient:
             },
             raw={},
             latency_s=0.01,
-            finish_reason="stop",
+            finish_reason=finish_reason,
         )
 
 
@@ -1281,3 +1284,241 @@ def test_rejected_stop_does_not_create_a_gap_in_perception_prefixes(
     ]
     assert [item["prefix_index"] for item in controllers] == [-1, -1, 0]
     assert [item["action_accepted"] for item in controllers] == [False, True, True]
+
+
+def test_duplicate_controller_action_does_not_consume_an_evidence_step(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the first interval"}}</tool_call>'
+    )
+    second_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check a different interval"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(interval=(10.0, 20.0), sufficient=False),
+            first_call,
+            second_call,
+            _indexed_state_json(interval=(30.0, 40.0)),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    controllers = [
+        item for item in result["request_trace"] if item["stage"] == "controller"
+    ]
+    assert result["error"] is None
+    assert result["accepted_evidence_steps"] == 2
+    assert result["controller_attempts"] == 3
+    assert len(result["perception_states"]) == 2
+    assert len(session.requests) == 2
+    assert [item["step_index"] for item in controllers] == [0, 1, 1]
+    assert [item["action_accepted"] for item in controllers] == [True, False, True]
+    assert controllers[1]["action_rejection_reason"] == "duplicate_interval"
+    assert controllers[2]["retry_reason"] == "duplicate_interval"
+    assert "duplicated already observed evidence" in json.dumps(
+        controllers[2]["messages"], ensure_ascii=False
+    )
+
+
+def test_invalid_controller_interval_is_retried_without_rewriting_it(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    invalid_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":10,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    valid_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            invalid_call,
+            valid_call,
+            _indexed_state_json(),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=1,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    controllers = [
+        item for item in result["request_trace"] if item["stage"] == "controller"
+    ]
+    assert result["error"] is None
+    assert result["accepted_evidence_steps"] == 1
+    assert result["controller_attempts"] == 2
+    assert [item["step_index"] for item in controllers] == [0, 0]
+    assert controllers[0]["content"] == invalid_call
+    assert controllers[0]["action_accepted"] is False
+    assert controllers[0]["action_rejection_reason"] == "invalid_interval"
+    assert controllers[1]["action_accepted"] is True
+    assert "0 <= start_time < end_time <= 100.000" in json.dumps(
+        controllers[1]["messages"], ensure_ascii=False
+    )
+    assert len(session.requests) == 1
+    assert session.requests[0].to_tool_arguments() == {
+        "start_time": 10.0,
+        "end_time": 20.0,
+        "resize": 0.75,
+        "nframes": 1,
+        "evidence_request": "check the action",
+    }
+
+
+def test_truncated_controller_action_gets_one_bounded_retry(tmp_path: Path) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    valid_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            ("<tool_call>{", "length"),
+            valid_call,
+            _indexed_state_json(),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=1,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    controllers = [
+        item for item in result["request_trace"] if item["stage"] == "controller"
+    ]
+    assert result["error"] is None
+    assert result["controller_attempts"] == 2
+    assert [item["action_accepted"] for item in controllers] == [False, True]
+    assert controllers[0]["action_rejection_reason"] == (
+        "controller_response_truncated"
+    )
+    assert controllers[1]["retry_reason"] == "controller_response_truncated"
+    assert len(session.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("bad_confirmation", "rejection_reason", "feedback_text"),
+    [
+        (
+            "I cannot choose an interval.",
+            "invalid_confirmation_action",
+            "official EVA action schema",
+        ),
+        (
+            ("{\"arguments\":{", "length"),
+            "controller_response_truncated",
+            "previous response was truncated",
+        ),
+    ],
+    ids=("bare_error", "truncated"),
+)
+def test_bad_confirmation_retries_then_runs_second_perception_and_judge(
+    tmp_path: Path,
+    bad_confirmation: str | tuple[str, str],
+    rejection_reason: str,
+    feedback_text: str,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    confirmation_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"symmetrically distinguish A and B"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+            bad_confirmation,
+            confirmation_call,
+            _indexed_state_json(interval=(30.0, 40.0)),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=1,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    confirmations = [
+        item
+        for item in result["request_trace"]
+        if item["stage"] == "confirmation_controller"
+    ]
+    assert result["error"] is None
+    assert result["final_prediction"] == "B"
+    assert result["decision_source"] == "confirmed_visual_change"
+    assert len(confirmations) == 2
+    assert [item["action_accepted"] for item in confirmations] == [False, True]
+    assert confirmations[0]["action_rejection_reason"] == rejection_reason
+    assert confirmations[1]["retry_reason"] == rejection_reason
+    retry_prompt = json.dumps(confirmations[1]["messages"], ensure_ascii=False)
+    assert feedback_text in retry_prompt
+    assert "Direct" not in retry_prompt
+    assert "candidate" not in retry_prompt.lower()
+    assert len(result["perception_states"]) == 2
+    assert result["perception_states"][1]["stage"] == "change_confirmation"
+    assert len(result["judge_answers"]) == 2
+    assert [request.start_time for request in session.requests] == [10.0, 30.0]

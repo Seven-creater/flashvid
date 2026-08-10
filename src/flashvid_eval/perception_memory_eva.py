@@ -284,6 +284,68 @@ def parse_controller_action(text: str) -> ControllerAction | None:
     return ControllerAction("observe", request)
 
 
+def _controller_rejection_reason(text: str, video_duration: float) -> str:
+    """Distinguish malformed calls from model-proposed invalid intervals."""
+
+    match = _TOOL_CALL_RE.fullmatch((text or "").strip())
+    if match is None:
+        return "invalid_controller_action"
+    try:
+        payload = json.loads(match.group(1))
+        arguments = payload["arguments"]
+        start = _finite_number(arguments["start_time"], "controller start_time")
+        end = _finite_number(arguments["end_time"], "controller end_time")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return "invalid_controller_action"
+    if start < 0.0 or end <= start or end > video_duration:
+        return "invalid_interval"
+    return "invalid_controller_action"
+
+
+def _request_interval_rejection_reason(
+    request: FrameRequest, video_duration: float
+) -> str | None:
+    if (
+        request.start_time < 0.0
+        or request.end_time <= request.start_time
+        or request.end_time > video_duration
+    ):
+        return "invalid_interval"
+    return None
+
+
+def _controller_retry_feedback(
+    reason: str, video_duration: float, *, allow_stop: bool = True
+) -> str:
+    """Return candidate-blind, format-strict feedback for one controller retry."""
+
+    if reason == "duplicate_interval":
+        detail = (
+            "The previous interval duplicated already observed evidence. Select a "
+            "different, non-overlapping interval needed by the unresolved evidence."
+        )
+    elif reason == "invalid_interval":
+        detail = (
+            "The previous interval was invalid. It must satisfy "
+            f"0 <= start_time < end_time <= {video_duration:.3f}."
+        )
+    elif reason == "controller_response_truncated":
+        detail = "The previous response was truncated; return one compact action."
+    else:
+        detail = "The previous response did not match the official EVA action schema."
+    allowed_action = (
+        'either {"action":"stop"} or ' if allow_stop else "one "
+    )
+    example_end = min(1.0, video_duration)
+    return (
+        f"{detail} Retry without prose or markdown. Return exactly {allowed_action}"
+        '<tool_call>{"tool":"frame_select","arguments":{"start_time":0.0,'
+        f'"end_time":{example_end:.3f},"nframes":1,"resize":0.75,'
+        '"evidence_request":"a precise symmetric visual question"}}</tool_call>. '
+        "Use numeric resize and exactly one of nframes or fps."
+    )
+
+
 def _controller_tool_call(request: FrameRequest) -> str:
     payload = {"tool": "frame_select", "arguments": request.to_tool_arguments()}
     return (
@@ -1055,11 +1117,20 @@ def build_confirmation_controller_messages(
     memory: EvidenceMemory,
     video_metadata: Mapping[str, float | int],
     hypotheses: tuple[str, str],
+    *,
+    feedback: str = "",
 ) -> list[dict[str, Any]]:
     """Request fresh visual evidence without identifying the Direct branch."""
 
     first, second = sorted(str(item).strip().upper() for item in hypotheses)
     duration = float(video_metadata["duration"])
+    user = (
+        f"{_question_text(sample)}\nHypotheses (unordered): {first}, {second}. "
+        f"Video duration: {duration:.3f} seconds.\nEvidence memory: "
+        f"{_memory_json(memory)}"
+    )
+    if feedback:
+        user += f"\nController feedback: {_SPACE_RE.sub(' ', feedback.strip())}"
     return [
         {
             "role": "system",
@@ -1074,11 +1145,7 @@ def build_confirmation_controller_messages(
         },
         {
             "role": "user",
-            "content": (
-                f"{_question_text(sample)}\nHypotheses (unordered): {first}, {second}. "
-                f"Video duration: {duration:.3f} seconds.\nEvidence memory: "
-                f"{_memory_json(memory)}"
-            ),
+            "content": user,
         },
     ]
 
@@ -1244,6 +1311,7 @@ class PerceptionMemoryEvaEvaluator:
         *,
         frame_tool: FrameTool | None = None,
         max_turns: int = 6,
+        max_controller_attempts: int | None = None,
         max_frames_per_call: int = 128,
         controller_max_tokens: int = 512,
         perception_max_tokens: int = 1024,
@@ -1264,6 +1332,14 @@ class PerceptionMemoryEvaEvaluator:
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
+        if max_controller_attempts is None:
+            max_controller_attempts = max_turns * 2
+        if (
+            isinstance(max_controller_attempts, bool)
+            or not isinstance(max_controller_attempts, int)
+            or max_controller_attempts <= 0
+        ):
+            raise ValueError("max_controller_attempts must be a positive integer")
         for name, value in (
             ("controller_max_tokens", controller_max_tokens),
             ("perception_max_tokens", perception_max_tokens),
@@ -1292,6 +1368,7 @@ class PerceptionMemoryEvaEvaluator:
             frame_root, max_frames_per_call=max_frames_per_call
         )
         self.max_turns = max_turns
+        self.max_controller_attempts = max_controller_attempts
         self.controller_max_tokens = controller_max_tokens
         self.perception_max_tokens = perception_max_tokens
         self.judge_max_tokens = judge_max_tokens
@@ -1367,6 +1444,8 @@ class PerceptionMemoryEvaEvaluator:
             "implementation_bundle_sha256": implementation_bundle_sha256,
             "frame_tool_identity": copy.deepcopy(selector),
             "max_turns": self.max_turns,
+            "max_controller_attempts": self.max_controller_attempts,
+            "confirmation_controller_max_attempts": 2,
             "max_frames_per_call": getattr(
                 self.frame_tool, "max_frames_per_call", None
             ),
@@ -1699,6 +1778,9 @@ class PerceptionMemoryEvaEvaluator:
         annotation_check = "passed"
         tool_latency = 0.0
         explicit_time_rescue_audit: dict[str, Any] | None = None
+        evidence_steps = 0
+        controller_attempts = 0
+        controller_attempt_limit_reached = False
 
         try:
             video = self.index.resolve(sample.video)
@@ -1726,8 +1808,15 @@ class PerceptionMemoryEvaEvaluator:
                 rescue_request = rescue_frame_request(
                     self.trajectory_variant_id, float(session.metadata["duration"])
                 )
-            for turn in range(self.max_turns):
-                if turn == 0 and rescue_request is not None:
+            last_controller_rejection: str | None = None
+            while (
+                evidence_steps < self.max_turns
+                and controller_attempts < self.max_controller_attempts
+            ):
+                controller_attempt_index = controller_attempts
+                controller_attempts += 1
+                retry_reason = last_controller_rejection
+                if controller_attempt_index == 0 and rescue_request is not None:
                     controller_messages = build_controller_messages(
                         sample, memory, session.metadata, feedback=feedback
                     )
@@ -1748,8 +1837,11 @@ class PerceptionMemoryEvaEvaluator:
                             },
                             "latency_s": 0.0,
                             "seed": self.seed,
-                            "step_index": turn,
+                            "step_index": evidence_steps,
                             "prefix_index": -1,
+                            "controller_attempt_index": controller_attempt_index,
+                            "retry_of_attempt": None,
+                            "retry_reason": None,
                             "prompt_hash": _messages_sha256(controller_messages),
                             "source_cached_action": (
                                 self.trajectory_variant_id
@@ -1763,32 +1855,75 @@ class PerceptionMemoryEvaEvaluator:
                         }
                     )
                 else:
-                    controller_text = self._chat(
-                        request_trace,
-                        build_controller_messages(
-                            sample, memory, session.metadata, feedback=feedback
-                        ),
-                        stage="controller",
-                        max_tokens=self.controller_max_tokens,
-                        seed_offset=turn * 10,
-                        json_mode=False,
-                        step_index=turn,
-                        prefix_index=len(perception_states) - 1,
+                    try:
+                        controller_text = self._chat(
+                            request_trace,
+                            build_controller_messages(
+                                sample, memory, session.metadata, feedback=feedback
+                            ),
+                            stage="controller",
+                            max_tokens=self.controller_max_tokens,
+                            seed_offset=controller_attempt_index * 10,
+                            json_mode=False,
+                            step_index=evidence_steps,
+                            prefix_index=len(perception_states) - 1,
+                        )
+                    except RuntimeError:
+                        current = request_trace[-1]
+                        if (
+                            current.get("stage") != "controller"
+                            or current.get("finish_reason") != "length"
+                        ):
+                            raise
+                        current.update(
+                            {
+                                "controller_attempt_index": controller_attempt_index,
+                                "retry_of_attempt": (
+                                    controller_attempt_index - 1
+                                    if controller_attempt_index
+                                    else None
+                                ),
+                                "retry_reason": retry_reason,
+                                "action_accepted": False,
+                                "action_rejection_reason": (
+                                    "controller_response_truncated"
+                                ),
+                            }
+                        )
+                        feedback = _controller_retry_feedback(
+                            "controller_response_truncated",
+                            float(session.metadata["duration"]),
+                        )
+                        last_controller_rejection = "controller_response_truncated"
+                        continue
+                    request_trace[-1].update(
+                        {
+                            "controller_attempt_index": controller_attempt_index,
+                            "retry_of_attempt": (
+                                controller_attempt_index - 1 if retry_reason else None
+                            ),
+                            "retry_reason": retry_reason,
+                        }
                     )
                 action = parse_controller_action(controller_text)
                 if action is None:
-                    request_trace[-1]["action_accepted"] = False
-                    request_trace[-1]["action_rejection_reason"] = (
-                        "invalid_controller_action"
+                    rejection_reason = _controller_rejection_reason(
+                        controller_text, float(session.metadata["duration"])
                     )
-                    raise ValueError("invalid controller action")
+                    request_trace[-1]["action_accepted"] = False
+                    request_trace[-1]["action_rejection_reason"] = rejection_reason
+                    feedback = _controller_retry_feedback(
+                        rejection_reason, float(session.metadata["duration"])
+                    )
+                    last_controller_rejection = rejection_reason
+                    continue
                 if action.action == "stop":
                     decision = self._completeness(
                         sample,
                         memory,
                         request_trace,
-                        turn * 10 + 1,
-                        step_index=turn,
+                        controller_attempt_index * 10 + 1,
+                        step_index=evidence_steps,
                         prefix_index=len(perception_states) - 1,
                     )
                     if (
@@ -1810,9 +1945,21 @@ class PerceptionMemoryEvaEvaluator:
                         else ("invalid completeness response",)
                     )
                     feedback = "Stop rejected; missing evidence: " + "; ".join(missing)
+                    last_controller_rejection = "incomplete_evidence"
                     continue
 
                 assert action.request is not None
+                interval_rejection = _request_interval_rejection_reason(
+                    action.request, float(session.metadata["duration"])
+                )
+                if interval_rejection is not None:
+                    request_trace[-1]["action_accepted"] = False
+                    request_trace[-1]["action_rejection_reason"] = interval_rejection
+                    feedback = _controller_retry_feedback(
+                        interval_rejection, float(session.metadata["duration"])
+                    )
+                    last_controller_rejection = interval_rejection
+                    continue
                 requested_interval = (
                     action.request.start_time,
                     action.request.end_time,
@@ -1820,9 +1967,17 @@ class PerceptionMemoryEvaEvaluator:
                 if duplicate_interval(requested_interval, memory.observed_intervals):
                     request_trace[-1]["action_accepted"] = False
                     request_trace[-1]["action_rejection_reason"] = "duplicate_interval"
-                    feedback = "Requested interval duplicates prior evidence; choose a different interval."
+                    feedback = _controller_retry_feedback(
+                        "duplicate_interval", float(session.metadata["duration"])
+                    )
+                    last_controller_rejection = "duplicate_interval"
                     continue
-                observation = session.select(action.request)
+                try:
+                    observation = session.select(action.request)
+                except Exception:
+                    request_trace[-1]["action_accepted"] = False
+                    request_trace[-1]["action_rejection_reason"] = "frame_select_error"
+                    raise
                 request_trace[-1]["action_accepted"] = True
                 tool_step = ToolStep.from_observation("perception", observation)
                 tool_steps.append(asdict(tool_step))
@@ -1834,7 +1989,7 @@ class PerceptionMemoryEvaEvaluator:
                     action.request.evidence_request,
                     request_trace,
                     stage="perception",
-                    seed_offset=turn * 10 + 2,
+                    seed_offset=evidence_steps * 10 + 2,
                     step_index=state_index,
                     prefix_index=state_index,
                 )
@@ -1842,7 +1997,7 @@ class PerceptionMemoryEvaEvaluator:
                 perception_states.append(
                     {
                         "step_index": state_index,
-                        "turn_index": turn,
+                        "turn_index": evidence_steps,
                         "request": action.request.to_tool_arguments(),
                         "frame_paths": list(observation.frame_paths),
                         "timestamps": list(observation.timestamps),
@@ -1854,8 +2009,14 @@ class PerceptionMemoryEvaEvaluator:
                         "judge_confirmations": [],
                     }
                 )
+                evidence_steps += 1
                 feedback = ""
-            else:
+                last_controller_rejection = None
+            if not complete:
+                controller_attempt_limit_reached = (
+                    controller_attempts >= self.max_controller_attempts
+                    and evidence_steps < self.max_turns
+                )
                 decision = self._completeness(
                     sample,
                     memory,
@@ -1905,31 +2066,121 @@ class PerceptionMemoryEvaEvaluator:
                     and candidate is not None
                     and first.answer != candidate
                 ):
-                    confirmation_text = self._chat(
-                        request_trace,
-                        build_confirmation_controller_messages(
-                            sample,
-                            memory,
-                            session.metadata,
-                            (candidate, first.answer),
-                        ),
-                        stage="confirmation_controller",
-                        max_tokens=self.controller_max_tokens,
-                        seed_offset=2001,
-                        json_mode=False,
-                        step_index=len(perception_states),
-                        prefix_index=len(perception_states) - 1,
-                    )
-                    confirmation_action = parse_controller_action(confirmation_text)
+                    confirmation_action: ControllerAction | None = None
+                    confirmation_observation: FrameObservation | None = None
+                    confirmation_feedback = ""
+                    confirmation_retry_reason: str | None = None
+                    for confirmation_attempt in range(2):
+                        try:
+                            confirmation_text = self._chat(
+                                request_trace,
+                                build_confirmation_controller_messages(
+                                    sample,
+                                    memory,
+                                    session.metadata,
+                                    (candidate, first.answer),
+                                    feedback=confirmation_feedback,
+                                ),
+                                stage="confirmation_controller",
+                                max_tokens=self.controller_max_tokens,
+                                seed_offset=2001 + confirmation_attempt,
+                                json_mode=False,
+                                step_index=len(perception_states),
+                                prefix_index=len(perception_states) - 1,
+                            )
+                        except RuntimeError:
+                            current = request_trace[-1]
+                            if (
+                                current.get("stage") != "confirmation_controller"
+                                or current.get("finish_reason") != "length"
+                            ):
+                                raise
+                            current.update(
+                                {
+                                    "controller_attempt_index": confirmation_attempt,
+                                    "retry_of_attempt": (
+                                        confirmation_attempt - 1
+                                        if confirmation_attempt
+                                        else None
+                                    ),
+                                    "retry_reason": confirmation_retry_reason,
+                                    "action_accepted": False,
+                                    "action_rejection_reason": (
+                                        "controller_response_truncated"
+                                    ),
+                                }
+                            )
+                            confirmation_retry_reason = (
+                                "controller_response_truncated"
+                            )
+                            confirmation_feedback = _controller_retry_feedback(
+                                confirmation_retry_reason,
+                                float(session.metadata["duration"]),
+                                allow_stop=False,
+                            )
+                            continue
+                        current = request_trace[-1]
+                        current.update(
+                            {
+                                "controller_attempt_index": confirmation_attempt,
+                                "retry_of_attempt": (
+                                    confirmation_attempt - 1
+                                    if confirmation_retry_reason
+                                    else None
+                                ),
+                                "retry_reason": confirmation_retry_reason,
+                            }
+                        )
+                        confirmation_action = parse_controller_action(confirmation_text)
+                        rejection_reason = None
+                        if (
+                            confirmation_action is None
+                            or confirmation_action.action != "observe"
+                            or confirmation_action.request is None
+                        ):
+                            parsed_reason = _controller_rejection_reason(
+                                confirmation_text,
+                                float(session.metadata["duration"]),
+                            )
+                            rejection_reason = (
+                                parsed_reason
+                                if parsed_reason == "invalid_interval"
+                                else "invalid_confirmation_action"
+                            )
+                        else:
+                            rejection_reason = _request_interval_rejection_reason(
+                                confirmation_action.request,
+                                float(session.metadata["duration"]),
+                            )
+                        if rejection_reason is not None:
+                            current["action_accepted"] = False
+                            current["action_rejection_reason"] = rejection_reason
+                            confirmation_retry_reason = rejection_reason
+                            confirmation_feedback = _controller_retry_feedback(
+                                rejection_reason,
+                                float(session.metadata["duration"]),
+                                allow_stop=False,
+                            )
+                            confirmation_action = None
+                            continue
+                        assert confirmation_action is not None
+                        assert confirmation_action.request is not None
+                        try:
+                            confirmation_observation = session.select(
+                                confirmation_action.request
+                            )
+                        except Exception:
+                            current["action_accepted"] = False
+                            current["action_rejection_reason"] = "frame_select_error"
+                            raise
+                        current["action_accepted"] = True
+                        break
+
                     if (
                         confirmation_action is not None
-                        and confirmation_action.action == "observe"
                         and confirmation_action.request is not None
+                        and confirmation_observation is not None
                     ):
-                        confirmation_observation = session.select(
-                            confirmation_action.request
-                        )
-                        request_trace[-1]["action_accepted"] = True
                         confirmation_tool = ToolStep.from_observation(
                             "confirmation_perception", confirmation_observation
                         )
@@ -1985,15 +2236,6 @@ class PerceptionMemoryEvaEvaluator:
                                 step_index=len(perception_states) - 1,
                                 prefix_index=len(perception_states) - 1,
                             )
-                    if (
-                        confirmation_action is None
-                        or confirmation_action.action != "observe"
-                        or confirmation_action.request is None
-                    ):
-                        request_trace[-1]["action_accepted"] = False
-                        request_trace[-1]["action_rejection_reason"] = (
-                            "invalid_confirmation_action"
-                        )
                     if perception_states:
                         perception_states[-1]["judge_confirmations"].append(
                             {
@@ -2102,6 +2344,10 @@ class PerceptionMemoryEvaEvaluator:
             "observed_intervals": [list(item) for item in memory.observed_intervals],
             "evidence_complete": complete,
             "stop_reason": stop_reason,
+            "accepted_evidence_steps": evidence_steps,
+            "controller_attempts": controller_attempts,
+            "controller_attempt_limit": self.max_controller_attempts,
+            "controller_attempt_limit_reached": controller_attempt_limit_reached,
             "tool_steps": tool_steps,
             "perception_states": perception_states,
             "judge_answers": [

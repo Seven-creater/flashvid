@@ -28,6 +28,7 @@ from .perception_memory_eva import (
     bind_perception_state,
     build_controller_messages,
     build_perception_messages,
+    build_perception_retry_messages,
     perception_model_target,
     validate_perception_state_observation,
 )
@@ -540,48 +541,13 @@ def _retry_perception_messages(
     frame_count: int,
     interval: tuple[float, float],
 ) -> list[dict[str, Any]]:
-    retry = copy.deepcopy(list(messages))
-    if len(retry) != 2 or retry[-1].get("role") != "user":
-        raise ValueError("perception retry requires the frozen two-message prompt")
-    content = retry[-1].get("content")
-    if not isinstance(content, list):
-        raise ValueError("perception retry requires multimodal user content")
-    letters = tuple(str(letter).strip().upper() for letter in valid_letters)
-    if not letters or len(set(letters)) != len(letters):
-        raise ValueError("perception retry requires unique valid option letters")
-    if frame_count <= 0:
-        raise ValueError("perception retry requires a positive frame count")
-    start = _finite(interval[0], "perception retry interval start")
-    end = _finite(interval[1], "perception retry interval end")
-    if end <= start:
-        raise ValueError("perception retry interval must be increasing")
-    skeleton = {
-        "interval": [start, end],
-        "timestamped_facts": [],
-        "option_evidence": {
-            letter: {"supports": [], "contradicts": []} for letter in letters
-        },
-        "temporal_changes": [],
-        "unresolved": [],
-        "evidence_sufficient": False,
-        "next_evidence_needed": "",
-    }
-    correction = (
-        f"Correction after {reason or 'invalid_json_or_schema'}: return one compact "
-        "raw JSON object only. The current observation contains exactly "
-        f"{frame_count} frames, so every timestamped_facts item must be exactly "
-        f'{{"frame_index": <integer 0 through {frame_count - 1}>, '
-        '"fact": "<directly visible fact>"}}. do not use timestamp seconds as '
-        f"frame_index. Use no more than 6 facts. Copy interval exactly as "
-        f"[{start}, {end}]. option_evidence must contain exactly "
-        f"{', '.join(letters)}; every option value must be an object with exactly "
-        "supports and contradicts string arrays. A bare list as an option value is "
-        "forbidden. Preserve every top-level key and its type. Use this exact JSON "
-        "skeleton, replacing only arrays, the boolean, and next_evidence_needed: "
-        + json.dumps(skeleton, ensure_ascii=False, separators=(",", ":"))
+    return build_perception_retry_messages(
+        messages,
+        reason,
+        valid_letters=valid_letters,
+        frame_count=frame_count,
+        interval=interval,
     )
-    content.append({"type": "text", "text": correction})
-    return retry
 
 
 class ReplayAttemptFailure(ValueError):

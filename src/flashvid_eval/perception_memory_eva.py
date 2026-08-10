@@ -974,6 +974,60 @@ def build_perception_messages(
     ]
 
 
+def build_perception_retry_messages(
+    messages: Sequence[Mapping[str, Any]],
+    reason: str,
+    *,
+    valid_letters: Sequence[str],
+    frame_count: int,
+    interval: tuple[float, float],
+) -> list[dict[str, Any]]:
+    """Add one compact schema correction without changing the observed frames."""
+
+    retry = copy.deepcopy(list(messages))
+    if len(retry) != 2 or retry[-1].get("role") != "user":
+        raise ValueError("perception retry requires the frozen two-message prompt")
+    content = retry[-1].get("content")
+    if not isinstance(content, list):
+        raise ValueError("perception retry requires multimodal user content")
+    letters = tuple(str(letter).strip().upper() for letter in valid_letters)
+    if not letters or len(set(letters)) != len(letters):
+        raise ValueError("perception retry requires unique valid option letters")
+    if frame_count <= 0:
+        raise ValueError("perception retry requires a positive frame count")
+    start = _finite_number(interval[0], "perception retry interval start")
+    end = _finite_number(interval[1], "perception retry interval end")
+    if end <= start:
+        raise ValueError("perception retry interval must be increasing")
+    skeleton = {
+        "interval": [start, end],
+        "timestamped_facts": [],
+        "option_evidence": {
+            letter: {"supports": [], "contradicts": []} for letter in letters
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+        "evidence_sufficient": False,
+        "next_evidence_needed": "",
+    }
+    correction = (
+        f"Correction after {reason or 'invalid_json_or_schema'}: return one compact "
+        "raw JSON object only. The current observation contains exactly "
+        f"{frame_count} frames, so every timestamped_facts item must be exactly "
+        f'{{"frame_index": <integer 0 through {frame_count - 1}>, '
+        '"fact": "<directly visible fact>"}}. do not use timestamp seconds as '
+        f"frame_index. Use no more than 6 facts. Copy interval exactly as "
+        f"[{start}, {end}]. option_evidence must contain exactly "
+        f"{', '.join(letters)}; every option value must be an object with exactly "
+        "supports and contradicts string arrays. A bare list as an option value is "
+        "forbidden. Preserve every top-level key and its type. Use this exact JSON "
+        "skeleton, replacing only arrays, the boolean, and next_evidence_needed: "
+        + json.dumps(skeleton, ensure_ascii=False, separators=(",", ":"))
+    )
+    content.append({"type": "text", "text": correction})
+    return retry
+
+
 def build_completeness_messages(
     sample: ModelSample, memory: EvidenceMemory
 ) -> list[dict[str, Any]]:
@@ -1111,6 +1165,20 @@ class FinalDecision:
     fallback_to_candidate: bool
 
 
+class PerceptionModelFailure(ValueError):
+    """A Perception response remained invalid after its one bounded retry."""
+
+    failure_class = "model_parse_failure"
+
+    def __init__(self, stage: str, reason: str, attempts: int) -> None:
+        super().__init__(
+            f"{stage} returned invalid evidence after {attempts} attempt(s): {reason}"
+        )
+        self.stage = stage
+        self.reason = reason
+        self.attempts = attempts
+
+
 def apply_candidate_gate(
     *,
     candidate: str | None,
@@ -1180,6 +1248,8 @@ class PerceptionMemoryEvaEvaluator:
         controller_max_tokens: int = 512,
         perception_max_tokens: int = 1024,
         judge_max_tokens: int = 512,
+        server_max_model_len: int = 131072,
+        context_safety_tokens: int = 1024,
         seed: int = 42,
         candidate_results_sha256: str | None = None,
         model_artifact_sha256: str | None = None,
@@ -1194,6 +1264,22 @@ class PerceptionMemoryEvaEvaluator:
     ) -> None:
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
+        for name, value in (
+            ("controller_max_tokens", controller_max_tokens),
+            ("perception_max_tokens", perception_max_tokens),
+            ("judge_max_tokens", judge_max_tokens),
+            ("server_max_model_len", server_max_model_len),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            isinstance(context_safety_tokens, bool)
+            or not isinstance(context_safety_tokens, int)
+            or context_safety_tokens < 0
+        ):
+            raise ValueError("context_safety_tokens must be a non-negative integer")
+        if context_safety_tokens >= server_max_model_len:
+            raise ValueError("context_safety_tokens must be below server_max_model_len")
         self.client = client
         self.local_media_transport = (
             "path"
@@ -1209,6 +1295,8 @@ class PerceptionMemoryEvaEvaluator:
         self.controller_max_tokens = controller_max_tokens
         self.perception_max_tokens = perception_max_tokens
         self.judge_max_tokens = judge_max_tokens
+        self.server_max_model_len = server_max_model_len
+        self.context_safety_tokens = context_safety_tokens
         self.seed = seed
         self.candidate_results_sha256 = candidate_results_sha256
         self.model_artifact_sha256 = model_artifact_sha256
@@ -1284,7 +1372,13 @@ class PerceptionMemoryEvaEvaluator:
             ),
             "controller_max_tokens": self.controller_max_tokens,
             "perception_max_tokens": self.perception_max_tokens,
+            "perception_retry_max_tokens": min(
+                self.perception_max_tokens * 2,
+                self.server_max_model_len - self.context_safety_tokens,
+            ),
             "judge_max_tokens": self.judge_max_tokens,
+            "server_max_model_len": self.server_max_model_len,
+            "context_safety_tokens": self.context_safety_tokens,
             "seed": self.seed,
             "candidate_results_sha256": self.candidate_results_sha256,
             "model_artifact_sha256": self.model_artifact_sha256,
@@ -1365,6 +1459,178 @@ class PerceptionMemoryEvaEvaluator:
             raise RuntimeError(f"{stage} response was truncated")
         return result.content
 
+    def _perception_state(
+        self,
+        sample: ModelSample,
+        observation: FrameObservation,
+        evidence_request: str,
+        trace: list[dict[str, Any]],
+        *,
+        stage: str,
+        seed_offset: int,
+        step_index: int,
+        prefix_index: int,
+    ) -> tuple[PerceptionState, dict[str, Any]]:
+        """Run one Perception turn with at most one same-frame model retry."""
+
+        messages = build_perception_messages(
+            sample,
+            observation,
+            evidence_request,
+            use_frame_indices=True,
+        )
+        retry_group_id = _messages_sha256(messages)
+        retry_reason: str | None = None
+        attempts = 0
+        timestamp_reference_mode = "invalid"
+        for attempt_index in range(2):
+            attempt_messages = (
+                messages
+                if attempt_index == 0
+                else build_perception_retry_messages(
+                    messages,
+                    retry_reason or "",
+                    valid_letters=sample.option_letters,
+                    frame_count=len(observation.timestamps),
+                    interval=(
+                        observation.resolved_start_time,
+                        observation.resolved_end_time,
+                    ),
+                )
+            )
+            if attempt_index == 0:
+                max_tokens = self.perception_max_tokens
+            else:
+                first_usage = trace[-1].get("usage", {}) if trace else {}
+                prompt_tokens = first_usage.get("prompt_tokens")
+                if (
+                    isinstance(prompt_tokens, bool)
+                    or not isinstance(prompt_tokens, (int, float))
+                    or not math.isfinite(float(prompt_tokens))
+                    or float(prompt_tokens) < 0
+                ):
+                    prompt_tokens = 0
+                headroom = (
+                    self.server_max_model_len
+                    - int(prompt_tokens)
+                    - self.context_safety_tokens
+                )
+                max_tokens = min(self.perception_max_tokens * 2, headroom)
+                if max_tokens <= 0:
+                    trace[-1]["retry_blocked_reason"] = (
+                        "insufficient_service_context_headroom"
+                    )
+                    break
+
+            trace_length = len(trace)
+            try:
+                content = self._chat(
+                    trace,
+                    attempt_messages,
+                    stage=stage,
+                    max_tokens=max_tokens,
+                    seed_offset=seed_offset,
+                    json_mode=True,
+                    step_index=step_index,
+                    prefix_index=prefix_index,
+                )
+            except AnnotationLeakError:
+                raise
+            except Exception as exc:
+                if len(trace) == trace_length:
+                    trace.append(
+                        {
+                            "stage": stage,
+                            "model": self.model,
+                            "messages": copy.deepcopy(attempt_messages),
+                            "content": "",
+                            "reasoning_content": "",
+                            "finish_reason": None,
+                            "usage": {},
+                            "latency_s": 0.0,
+                            "seed": self.seed + seed_offset,
+                            "step_index": step_index,
+                            "prefix_index": prefix_index,
+                            "prompt_hash": _messages_sha256(attempt_messages),
+                            "retry_group_id": retry_group_id,
+                            "attempt_index": attempt_index,
+                            "retry_of_attempt": 0 if attempt_index else None,
+                            "retry_reason": retry_reason,
+                            "retry_triggered": False,
+                            "timestamp_reference_mode": "not_run",
+                            "max_tokens": max_tokens,
+                            "failure_class": "infrastructure_error",
+                            "attempt_error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    raise
+                attempt_trace = trace[-1]
+                if not isinstance(exc, RuntimeError) or attempt_trace.get(
+                    "finish_reason"
+                ) != "length":
+                    raise
+                content = str(attempt_trace.get("content") or "")
+            attempts += 1
+            attempt_trace = trace[-1]
+            state, timestamp_reference_mode = bind_perception_state(
+                content,
+                sample.option_letters,
+                observation.timestamps,
+                allow_timestamp_schema=False,
+            )
+            attempt_failure: str | None = None
+            validation_error: str | None = None
+            if attempt_trace.get("finish_reason") == "length":
+                attempt_failure = "finish_reason_length"
+            elif state is None:
+                attempt_failure = (
+                    "legacy_timestamp_schema"
+                    if timestamp_reference_mode == "timestamp"
+                    else "invalid_json_or_schema"
+                )
+            else:
+                try:
+                    state = validate_perception_state_observation(state, observation)
+                except ValueError as exc:
+                    validation_error = str(exc)
+                    attempt_failure = "invalid_observation_binding"
+                    state = None
+
+            attempt_trace.update(
+                {
+                    "retry_group_id": retry_group_id,
+                    "attempt_index": attempt_index,
+                    "retry_of_attempt": 0 if attempt_index else None,
+                    "retry_reason": attempt_failure or retry_reason,
+                    "retry_triggered": attempt_index == 0
+                    and attempt_failure is not None,
+                    "timestamp_reference_mode": timestamp_reference_mode,
+                    "max_tokens": max_tokens,
+                    "failure_class": (
+                        "model_parse_failure" if attempt_failure else None
+                    ),
+                    "attempt_error": attempt_failure,
+                }
+            )
+            if validation_error is not None:
+                attempt_trace["state_validation_error"] = validation_error
+            if state is not None and attempt_failure is None:
+                return state, {
+                    "perception_attempts": attempts,
+                    "perception_retry_reason": retry_reason,
+                    "timestamp_reference_mode": timestamp_reference_mode,
+                    "perception_model_target": perception_model_target(
+                        state, observation.timestamps
+                    ),
+                }
+            retry_reason = attempt_failure
+
+        raise PerceptionModelFailure(
+            stage,
+            retry_reason or "insufficient_service_context_headroom",
+            attempts,
+        )
+
     def _completeness(
         self,
         sample: ModelSample,
@@ -1429,6 +1695,7 @@ class PerceptionMemoryEvaEvaluator:
         complete = False
         stop_reason = "error"
         error: str | None = None
+        failure_class: str | None = None
         annotation_check = "passed"
         tool_latency = 0.0
         explicit_time_rescue_audit: dict[str, Any] | None = None
@@ -1561,29 +1828,16 @@ class PerceptionMemoryEvaEvaluator:
                 tool_steps.append(asdict(tool_step))
                 tool_latency += observation.latency_s
                 state_index = len(perception_states)
-                perception_text = self._chat(
+                state, perception_audit = self._perception_state(
+                    sample,
+                    observation,
+                    action.request.evidence_request,
                     request_trace,
-                    build_perception_messages(
-                        sample, observation, action.request.evidence_request
-                    ),
                     stage="perception",
-                    max_tokens=self.perception_max_tokens,
                     seed_offset=turn * 10 + 2,
-                    json_mode=True,
                     step_index=state_index,
                     prefix_index=state_index,
                 )
-                state = parse_perception_state(perception_text, sample.option_letters)
-                if state is None:
-                    request_trace[-1]["state_validation_error"] = (
-                        "invalid perception state schema"
-                    )
-                    raise ValueError("invalid perception state")
-                try:
-                    state = validate_perception_state_observation(state, observation)
-                except ValueError as exc:
-                    request_trace[-1]["state_validation_error"] = str(exc)
-                    raise
                 memory.merge(state)
                 perception_states.append(
                     {
@@ -1594,6 +1848,7 @@ class PerceptionMemoryEvaEvaluator:
                         "timestamps": list(observation.timestamps),
                         "perception": state.to_dict(),
                         "perception_response": state.to_dict(),
+                        **perception_audit,
                         "memory_after": memory.to_dict(),
                         "evidence_complete": False,
                         "judge_confirmations": [],
@@ -1680,35 +1935,18 @@ class PerceptionMemoryEvaEvaluator:
                         )
                         tool_steps.append(asdict(confirmation_tool))
                         tool_latency += confirmation_observation.latency_s
-                        confirmation_perception_text = self._chat(
-                            request_trace,
-                            build_perception_messages(
+                        confirmation_state, confirmation_perception_audit = (
+                            self._perception_state(
                                 sample,
                                 confirmation_observation,
                                 confirmation_action.request.evidence_request,
-                            ),
-                            stage="confirmation_perception",
-                            max_tokens=self.perception_max_tokens,
-                            seed_offset=2002,
-                            json_mode=True,
-                            step_index=len(perception_states),
-                            prefix_index=len(perception_states),
-                        )
-                        confirmation_state = parse_perception_state(
-                            confirmation_perception_text, sample.option_letters
-                        )
-                        if confirmation_state is None:
-                            request_trace[-1]["state_validation_error"] = (
-                                "invalid confirmation perception state schema"
+                                request_trace,
+                                stage="confirmation_perception",
+                                seed_offset=2002,
+                                step_index=len(perception_states),
+                                prefix_index=len(perception_states),
                             )
-                            raise ValueError("invalid confirmation perception state")
-                        try:
-                            confirmation_state = validate_perception_state_observation(
-                                confirmation_state, confirmation_observation
-                            )
-                        except ValueError as exc:
-                            request_trace[-1]["state_validation_error"] = str(exc)
-                            raise
+                        )
                         memory.merge(confirmation_state)
                         perception_states.append(
                             {
@@ -1721,6 +1959,7 @@ class PerceptionMemoryEvaEvaluator:
                                 "timestamps": list(confirmation_observation.timestamps),
                                 "perception": confirmation_state.to_dict(),
                                 "perception_response": confirmation_state.to_dict(),
+                                **confirmation_perception_audit,
                                 "memory_after": memory.to_dict(),
                                 "evidence_complete": False,
                                 "judge_confirmations": [],
@@ -1781,9 +2020,15 @@ class PerceptionMemoryEvaEvaluator:
         except AnnotationLeakError as exc:
             annotation_check = "failed"
             error = f"{type(exc).__name__}: {exc}"
+            failure_class = "annotation_leak"
             stop_reason = "annotation_leak"
+        except PerceptionModelFailure as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            failure_class = exc.failure_class
+            stop_reason = "model_parse_failure"
         except Exception as exc:  # sample-local failure always falls back
             error = f"{type(exc).__name__}: {exc}"
+            failure_class = "infrastructure_error"
             stop_reason = "runtime_error"
 
         prompt_tokens = sum(
@@ -1887,6 +2132,8 @@ class PerceptionMemoryEvaEvaluator:
             + tool_latency,
             "error": error,
             "error_type": error.split(":", 1)[0] if error else None,
+            "model_parse_failure": failure_class == "model_parse_failure",
+            "failure_class": failure_class,
         }
 
 
@@ -1900,6 +2147,7 @@ __all__ = [
     "OptionLedger",
     "OptionObservation",
     "PerceptionMemoryEvaEvaluator",
+    "PerceptionModelFailure",
     "PerceptionState",
     "PERCEPTION_NORMALIZATION_VERSION",
     "REPAIR_ONLY_TRAJECTORY_VARIANTS",
@@ -1912,6 +2160,7 @@ __all__ = [
     "build_controller_messages",
     "build_judge_messages",
     "build_perception_messages",
+    "build_perception_retry_messages",
     "duplicate_interval",
     "explicit_time_rescue_request",
     "interval_iou",

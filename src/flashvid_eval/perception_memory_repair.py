@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -25,13 +27,17 @@ from .perception_memory_replay import (
 from .runner import parse_question_time_range
 
 
-REPAIR_SCOPE_VERSION = "perception_memory_repair_scope_v1"
+REPAIR_SCOPE_VERSION = "perception_memory_repair_scope_v2"
 _CACHED_INPUT = "cached_repair_input.jsonl"
 _EXPLICIT_TIME_INPUT = "explicit_time_mismatch.jsonl"
 _FROZEN_SCOPE = "frozen_scope.json"
 _MERGED_SUCCESS = "merged_success.jsonl"
 _DOUBLE_FAILURES = "double_failures.jsonl"
 _MERGE_SUMMARY = "merge_summary.json"
+_MM_SS_TOKEN = re.compile(r"(?<![\d:])(?P<minutes>\d+):(?P<seconds>[0-5]\d)(?![:\d])")
+_TIME_RANGE_CONNECTOR = re.compile(
+    r"(?:-|\u2013|\u2014|~|to|through|until|from)", re.IGNORECASE
+)
 
 
 def _text(value: Any, field: str) -> str:
@@ -196,6 +202,28 @@ def _validate_prefix_success(row: Mapping[str, Any], *, label: str) -> None:
         raise ValueError(f"{label} produced no prefix jobs")
 
 
+def _prefix_failure_reason(
+    row: Mapping[str, Any], *, label: str
+) -> dict[str, str] | None:
+    """Return a frozen reason when an otherwise error-free row is unbindable."""
+
+    if _result_failed(row, label=label):
+        return {
+            "kind": "reported_error",
+            "error_type": _text(row.get("error_type"), f"{label} error_type"),
+            "detail": _text(row.get("error"), f"{label} error"),
+        }
+    try:
+        _validate_prefix_success(row, label=label)
+    except ValueError as error:
+        return {
+            "kind": "prefix_unbindable",
+            "error_type": type(error).__name__,
+            "detail": str(error),
+        }
+    return None
+
+
 def _validate_success_public_lineage(
     result: Mapping[str, Any], source: Mapping[str, Any], *, label: str
 ) -> None:
@@ -239,6 +267,33 @@ def _intervals_overlap(left: Sequence[float], right: Sequence[float]) -> bool:
     return max(float(left[0]), float(right[0])) <= min(float(left[1]), float(right[1]))
 
 
+def _legacy_decimalized_question_interval(question: str) -> list[float] | None:
+    """Reconstruct the retired MM:SS-as-decimal parser from public text only."""
+
+    matches = list(_MM_SS_TOKEN.finditer(question))
+    if not matches:
+        return None
+
+    def decimalized(match: re.Match[str]) -> float:
+        return float(match.group("minutes")) + float(match.group("seconds")) / 100.0
+
+    first = decimalized(matches[0])
+    if len(matches) == 1:
+        return [max(0.0, first - 1.0), first + 1.0]
+    between = question[matches[0].end() : matches[1].start()]
+    if not _TIME_RANGE_CONNECTOR.search(between):
+        return None
+    second = decimalized(matches[1])
+    return [min(first, second), max(first, second)]
+
+
+def _same_interval(left: Sequence[float], right: Sequence[float]) -> bool:
+    return all(
+        math.isclose(float(a), float(b), rel_tol=0.0, abs_tol=1e-6)
+        for a, b in zip(left, right, strict=True)
+    )
+
+
 def _explicit_time_mismatch(
     source: Mapping[str, Any], base_failure: Mapping[str, Any]
 ) -> dict[str, Any] | None:
@@ -248,11 +303,37 @@ def _explicit_time_mismatch(
         return None
     sample = public_model_sample(source)
     parsed = parse_question_time_range(sample.question)
+    legacy_decimalized = _legacy_decimalized_question_interval(sample.question)
     requested = _requested_intervals(source)
-    if parsed is None or not requested:
+    if parsed is None or legacy_decimalized is None or not requested:
         return None
     parsed_list = [float(parsed[0]), float(parsed[1])]
-    if any(_intervals_overlap(parsed_list, interval) for interval in requested):
+    match = re.search(r"perception step\s+(\d+)", str(base_failure.get("error") or ""))
+    if match is None:
+        return None
+    failed_step_index = int(match.group(1))
+    raw_steps = source.get("tool_steps", source.get("tool_calls"))
+    if not isinstance(raw_steps, list) or failed_step_index >= len(raw_steps):
+        return None
+    raw_failed_step = raw_steps[failed_step_index]
+    if not isinstance(raw_failed_step, Mapping):
+        return None
+    raw_arguments = raw_failed_step.get("arguments")
+    failed_values = (
+        raw_arguments if isinstance(raw_arguments, Mapping) else raw_failed_step
+    )
+    try:
+        failed_interval = [
+            float(failed_values["start_time"]),
+            float(failed_values["end_time"]),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        failed_interval[1] <= failed_interval[0]
+        or _intervals_overlap(parsed_list, failed_interval)
+        or not _same_interval(failed_interval, legacy_decimalized)
+    ):
         return None
     public_sample = {
         "dataset": sample.dataset,
@@ -275,6 +356,9 @@ def _explicit_time_mismatch(
         "base_row_sha256": canonical_sha256(base_failure),
         "parsed_time_range": parsed_list,
         "parsed_question_interval": parsed_list,
+        "failed_step_index": failed_step_index,
+        "failed_step_requested_interval": failed_interval,
+        "legacy_decimalized_interval": legacy_decimalized,
         "source_requested_intervals": requested,
         "public_sample": public_sample,
         "source_row": dict(source),
@@ -284,6 +368,7 @@ def _explicit_time_mismatch(
 def _scope_entries(
     source_rows: Sequence[Mapping[str, Any]],
     base_by_id: Mapping[str, Mapping[str, Any]],
+    failure_reasons: Mapping[str, Mapping[str, str]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     source_scope: list[dict[str, Any]] = []
     base_scope: list[dict[str, Any]] = []
@@ -304,11 +389,8 @@ def _scope_entries(
                 "sample_id": sample_id,
                 "source_trajectory_id": source_id,
                 "base_row_sha256": canonical_sha256(base),
-                "status": (
-                    "failed"
-                    if _result_failed(base, label=f"base result {source_id}")
-                    else "success"
-                ),
+                "status": "failed" if source_id in failure_reasons else "success",
+                "failure_reason": failure_reasons.get(source_id),
             }
         )
     return source_scope, base_scope
@@ -352,6 +434,7 @@ def prepare_repair_scope(
         )
 
     ordered_sources: list[dict[str, Any]] = []
+    failure_reasons: dict[str, dict[str, str]] = {}
     for source in source_rows:
         copied = dict(source)
         ordered_sources.append(copied)
@@ -367,7 +450,9 @@ def prepare_repair_scope(
             _validate_success_public_lineage(
                 base, source, label=f"base result {source_id}"
             )
-            _validate_prefix_success(base, label=f"base result {source_id}")
+        failure_reason = _prefix_failure_reason(base, label=f"base result {source_id}")
+        if failure_reason is not None:
+            failure_reasons[source_id] = failure_reason
 
     cached_rows: list[dict[str, Any]] = []
     mismatch_rows: list[dict[str, Any]] = []
@@ -376,7 +461,7 @@ def prepare_repair_scope(
     for source in ordered_sources:
         _, _, source_id = _source_identity(source)
         base = dict(base_by_id[source_id])
-        if not _result_failed(base, label=f"base result {source_id}"):
+        if source_id not in failure_reasons:
             base_success_ids.append(source_id)
             continue
         failure_ids.append(source_id)
@@ -413,7 +498,9 @@ def prepare_repair_scope(
         )
     cached_sha = hashlib.sha256(cached_bytes).hexdigest()
     mismatch_sha = hashlib.sha256(mismatch_bytes).hexdigest()
-    source_scope, base_scope = _scope_entries(ordered_sources, base_by_id)
+    source_scope, base_scope = _scope_entries(
+        ordered_sources, base_by_id, failure_reasons
+    )
     frozen_scope = {
         "schema_version": 1,
         "repair_scope_version": REPAIR_SCOPE_VERSION,
@@ -434,6 +521,7 @@ def prepare_repair_scope(
         "base_failure_count": len(failure_ids),
         "base_success_ids": base_success_ids,
         "base_failure_ids": failure_ids,
+        "base_failure_reasons": failure_reasons,
         "cached_repair_ids": [row["trajectory_id"] for row in cached_rows],
         "explicit_time_mismatch_ids": [
             row["source_trajectory_id"] for row in mismatch_rows
@@ -541,7 +629,25 @@ def merge_replay_results(
     base_by_id = _index_unique(base_rows, _base_identity, label="base JSONL")
     if set(source_by_id) != set(base_by_id):
         raise ValueError("source/base scope differs during merge")
-    source_scope, base_scope = _scope_entries(source_rows, base_by_id)
+    frozen_failure_reasons = scope.get("base_failure_reasons")
+    if not isinstance(frozen_failure_reasons, Mapping):
+        raise ValueError("frozen scope lacks base failure reasons")
+    current_failure_reasons: dict[str, dict[str, str]] = {}
+    for source in source_rows:
+        _, _, source_id = _source_identity(source)
+        base = base_by_id[source_id]
+        if not _result_failed(base, label=f"base result {source_id}"):
+            _validate_success_public_lineage(
+                base, source, label=f"base result {source_id}"
+            )
+        failure_reason = _prefix_failure_reason(base, label=f"base result {source_id}")
+        if failure_reason is not None:
+            current_failure_reasons[source_id] = failure_reason
+    if current_failure_reasons != frozen_failure_reasons:
+        raise ValueError("base failure classification differs from frozen scope")
+    source_scope, base_scope = _scope_entries(
+        source_rows, base_by_id, current_failure_reasons
+    )
     if canonical_sha256(source_scope) != source_record.get("scope_sha256"):
         raise ValueError("source row scope differs from frozen scope")
     if canonical_sha256(base_scope) != base_record.get("scope_sha256"):
@@ -553,6 +659,8 @@ def merge_replay_results(
     cached_ids = list(scope.get("cached_repair_ids") or [])
     rescue_ids = list(scope.get("explicit_time_mismatch_ids") or [])
     failure_ids = list(scope.get("base_failure_ids") or [])
+    if set(frozen_failure_reasons) != set(failure_ids):
+        raise ValueError("frozen base failure reasons differ from failed scope")
     if len(failure_ids) != len(set(failure_ids)) or set(failure_ids) != (
         set(cached_ids) | set(rescue_ids)
     ):
@@ -608,7 +716,7 @@ def merge_replay_results(
             original_source_sha256=source_file_by_id[source_id],
             require_original_source_file=True,
         )
-        if not _result_failed(base, label=f"base result {source_id}"):
+        if source_id not in failure_ids:
             _validate_success_public_lineage(
                 base, source, label=f"base result {source_id}"
             )
@@ -637,7 +745,14 @@ def merge_replay_results(
                 raise ValueError(
                     f"explicit-time frozen scope hash mismatch: {source_id}"
                 )
-        if _result_failed(replacement, label=f"replacement result {source_id}"):
+        if not _result_failed(replacement, label=f"replacement result {source_id}"):
+            _validate_success_public_lineage(
+                replacement, source, label=f"replacement result {source_id}"
+            )
+        replacement_failure_reason = _prefix_failure_reason(
+            replacement, label=f"replacement result {source_id}"
+        )
+        if replacement_failure_reason is not None:
             double_failures.append(
                 {
                     "schema_version": 1,
@@ -646,15 +761,13 @@ def merge_replay_results(
                     "source_trajectory_id": source_id,
                     "source_row_sha256": canonical_sha256(source),
                     "repair_lane": lane,
+                    "base_failure_reason": frozen_failure_reasons[source_id],
+                    "replacement_failure_reason": replacement_failure_reason,
                     "base_failure": base,
                     "replacement_failure": replacement,
                 }
             )
             continue
-        _validate_success_public_lineage(
-            replacement, source, label=f"replacement result {source_id}"
-        )
-        _validate_prefix_success(replacement, label=f"replacement result {source_id}")
         merged.append(replacement)
         replaced_success_ids.append(source_id)
 

@@ -117,6 +117,16 @@ def _fixture(tmp_path: Path) -> tuple[list[Path], list[Path], list[dict]]:
         question="What happens at 65:02?",
         interval=(64.02, 66.02),
     )
+    explicit["tool_steps"].append(
+        {
+            "start_time": 3901.0,
+            "end_time": 3903.0,
+            "nframes": 1,
+            "resize": 0.75,
+            "frame_paths": ["/cache/s2-correct.jpg"],
+            "actual_timestamps": [3902.0],
+        }
+    )
     source_0 = _write_jsonl(tmp_path / "source-0.jsonl", [success, cached])
     source_1 = _write_jsonl(tmp_path / "source-1.jsonl", [explicit])
     base_0 = _write_jsonl(
@@ -136,7 +146,10 @@ def _fixture(tmp_path: Path) -> tuple[list[Path], list[Path], list[dict]]:
             _result(
                 explicit,
                 file_sha256(source_1),
-                error="ValueError: invalid_frame_reference",
+                error=(
+                    "ValueError: perception step 0 returned invalid evidence after "
+                    "retry: invalid_frame_reference"
+                ),
             )
         ],
     )
@@ -175,10 +188,16 @@ def test_prepare_freezes_exact_failed_lanes_and_shard_lineage(tmp_path: Path) ->
     assert rescue[0]["reason"] == "explicit_time_source_interval_mismatch"
     assert rescue[0]["parsed_time_source"] == "public_question"
     assert rescue[0]["parsed_time_range"] == [3901.0, 3903.0]
-    assert rescue[0]["source_requested_intervals"] == [[64.02, 66.02]]
+    assert rescue[0]["failed_step_index"] == 0
+    assert rescue[0]["failed_step_requested_interval"] == [64.02, 66.02]
+    assert rescue[0]["legacy_decimalized_interval"] == [64.02, 66.02]
+    assert rescue[0]["source_requested_intervals"] == [
+        [64.02, 66.02],
+        [3901.0, 3903.0],
+    ]
     rescued_sample, source_intervals = _validate_manifest_row(rescue[0])
     assert rescued_sample.candidate_answer == "A"
-    assert source_intervals == ((64.02, 66.02),)
+    assert source_intervals == ((64.02, 66.02), (3901.0, 3903.0))
     assert scope["base_failure_ids"] == [
         "lvbench:s1:teacher:0",
         "lvbench:s2:teacher:0",
@@ -238,6 +257,137 @@ def test_prepare_rejects_tampered_per_row_shard_lineage(tmp_path: Path) -> None:
             expected_explicit_time_rows=1,
             expected_explicit_time_samples=1,
         )
+
+
+def test_prepare_does_not_call_unrelated_failed_interval_a_time_parse_mismatch(
+    tmp_path: Path,
+) -> None:
+    source = _source(
+        "lvbench:s4:teacher:0",
+        sample_id="s4",
+        question="What happens at 65:02?",
+        interval=(100.0, 110.0),
+    )
+    source_path = _write_jsonl(tmp_path / "source-unrelated.jsonl", [source])
+    base = _result(
+        source,
+        file_sha256(source_path),
+        error=(
+            "ValueError: perception step 0 returned invalid evidence after retry: "
+            "invalid_frame_reference"
+        ),
+    )
+    base_path = _write_jsonl(tmp_path / "base-unrelated.jsonl", [base])
+    prepared = tmp_path / "prepared-unrelated"
+
+    summary = prepare_repair_scope(
+        source_paths=[source_path],
+        base_results_paths=[base_path],
+        output_dir=prepared,
+        expected_rows=1,
+        expected_explicit_time_rows=0,
+        expected_explicit_time_samples=0,
+    )
+
+    assert summary["cached_repair"] == 1
+    assert summary["explicit_time_rescue"] == 0
+
+
+def _unbindable_fixture(
+    tmp_path: Path,
+) -> tuple[list[Path], list[Path], list[dict], Path]:
+    success = _source("lvbench:s0:teacher:0", sample_id="s0")
+    unbindable = _source("lvbench:s3:teacher:0", sample_id="s3")
+    source_path = _write_jsonl(tmp_path / "source.jsonl", [success, unbindable])
+    good = _result(success, file_sha256(source_path))
+    bad = _result(unbindable, file_sha256(source_path))
+    bad["perception_states"][0]["memory_after"]["event_ledger"] = []
+    base_path = _write_jsonl(tmp_path / "base.jsonl", [good, bad])
+    prepared = tmp_path / "prepared-unbindable"
+    prepare_repair_scope(
+        source_paths=[source_path],
+        base_results_paths=[base_path],
+        output_dir=prepared,
+        expected_rows=2,
+        expected_explicit_time_rows=0,
+        expected_explicit_time_samples=0,
+    )
+    return [source_path], [base_path], [success, unbindable], prepared
+
+
+def test_prepare_classifies_error_free_unbindable_base_as_cached_repair(
+    tmp_path: Path,
+) -> None:
+    _sources, _bases, rows, prepared = _unbindable_fixture(tmp_path)
+    cached = _read_jsonl(prepared / "cached_repair_input.jsonl")
+    scope = json.loads((prepared / "frozen_scope.json").read_text(encoding="utf-8"))
+    source_id = rows[1]["trajectory_id"]
+
+    assert [row["trajectory_id"] for row in cached] == [source_id]
+    assert scope["base_success_ids"] == [rows[0]["trajectory_id"]]
+    assert scope["base_failure_ids"] == [source_id]
+    assert scope["base_failure_reasons"][source_id]["kind"] == "prefix_unbindable"
+    assert (
+        "memory_after.event_ledger must be non-empty"
+        in scope["base_failure_reasons"][source_id]["detail"]
+    )
+
+
+def test_merge_replaces_frozen_unbindable_base_and_never_emits_it(
+    tmp_path: Path,
+) -> None:
+    sources, bases, rows, prepared = _unbindable_fixture(tmp_path)
+    source_id = rows[1]["trajectory_id"]
+    replacement = _result(rows[1], file_sha256(prepared / "cached_repair_input.jsonl"))
+    replacement_path = _write_jsonl(tmp_path / "replacement.jsonl", [replacement])
+    merged_dir = tmp_path / "merged-unbindable"
+
+    summary = merge_replay_results(
+        source_paths=sources,
+        base_results_paths=bases,
+        frozen_scope_path=prepared / "frozen_scope.json",
+        replacement_result_paths=[replacement_path],
+        output_dir=merged_dir,
+    )
+
+    merged = _read_jsonl(merged_dir / "merged_success.jsonl")
+    by_id = {row["source_trajectory_id"]: row for row in merged}
+    assert summary["base_success"] == 1
+    assert summary["replacement_success"] == 1
+    assert by_id[source_id]["source_file_sha256"] == file_sha256(
+        prepared / "cached_repair_input.jsonl"
+    )
+    assert by_id[source_id]["perception_states"][0]["memory_after"]["event_ledger"]
+    assert bind_prefix_jobs(merged)
+
+
+def test_merge_isolates_unbindable_replacement_as_double_failure(
+    tmp_path: Path,
+) -> None:
+    sources, bases, rows, prepared = _unbindable_fixture(tmp_path)
+    source_id = rows[1]["trajectory_id"]
+    replacement = _result(rows[1], file_sha256(prepared / "cached_repair_input.jsonl"))
+    replacement["perception_states"][0]["memory_after"]["event_ledger"] = []
+    replacement_path = _write_jsonl(
+        tmp_path / "replacement-unbindable.jsonl", [replacement]
+    )
+    merged_dir = tmp_path / "merged-double-failure"
+
+    summary = merge_replay_results(
+        source_paths=sources,
+        base_results_paths=bases,
+        frozen_scope_path=prepared / "frozen_scope.json",
+        replacement_result_paths=[replacement_path],
+        output_dir=merged_dir,
+    )
+
+    merged = _read_jsonl(merged_dir / "merged_success.jsonl")
+    failures = _read_jsonl(merged_dir / "double_failures.jsonl")
+    assert source_id not in {row["source_trajectory_id"] for row in merged}
+    assert summary["double_failure_ids"] == [source_id]
+    assert failures[0]["base_failure_reason"]["kind"] == "prefix_unbindable"
+    assert failures[0]["replacement_failure_reason"]["kind"] == ("prefix_unbindable")
+    assert bind_prefix_jobs(merged)
 
 
 def _replacement_results(

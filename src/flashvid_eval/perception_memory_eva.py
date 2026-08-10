@@ -54,6 +54,7 @@ RESCUE_TRAJECTORY_VARIANTS = frozenset(
     {*DURATION_RESCUE_TRAJECTORY_VARIANTS, *REPAIR_ONLY_TRAJECTORY_VARIANTS}
 )
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
+_MAX_NO_NOVEL_ACTION_REJECTIONS = 2
 
 
 def _clean_text(value: Any, field_name: str) -> str:
@@ -315,7 +316,12 @@ def _request_interval_rejection_reason(
 
 
 def _controller_retry_feedback(
-    reason: str, video_duration: float, *, allow_stop: bool = True
+    reason: str,
+    video_duration: float,
+    *,
+    allow_stop: bool = True,
+    requested_interval: tuple[float, float] | None = None,
+    observed_intervals: Sequence[tuple[float, float]] = (),
 ) -> str:
     """Return candidate-blind, format-strict feedback for one controller retry."""
 
@@ -324,6 +330,16 @@ def _controller_retry_feedback(
             "The previous interval duplicated already observed evidence. Select a "
             "different, non-overlapping interval needed by the unresolved evidence."
         )
+        if requested_interval is not None:
+            detail += (
+                " The rejected interval was "
+                f"[{requested_interval[0]:.3f}, {requested_interval[1]:.3f}]."
+            )
+        if observed_intervals:
+            intervals = ", ".join(
+                f"[{start:.3f}, {end:.3f}]" for start, end in observed_intervals
+            )
+            detail += f" Already observed intervals: {intervals}."
     elif reason == "invalid_interval":
         detail = (
             "The previous interval was invalid. It must satisfy "
@@ -333,16 +349,17 @@ def _controller_retry_feedback(
         detail = "The previous response was truncated; return one compact action."
     else:
         detail = "The previous response did not match the official EVA action schema."
-    allowed_action = (
-        'either {"action":"stop"} or ' if allow_stop else "one "
+    stop_action = (
+        'If the text ledger is ready for an independent completeness check, return '
+        'exactly {"action":"stop"}. Otherwise, ' if allow_stop else ""
     )
-    example_end = min(1.0, video_duration)
     return (
-        f"{detail} Retry without prose or markdown. Return exactly {allowed_action}"
-        '<tool_call>{"tool":"frame_select","arguments":{"start_time":0.0,'
-        f'"end_time":{example_end:.3f},"nframes":1,"resize":0.75,'
-        '"evidence_request":"a precise symmetric visual question"}}</tool_call>. '
-        "Use numeric resize and exactly one of nframes or fps."
+        f"{detail} Retry without prose or markdown. {stop_action}return exactly one "
+        "official EVA <tool_call> JSON object whose tool is frame_select. Its "
+        "arguments must contain numeric start_time, end_time, and resize; a short "
+        "evidence_request; and exactly one numeric nframes or fps. Choose the "
+        "interval from the question and current evidence gap; do not copy an "
+        "illustrative interval."
     )
 
 
@@ -937,10 +954,11 @@ def build_controller_messages(
         "You are the text-only controller of a long-video evidence agent. Decide "
         "what visual evidence is still missing from the timestamped text ledger. "
         "You cannot see images. Never infer an action that is absent from the ledger. "
-        "To observe, output only one official EVA call: "
-        '<tool_call>{"tool":"frame_select","arguments":{"start_time":0.0,'
-        '"end_time":30.0,"nframes":16,"resize":0.75,'
-        '"evidence_request":"a precise visual question"}}</tool_call>. '
+        "To observe, output only one official EVA <tool_call> JSON object whose tool "
+        "is frame_select. Its arguments must contain numeric start_time, end_time, "
+        "and resize; a precise evidence_request; and exactly one numeric nframes or "
+        "fps. Choose the interval from the question and current evidence gap; there "
+        "is no default interval. "
         "Use exactly one of nframes or fps and do not repeat an observed interval. "
         "Only when the ledger is ready for an independent completeness check, output "
         'exactly {"action":"stop"}.'
@@ -1655,7 +1673,12 @@ class PerceptionMemoryEvaEvaluator:
                 content,
                 sample.option_letters,
                 observation.timestamps,
-                allow_timestamp_schema=False,
+                # Some Qwen responses faithfully copy the printed frame timestamp
+                # instead of emitting frame_index.  Accept that legacy surface form
+                # only when the normalizer below can bind it to an actual sampled
+                # frame within the frozen 1 ms tolerance.  The persisted SFT target
+                # remains canonical frame_index via perception_model_target().
+                allow_timestamp_schema=True,
             )
             attempt_failure: str | None = None
             validation_error: str | None = None
@@ -1782,6 +1805,9 @@ class PerceptionMemoryEvaEvaluator:
         controller_attempts = 0
         controller_attempt_limit_reached = False
         controller_attempt_limit_reason: str | None = None
+        no_novel_action_rejections = 0
+        no_novel_action_reason: str | None = None
+        stopped_without_novel_action = False
 
         try:
             video = self.index.resolve(sample.video)
@@ -1957,6 +1983,15 @@ class PerceptionMemoryEvaEvaluator:
                     )
                     feedback = "Stop rejected; missing evidence: " + "; ".join(missing)
                     last_controller_rejection = "incomplete_evidence"
+                    no_novel_action_rejections += 1
+                    if (
+                        no_novel_action_rejections
+                        >= _MAX_NO_NOVEL_ACTION_REJECTIONS
+                    ):
+                        stopped_without_novel_action = True
+                        no_novel_action_reason = "incomplete_evidence"
+                        stop_reason = "evidence_incomplete_no_novel_action"
+                        break
                     continue
 
                 assert action.request is not None
@@ -1978,10 +2013,51 @@ class PerceptionMemoryEvaEvaluator:
                 if duplicate_interval(requested_interval, memory.observed_intervals):
                     request_trace[-1]["action_accepted"] = False
                     request_trace[-1]["action_rejection_reason"] = "duplicate_interval"
+                    no_novel_action_rejections += 1
                     feedback = _controller_retry_feedback(
-                        "duplicate_interval", float(session.metadata["duration"])
+                        "duplicate_interval",
+                        float(session.metadata["duration"]),
+                        requested_interval=requested_interval,
+                        observed_intervals=tuple(memory.observed_intervals),
                     )
                     last_controller_rejection = "duplicate_interval"
+                    if evidence_steps > 0 and no_novel_action_rejections == 1:
+                        decision = self._completeness(
+                            sample,
+                            memory,
+                            request_trace,
+                            controller_attempt_index * 10 + 1,
+                            step_index=evidence_steps - 1,
+                            prefix_index=len(perception_states) - 1,
+                        )
+                        if (
+                            decision is not None
+                            and decision.evidence_complete
+                            and memory.event_ledger
+                        ):
+                            complete = True
+                            stop_reason = "evidence_complete_after_duplicate_stall"
+                            perception_states[-1]["evidence_complete"] = True
+                            break
+                        missing = (
+                            decision.missing_evidence
+                            if decision
+                            else ("valid evidence completeness decision",)
+                        )
+                        feedback += (
+                            " Completeness check still requires: "
+                            + "; ".join(missing)
+                            + "."
+                        )
+                    if (
+                        evidence_steps > 0
+                        and no_novel_action_rejections
+                        >= _MAX_NO_NOVEL_ACTION_REJECTIONS
+                    ):
+                        stopped_without_novel_action = True
+                        no_novel_action_reason = "duplicate_interval"
+                        stop_reason = "evidence_incomplete_no_novel_action"
+                        break
                     continue
                 try:
                     observation = session.select(action.request)
@@ -2024,12 +2100,19 @@ class PerceptionMemoryEvaEvaluator:
                 feedback = ""
                 last_controller_rejection = None
                 controller_step_attempts = 0
+                no_novel_action_rejections = 0
             if not complete:
-                controller_attempt_limit_reached = (
-                    controller_attempts >= self.max_controller_attempts
-                    and evidence_steps < self.max_turns
-                )
-                if controller_attempt_limit_reached:
+                if stopped_without_novel_action:
+                    controller_attempt_limit_reached = False
+                    controller_attempt_limit_reason = None
+                else:
+                    controller_attempt_limit_reached = (
+                        controller_attempts >= self.max_controller_attempts
+                        and evidence_steps < self.max_turns
+                    )
+                if stopped_without_novel_action:
+                    stop_reason = "evidence_incomplete_no_novel_action"
+                elif controller_attempt_limit_reached:
                     controller_attempt_limit_reason = last_controller_rejection
                     error = (
                         "ControllerAttemptLimit: exhausted "
@@ -2392,6 +2475,8 @@ class PerceptionMemoryEvaEvaluator:
             "controller_attempt_limit": self.max_controller_attempts,
             "controller_attempt_limit_reached": controller_attempt_limit_reached,
             "controller_attempt_limit_reason": controller_attempt_limit_reason,
+            "no_novel_action_rejections": no_novel_action_rejections,
+            "no_novel_action_reason": no_novel_action_reason,
             "tool_steps": tool_steps,
             "perception_states": perception_states,
             "judge_answers": [

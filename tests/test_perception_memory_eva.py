@@ -1183,7 +1183,7 @@ def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
     )
 
 
-def test_runtime_rejects_legacy_time_schema_after_one_bounded_retry(
+def test_runtime_accepts_exact_legacy_time_schema_and_canonicalizes_target(
     tmp_path: Path,
 ) -> None:
     video = tmp_path / "video.mp4"
@@ -1194,7 +1194,79 @@ def test_runtime_rejects_legacy_time_schema_after_one_bounded_retry(
         '"evidence_request":"check the action"}}</tool_call>'
     )
     legacy = _state_json(fact_time=15.0)
-    client = _FakeClient([tool_call, legacy, legacy])
+    client = _FakeClient(
+        [
+            tool_call,
+            legacy,
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["final_prediction"] == "A"
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["event_ledger"][0]["timestamp"] == 15.0
+    assert len(result["perception_states"]) == 1
+    perception_requests = [
+        item for item in result["request_trace"] if item["stage"] == "perception"
+    ]
+    assert len(perception_requests) == 1
+    assert perception_requests[0]["timestamp_reference_mode"] == "timestamp"
+    assert perception_requests[0]["retry_triggered"] is False
+    target = json.loads(result["perception_states"][0]["perception_model_target"])
+    assert target["timestamped_facts"][0]["frame_index"] == 0
+    assert "time" not in target["timestamped_facts"][0]
+    judge_trace = next(
+        item for item in result["request_trace"] if item["stage"] == "evidence_judge"
+    )
+    result["perception_states"][0]["judge_confirmations"] = [
+        {
+            "judge_seed": seed,
+            "prediction": "A",
+            "evidence_ids": ["E0001"],
+            "request_messages": judge_trace["messages"],
+            "raw_response": judge_trace["content"],
+            "evidence_complete": True,
+            "annotation_leak_check": "passed",
+            "error": None,
+        }
+        for seed in (17, 42, 73)
+    ]
+    result["_selection_stable"] = True
+    records = build_perception_memory_sft_records(result)
+    memory_target = next(
+        record
+        for record in records
+        if record["metadata"]["episode_target_type"] == "memory"
+    )
+    exported = json.loads(memory_target["messages"][-1]["content"])
+    assert exported["timestamped_facts"][0]["frame_index"] == 0
+
+
+def test_runtime_rejects_unbound_legacy_timestamp_after_one_retry(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    unbound = _state_json(fact_time=15.5)
+    client = _FakeClient([tool_call, unbound, unbound])
     evaluator = PerceptionMemoryEvaEvaluator(
         client,
         "Qwen3.5-9B",
@@ -1210,20 +1282,14 @@ def test_runtime_rejects_legacy_time_schema_after_one_bounded_retry(
     assert result["fallback_to_candidate"] is True
     assert result["error_type"] == "PerceptionModelFailure"
     assert result["failure_class"] == "model_parse_failure"
-    assert "legacy_timestamp_schema" in result["error"]
+    assert "invalid_observation_binding" in result["error"]
     assert result["event_ledger"] == []
-    assert result["perception_states"] == []
-    perception_requests = [
+    attempts = [
         item for item in result["request_trace"] if item["stage"] == "perception"
     ]
-    assert len(perception_requests) == 2
-    assert all(
-        item["timestamp_reference_mode"] == "timestamp"
-        for item in perception_requests
-    )
-    assert perception_requests[0]["retry_triggered"] is True
-    assert perception_requests[0]["retry_reason"] == "legacy_timestamp_schema"
-    assert perception_requests[1]["retry_triggered"] is False
+    assert len(attempts) == 2
+    assert all(item["timestamp_reference_mode"] == "timestamp" for item in attempts)
+    assert all("does not match" in item["state_validation_error"] for item in attempts)
 
 
 def test_deferred_trajectory_provenance_is_part_of_fingerprint(
@@ -1306,6 +1372,7 @@ def test_duplicate_controller_action_does_not_consume_an_evidence_step(
             first_call,
             _indexed_state_json(interval=(10.0, 20.0), sufficient=False),
             first_call,
+            '{"evidence_complete":false,"missing_evidence":["later action"]}',
             second_call,
             _indexed_state_json(interval=(30.0, 40.0)),
             '{"evidence_complete":true,"missing_evidence":[]}',
@@ -1339,6 +1406,132 @@ def test_duplicate_controller_action_does_not_consume_an_evidence_step(
     assert "duplicated already observed evidence" in json.dumps(
         controllers[2]["messages"], ensure_ascii=False
     )
+
+
+def test_two_duplicate_actions_stop_as_audited_incomplete_fallback(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the first interval"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(interval=(10.0, 20.0), sufficient=False),
+            first_call,
+            '{"evidence_complete":false,"missing_evidence":["later action"]}',
+            first_call,
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=3,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["fallback_to_candidate"] is True
+    assert result["stop_reason"] == "evidence_incomplete_no_novel_action"
+    assert result["controller_attempt_limit_reached"] is False
+    assert result["accepted_evidence_steps"] == 1
+    assert result["no_novel_action_rejections"] == 2
+    assert result["no_novel_action_reason"] == "duplicate_interval"
+
+
+def test_two_incomplete_stop_requests_become_audited_safe_fallback(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    client = _FakeClient(
+        [
+            '{"action":"stop"}',
+            '{"evidence_complete":false,"missing_evidence":["visual action"]}',
+            '{"action":"stop"}',
+            '{"evidence_complete":false,"missing_evidence":["visual action"]}',
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=3,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["fallback_to_candidate"] is True
+    assert result["stop_reason"] == "evidence_incomplete_no_novel_action"
+    assert result["accepted_evidence_steps"] == 0
+    assert result["controller_attempt_limit_reached"] is False
+    assert result["no_novel_action_rejections"] == 2
+    assert result["no_novel_action_reason"] == "incomplete_evidence"
+
+
+def test_duplicate_stall_runs_blind_completeness_before_answering(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the first interval"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(interval=(10.0, 20.0), sufficient=True),
+            first_call,
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=3,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["stop_reason"] == "evidence_complete_after_duplicate_stall"
+    assert result["fallback_to_candidate"] is False
+    assert result["perception_states"][0]["evidence_complete"] is True
+    completeness = [
+        item for item in result["request_trace"] if item["stage"] == "completeness"
+    ]
+    assert len(completeness) == 1
+    assert not messages_have_media(completeness[0]["messages"])
+
+
+def test_controller_prompt_has_no_copyable_default_interval() -> None:
+    memory = EvidenceMemory(("A", "B"))
+    messages = build_controller_messages(
+        _sample(None), memory, {"duration": 100.0, "width": 1, "height": 1}
+    )
+    prompt = json.dumps(messages, ensure_ascii=False)
+    assert "there is no default interval" in prompt
+    assert '"end_time":30.0' not in prompt
+    assert '"start_time":0.0' not in prompt
 
 
 def test_invalid_controller_interval_is_retried_without_rewriting_it(

@@ -55,6 +55,7 @@ RESCUE_TRAJECTORY_VARIANTS = frozenset(
 )
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
 _MAX_NO_NOVEL_ACTION_REJECTIONS = 2
+PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
 
 
 def _clean_text(value: Any, field_name: str) -> str:
@@ -1202,6 +1203,101 @@ def build_perception_messages(
     ]
 
 
+def perception_response_format(
+    valid_letters: Sequence[str], frame_count: int
+) -> dict[str, Any]:
+    """Return the strict, per-request schema enforced by the serving runtime."""
+
+    letters = tuple(str(letter).strip().upper() for letter in valid_letters)
+    if not letters or len(set(letters)) != len(letters):
+        raise ValueError("perception response schema requires unique option letters")
+    if isinstance(frame_count, bool) or not isinstance(frame_count, int) or frame_count <= 0:
+        raise ValueError("perception response schema requires a positive frame count")
+
+    short_text = {"type": "string", "minLength": 1, "maxLength": 160}
+    option_state = {
+        "type": "object",
+        "properties": {
+            "supports": {
+                "type": "array",
+                "items": short_text,
+                "maxItems": 1,
+            },
+            "contradicts": {
+                "type": "array",
+                "items": short_text,
+                "maxItems": 1,
+            },
+        },
+        "required": ["contradicts", "supports"],
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "interval": {
+                "type": "array",
+                "items": {"type": "number"},
+                "minItems": 2,
+                "maxItems": 2,
+            },
+            "timestamped_facts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "frame_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": frame_count - 1,
+                        },
+                        "fact": short_text,
+                    },
+                    "required": ["fact", "frame_index"],
+                    "additionalProperties": False,
+                },
+                "maxItems": 12,
+            },
+            "option_evidence": {
+                "type": "object",
+                "properties": {letter: option_state for letter in letters},
+                "required": sorted(letters),
+                "additionalProperties": False,
+            },
+            "temporal_changes": {
+                "type": "array",
+                "items": short_text,
+                "maxItems": 4,
+            },
+            "unresolved": {
+                "type": "array",
+                "items": short_text,
+                "maxItems": 3,
+            },
+            "evidence_sufficient": {"type": "boolean"},
+            "next_evidence_needed": {"type": "string", "maxLength": 160},
+        },
+        "required": [
+            "evidence_sufficient",
+            "interval",
+            "next_evidence_needed",
+            "option_evidence",
+            "temporal_changes",
+            "timestamped_facts",
+            "unresolved",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "perception_memory_state",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
 def build_perception_retry_messages(
     messages: Sequence[Mapping[str, Any]],
     reason: str,
@@ -1607,6 +1703,7 @@ class PerceptionMemoryEvaEvaluator:
             "backend": self.backend,
             "agent_version": self.version,
             "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
+            "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
             "model": self.model,
             "implementation_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "implementation_bundle_sha256": implementation_bundle_sha256,
@@ -1659,6 +1756,7 @@ class PerceptionMemoryEvaEvaluator:
         max_tokens: int,
         seed_offset: int,
         json_mode: bool,
+        response_format: dict[str, Any] | None = None,
         step_index: int | None = None,
         prefix_index: int | None = None,
     ) -> str:
@@ -1676,13 +1774,18 @@ class PerceptionMemoryEvaEvaluator:
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+        effective_response_format = (
+            copy.deepcopy(response_format)
+            if response_format is not None
+            else ({"type": "json_object"} if json_mode else None)
+        )
         result = self.client.chat(
             self.model,
             messages,
             max_tokens=max_tokens,
             temperature=0.0,
             seed=self.seed + seed_offset,
-            response_format={"type": "json_object"} if json_mode else None,
+            response_format=effective_response_format,
             chat_template_kwargs={"enable_thinking": False},
             extra_body={"return_token_ids": True},
         )
@@ -1700,6 +1803,7 @@ class PerceptionMemoryEvaEvaluator:
                 "step_index": step_index,
                 "prefix_index": prefix_index,
                 "prompt_hash": prompt_hash,
+                "response_format": copy.deepcopy(effective_response_format),
             }
         )
         if result.finish_reason == "length":
@@ -1778,6 +1882,9 @@ class PerceptionMemoryEvaEvaluator:
                     max_tokens=max_tokens,
                     seed_offset=seed_offset,
                     json_mode=True,
+                    response_format=perception_response_format(
+                        sample.option_letters, len(observation.timestamps)
+                    ),
                     step_index=step_index,
                     prefix_index=prefix_index,
                 )
@@ -2670,6 +2777,7 @@ __all__ = [
     "PerceptionModelFailure",
     "PerceptionState",
     "PERCEPTION_NORMALIZATION_VERSION",
+    "PERCEPTION_RESPONSE_SCHEMA_VERSION",
     "REPAIR_ONLY_TRAJECTORY_VARIANTS",
     "RESCUE_TRAJECTORY_VARIANTS",
     "TimestampedFact",
@@ -2690,6 +2798,7 @@ __all__ = [
     "parse_evidence_decision",
     "parse_perception_state",
     "perception_model_target",
+    "perception_response_format",
     "normalize_perception_state",
     "rescue_frame_request",
     "validate_perception_state_observation",

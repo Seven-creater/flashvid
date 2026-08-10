@@ -34,6 +34,7 @@ from flashvid_eval.perception_memory_eva import (
     parse_controller_action,
     parse_perception_state,
     perception_model_target,
+    perception_response_format,
     rescue_frame_request,
     validate_perception_state_observation,
 )
@@ -197,6 +198,30 @@ def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
         "at most one support and one contradiction per option" in messages[0]["content"]
     )
     assert_annotation_free_request({"messages": messages})
+
+
+def test_perception_response_schema_binds_frame_indices_and_option_shape() -> None:
+    response_format = perception_response_format(("A", "B"), 32)
+    assert response_format["type"] == "json_schema"
+    envelope = response_format["json_schema"]
+    assert envelope["strict"] is True
+    schema = envelope["schema"]
+    assert schema["additionalProperties"] is False
+    facts = schema["properties"]["timestamped_facts"]
+    assert facts["maxItems"] == 12
+    index = facts["items"]["properties"]["frame_index"]
+    assert (index["minimum"], index["maximum"]) == (0, 31)
+    options = schema["properties"]["option_evidence"]
+    assert options["required"] == ["A", "B"]
+    assert options["additionalProperties"] is False
+    for letter in ("A", "B"):
+        assert options["properties"][letter]["required"] == [
+            "contradicts",
+            "supports",
+        ]
+
+    with pytest.raises(ValueError, match="positive frame count"):
+        perception_response_format(("A", "B"), 0)
 
 
 def test_perception_parser_accepts_only_an_exact_json_fence() -> None:

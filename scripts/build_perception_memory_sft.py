@@ -239,6 +239,89 @@ def _unique_sorted_trajectories(
     )
 
 
+def _filter_experiment_config(
+    rows: Sequence[Mapping[str, Any]], expected_sha256: str | None
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if expected_sha256 is None:
+        return [dict(row) for row in rows], {
+            "enabled": False,
+            "expected_experiment_config_sha256": None,
+            "input_rows": len(rows),
+            "included_rows": len(rows),
+            "excluded_rows": 0,
+            "excluded_trajectories": [],
+        }
+    expected = _validate_digest(
+        expected_sha256, "expected_experiment_config_sha256"
+    )
+    included: list[dict[str, Any]] = []
+    excluded: list[dict[str, str]] = []
+    for index, raw in enumerate(rows):
+        row = dict(raw)
+        actual = _validate_digest(
+            row.get("experiment_config_sha256"),
+            f"trajectory[{index}].experiment_config_sha256",
+        )
+        if actual == expected:
+            included.append(row)
+            continue
+        excluded.append(
+            {
+                "dataset": str(row.get("dataset") or ""),
+                "sample_id": str(row.get("sample_id") or ""),
+                "trajectory_id": str(row.get("trajectory_id") or ""),
+                "experiment_config_sha256": actual,
+            }
+        )
+    if not included:
+        raise ValueError("experiment-config filter removed every selected trajectory")
+    return included, {
+        "enabled": True,
+        "expected_experiment_config_sha256": expected,
+        "input_rows": len(rows),
+        "included_rows": len(included),
+        "excluded_rows": len(excluded),
+        "excluded_trajectories": sorted(
+            excluded,
+            key=lambda item: (
+                item["dataset"], item["sample_id"], item["trajectory_id"]
+            ),
+        ),
+    }
+
+
+def _selection_threshold_failures(
+    summary: Mapping[str, Any],
+    *,
+    minimum_total: int,
+    minimum_per_dataset: int,
+    minimum_candidate_fixes: int,
+    minimum_candidate_fixes_per_dataset: int,
+) -> list[str]:
+    failures: list[str] = []
+    if int(summary.get("selected_trajectories") or 0) < minimum_total:
+        failures.append(f"selected<{minimum_total}")
+    selected_by_dataset = summary.get("selected_by_dataset")
+    fixes_by_dataset = summary.get("candidate_fixes_by_dataset")
+    if not isinstance(selected_by_dataset, Mapping) or not isinstance(
+        fixes_by_dataset, Mapping
+    ):
+        raise ValueError("selection gate summary lacks per-dataset counts")
+    for dataset in ("lvbench", "lsdbench", "cgbench"):
+        if int(selected_by_dataset.get(dataset, 0)) < minimum_per_dataset:
+            failures.append(f"{dataset}<{minimum_per_dataset}")
+        if (
+            int(fixes_by_dataset.get(dataset, 0))
+            < minimum_candidate_fixes_per_dataset
+        ):
+            failures.append(
+                f"{dataset}_candidate_fixes<{minimum_candidate_fixes_per_dataset}"
+            )
+    if int(summary.get("candidate_fixes") or 0) < minimum_candidate_fixes:
+        failures.append(f"candidate_fixes<{minimum_candidate_fixes}")
+    return failures
+
+
 def _record_identity(record: Mapping[str, Any]) -> tuple[str, int, str, str]:
     metadata = record.get("metadata")
     if not isinstance(metadata, Mapping):
@@ -353,6 +436,9 @@ def build(
     minimum_per_dataset: int = 100,
     minimum_candidate_fixes: int = 90,
     minimum_candidate_fixes_per_dataset: int = 20,
+    allow_underfilled_training_set: bool = False,
+    underfilled_authorization_reason: str | None = None,
+    include_experiment_config_sha256: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     if not selected_paths:
@@ -372,6 +458,13 @@ def build(
             "output already exists; pass --overwrite to replace the complete output pair: "
             + ", ".join(str(path) for path in existing)
         )
+    authorization_reason = str(underfilled_authorization_reason or "").strip()
+    if allow_underfilled_training_set and not authorization_reason:
+        raise ValueError("underfilled training requires an authorization reason")
+    if not allow_underfilled_training_set and authorization_reason:
+        raise ValueError(
+            "underfilled authorization reason requires allow_underfilled_training_set"
+        )
 
     all_rows: list[dict[str, Any]] = []
     input_entries: list[dict[str, Any]] = []
@@ -379,21 +472,36 @@ def build(
         rows, digest = _read_jsonl_once(path)
         all_rows.extend(rows)
         input_entries.append({"path": str(path), "sha256": digest, "rows": len(rows)})
-    trajectories = _unique_sorted_trajectories(all_rows)
+    filtered_rows, filter_audit = _filter_experiment_config(
+        all_rows, include_experiment_config_sha256
+    )
+    trajectories = _unique_sorted_trajectories(filtered_rows)
     raw_records = [
         record
         for trajectory in trajectories
         for record in build_perception_memory_sft_records(trajectory)
     ]
     records = _unique_sorted_records(raw_records)
-    gate = enforce_perception_memory_selection_gate(
-        trajectories,
-        records,
-        minimum_total=minimum_total,
-        minimum_per_dataset=minimum_per_dataset,
-        minimum_candidate_fixes=minimum_candidate_fixes,
-        minimum_candidate_fixes_per_dataset=minimum_candidate_fixes_per_dataset,
-    )
+    gate_kwargs = {
+        "minimum_total": minimum_total,
+        "minimum_per_dataset": minimum_per_dataset,
+        "minimum_candidate_fixes": minimum_candidate_fixes,
+        "minimum_candidate_fixes_per_dataset": minimum_candidate_fixes_per_dataset,
+    }
+    if allow_underfilled_training_set:
+        gate = enforce_perception_memory_selection_gate(
+            trajectories,
+            records,
+            minimum_total=0,
+            minimum_per_dataset=0,
+            minimum_candidate_fixes=0,
+            minimum_candidate_fixes_per_dataset=0,
+        )
+    else:
+        gate = enforce_perception_memory_selection_gate(
+            trajectories, records, **gate_kwargs
+        )
+    unmet_conditions = _selection_threshold_failures(gate, **gate_kwargs)
     output_payload = _jsonl_bytes(records)
     output_sha256 = _sha256_bytes(output_payload)
     provenance = _provenance_coverage(trajectories)
@@ -402,6 +510,7 @@ def build(
         "schema_version": 1,
         "selected_inputs": input_entries,
         "selected_input_set_sha256": canonical_sha256(input_entries),
+        "selected_filter": filter_audit,
         "selection_gate": {
             "thresholds": {
                 "minimum_total": minimum_total,
@@ -412,6 +521,13 @@ def build(
                 ),
             },
             "result": gate,
+            "passed_frozen_gate": not unmet_conditions,
+            "unmet_conditions": unmet_conditions,
+            "underfilled_override": {
+                "enabled": allow_underfilled_training_set,
+                "applied": bool(allow_underfilled_training_set and unmet_conditions),
+                "authorization_reason": authorization_reason or None,
+            },
         },
         "provenance_coverage": provenance,
         "sorting": ["trajectory_id", "prefix_index", "episode_target_type"],
@@ -443,6 +559,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--minimum-per-dataset", type=int, default=100)
     parser.add_argument("--minimum-candidate-fixes", type=int, default=90)
     parser.add_argument("--minimum-candidate-fixes-per-dataset", type=int, default=20)
+    parser.add_argument(
+        "--allow-underfilled-training-set",
+        action="store_true",
+        help=(
+            "Explicitly authorize training below the frozen quantity thresholds; "
+            "all stability, leakage, provenance, frame, and hash gates remain enforced."
+        ),
+    )
+    parser.add_argument("--underfilled-authorization-reason")
+    parser.add_argument("--include-experiment-config-sha256")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     frozen_minima = (360, 100, 90, 20)
@@ -454,6 +580,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if any(requested < frozen for requested, frozen in zip(requested_minima, frozen_minima)):
         parser.error("process-SFT selection thresholds may not weaken the frozen plan")
+    if args.allow_underfilled_training_set and not str(
+        args.underfilled_authorization_reason or ""
+    ).strip():
+        parser.error("--allow-underfilled-training-set requires an authorization reason")
+    if (
+        args.underfilled_authorization_reason
+        and not args.allow_underfilled_training_set
+    ):
+        parser.error(
+            "--underfilled-authorization-reason requires "
+            "--allow-underfilled-training-set"
+        )
     try:
         result = build(
             selected_paths=args.selected,
@@ -464,6 +602,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             minimum_candidate_fixes=args.minimum_candidate_fixes,
             minimum_candidate_fixes_per_dataset=(
                 args.minimum_candidate_fixes_per_dataset
+            ),
+            allow_underfilled_training_set=args.allow_underfilled_training_set,
+            underfilled_authorization_reason=(
+                args.underfilled_authorization_reason
+            ),
+            include_experiment_config_sha256=(
+                args.include_experiment_config_sha256
             ),
             overwrite=args.overwrite,
         )

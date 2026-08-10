@@ -69,6 +69,10 @@ def _install_export_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         )
 
     def fake_gate(trajectories: list[dict], records: list[dict], **kwargs: int) -> dict:
+        selected_by_dataset: dict[str, int] = {}
+        for row in trajectories:
+            dataset = str(row["dataset"])
+            selected_by_dataset[dataset] = selected_by_dataset.get(dataset, 0) + 1
         gate_calls.append(
             {
                 "trajectory_ids": [row["trajectory_id"] for row in trajectories],
@@ -78,6 +82,11 @@ def _install_export_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         )
         return {
             "selected_trajectories": len(trajectories),
+            "selected_by_dataset": selected_by_dataset,
+            "candidate_fixes": 0,
+            "candidate_fixes_by_dataset": {
+                dataset: 0 for dataset in selected_by_dataset
+            },
             "sft_records": len(records),
         }
 
@@ -294,3 +303,94 @@ def test_invalid_row_never_creates_partial_formal_outputs(
     assert not output.exists()
     assert not summary_path.exists()
     assert not output.parent.exists()
+
+
+def test_underfilled_override_is_explicit_audited_and_keeps_frozen_thresholds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate_calls = _install_export_stubs(monkeypatch)
+    selected = tmp_path / "selected.jsonl"
+    _write_jsonl(
+        selected,
+        [_trajectory("lvbench", "sample", "trajectory", "1")],
+    )
+
+    summary = builder.build(
+        selected_paths=[selected],
+        output=tmp_path / "sft.jsonl",
+        summary_path=tmp_path / "summary.json",
+        allow_underfilled_training_set=True,
+        underfilled_authorization_reason="User explicitly authorized smaller data.",
+    )
+
+    assert gate_calls[0]["thresholds"] == {
+        "minimum_total": 0,
+        "minimum_per_dataset": 0,
+        "minimum_candidate_fixes": 0,
+        "minimum_candidate_fixes_per_dataset": 0,
+    }
+    gate = summary["selection_gate"]
+    assert gate["thresholds"] == {
+        "minimum_total": 360,
+        "minimum_per_dataset": 100,
+        "minimum_candidate_fixes": 90,
+        "minimum_candidate_fixes_per_dataset": 20,
+    }
+    assert gate["passed_frozen_gate"] is False
+    assert "selected<360" in gate["unmet_conditions"]
+    assert gate["underfilled_override"] == {
+        "enabled": True,
+        "applied": True,
+        "authorization_reason": "User explicitly authorized smaller data.",
+    }
+
+
+def test_underfilled_override_requires_reason(tmp_path: Path) -> None:
+    selected = tmp_path / "selected.jsonl"
+    _write_jsonl(
+        selected,
+        [_trajectory("lvbench", "sample", "trajectory", "1")],
+    )
+    with pytest.raises(ValueError, match="authorization reason"):
+        builder.build(
+            selected_paths=[selected],
+            output=tmp_path / "sft.jsonl",
+            summary_path=tmp_path / "summary.json",
+            allow_underfilled_training_set=True,
+        )
+
+
+def test_experiment_config_filter_excludes_rows_without_rewriting_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gate_calls = _install_export_stubs(monkeypatch)
+    selected = tmp_path / "selected.jsonl"
+    included = _trajectory("lvbench", "included", "trajectory-included", "1")
+    excluded = _trajectory("cgbench", "excluded", "trajectory-excluded", "2")
+    excluded["experiment_config_sha256"] = "7" * 64
+    _write_jsonl(selected, [included, excluded])
+
+    summary = builder.build(
+        selected_paths=[selected],
+        output=tmp_path / "sft.jsonl",
+        summary_path=tmp_path / "summary.json",
+        minimum_total=1,
+        minimum_per_dataset=0,
+        minimum_candidate_fixes=0,
+        minimum_candidate_fixes_per_dataset=0,
+        include_experiment_config_sha256="b" * 64,
+    )
+
+    assert gate_calls[0]["trajectory_ids"] == ["trajectory-included"]
+    audit = summary["selected_filter"]
+    assert audit["input_rows"] == 2
+    assert audit["included_rows"] == 1
+    assert audit["excluded_rows"] == 1
+    assert audit["excluded_trajectories"] == [
+        {
+            "dataset": "cgbench",
+            "sample_id": "excluded",
+            "trajectory_id": "trajectory-excluded",
+            "experiment_config_sha256": "7" * 64,
+        }
+    ]

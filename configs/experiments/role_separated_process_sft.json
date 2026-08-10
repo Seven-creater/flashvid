@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "experiment_id": "role-separated-perception-memory-process-sft-v1",
+  "runtime_contract": {
+    "backend": "perception_memory_eva",
+    "agent_version": "perception_memory_v1",
+    "same_runtime_baseline_required": true,
+    "same_prompt_hash_required": true,
+    "same_config_hash_required": true,
+    "prompt_selection_on_test_forbidden": true,
+    "test_access_before_dev_winner_forbidden": true,
+    "candidate_rerun": false
+  },
+  "roles": {
+    "controller": {
+      "base_model": "Qwen3.5-9B",
+      "adapter": "trainable_controller_lora",
+      "trainable": true,
+      "media_count": 0,
+      "loss_targets": [
+        "evidence_request",
+        "ledger_update",
+        "frame_select",
+        "continue_stop",
+        "final_answer"
+      ]
+    },
+    "perception": {
+      "base_model": "Qwen3.5-9B",
+      "adapter": "frozen_base",
+      "trainable": false,
+      "candidate_blind": true,
+      "input_scope": "current_frame_batch_only"
+    },
+    "judge": {
+      "base_model": "Qwen3.5-9B",
+      "adapter": "frozen_base",
+      "trainable": false,
+      "candidate_blind": true,
+      "includes": [
+        "completeness",
+        "evidence_answer",
+        "confirmation"
+      ]
+    }
+  },
+  "shared_adapter_across_roles_forbidden": true,
+  "process_sft": {
+    "source_split": "train600_only",
+    "templates": [
+      "direct_answer",
+      "single_frame_select",
+      "timestamp_grounded_select",
+      "hierarchical_refinement",
+      "multi_interval_exploration"
+    ],
+    "real_tool_loop_required": true,
+    "incomplete_prefix_targets_continue": true,
+    "complete_prefix_stop_requires_3_of_3": true,
+    "tool_observations_masked": true,
+    "hidden_reasoning_masked": true,
+    "test300_training_forbidden": true,
+    "ground_truth_join_after_model_requests": true
+  },
+  "training_quantity": {
+    "policy": "report_only",
+    "blocks_training": false,
+    "observed_questions": null,
+    "observed_prefixes": null,
+    "candidate_fix_questions": null,
+    "advisory_targets": {
+      "questions": 360,
+      "per_dataset": 100,
+      "candidate_fix_questions": 90
+    }
+  },
+  "data": {
+    "dev": {
+      "lvbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lvbench_dev.jsonl",
+        "sha256": "c1fb73c070dac5a99c1d1f66a7b50ccc3475b520c8595f451e30d755e5d357f1",
+        "samples": 50
+      },
+      "lsdbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/lsdbench_dev.jsonl",
+        "sha256": "c6e1840e055e53fe48fa831ab4b193267af87054155e1b87abcfb12260e31b39",
+        "samples": 50
+      },
+      "cgbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/splits/cgbench_dev.jsonl",
+        "sha256": "fb9239f0243db7abd9b007bd53315abf2fa637540ddf8fee2cee5b9bdec23815",
+        "samples": 50
+      }
+    },
+    "test": {
+      "lvbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lvbench_manifest_42_100.jsonl",
+        "sha256": "2e71b4ae1fb1fe88c5eeb8d93d099f4a149eff31626b9f60a74a8b5e05743bbb",
+        "samples": 100,
+        "read_only": true
+      },
+      "lsdbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/lsdbench_manifest_42_100.jsonl",
+        "sha256": "37dbd946d8abe870ac4eec7d8d1f787c99c148f43546a97371cb13a8856e68d2",
+        "samples": 100,
+        "read_only": true
+      },
+      "cgbench": {
+        "path": "/data02/usr/wangqihao/Demo/test/flashvid/results/eval/flashvid_budget_v1/frozen/manifests/cgbench_manifest_42_100.jsonl",
+        "sha256": "4f60b2876d896741529733841e9497b123c75fee0f5a428c761ac689d8b1b0a6",
+        "samples": 100,
+        "read_only": true
+      }
+    }
+  },
+  "gates": {
+    "implementation": "flashvid_eval.perception_memory_gate",
+    "dev": {
+      "baseline": "same_runtime_untrained",
+      "aggregate_seeds": [17, 42, 73],
+      "minimum_gain_out_of_150": 3,
+      "per_dataset_non_decrease": true,
+      "maximum_total_token_ratio": 0.7,
+      "maximum_visual_token_ratio": 0.7,
+      "maximum_engineering_failure_rate": 0.01,
+      "annotation_leak_required": 0,
+      "candidate_rerun_required": 0,
+      "duplicate_sample_id_required": 0
+    },
+    "test": {
+      "requires_frozen_dev_winner": true,
+      "run_once": true,
+      "minimum_gain_out_of_300": 6,
+      "minimum_total_correct": 157,
+      "minimum_dataset_correct": {
+        "lvbench": 45,
+        "lsdbench": 63,
+        "cgbench": 43
+      },
+      "per_dataset_non_decrease": true,
+      "maximum_total_token_ratio": 0.7,
+      "maximum_visual_token_ratio": 0.7,
+      "maximum_engineering_failure_rate": 0.01,
+      "annotation_leak_required": 0,
+      "candidate_rerun_required": 0,
+      "duplicate_sample_id_required": 0
+    }
+  },
+  "role_ablation": {
+    "split": "dev",
+    "seeds": [42],
+    "may_select_prompt": false,
+    "test_access": "forbidden",
+    "purpose": "attribute regression to the adapter role before any new SFT selection",
+    "cells": [
+      {
+        "id": "base_base_base",
+        "bindings": {"controller": "base", "perception": "base", "judge": "base"}
+      },
+      {
+        "id": "sft_base_base",
+        "bindings": {"controller": "candidate", "perception": "base", "judge": "base"}
+      },
+      {
+        "id": "base_sft_base",
+        "bindings": {"controller": "base", "perception": "candidate", "judge": "base"}
+      },
+      {
+        "id": "base_base_sft",
+        "bindings": {"controller": "base", "perception": "base", "judge": "candidate"}
+      },
+      {
+        "id": "sft_sft_base",
+        "bindings": {"controller": "candidate", "perception": "candidate", "judge": "base"}
+      },
+      {
+        "id": "sft_base_sft",
+        "bindings": {"controller": "candidate", "perception": "base", "judge": "candidate"}
+      },
+      {
+        "id": "base_sft_sft",
+        "bindings": {"controller": "base", "perception": "candidate", "judge": "candidate"}
+      },
+      {
+        "id": "sft_sft_sft",
+        "bindings": {"controller": "candidate", "perception": "candidate", "judge": "candidate"}
+      }
+    ]
+  },
+  "sources": [
+    {
+      "name": "efficient_video_agent",
+      "repository_url": "https://github.com/wangruohui/EfficientVideoAgent.git",
+      "commit": "758ad8d3dcb84a8086e5d70c9afb9a6f278e8f5a",
+      "paper_url": "https://arxiv.org/abs/2603.22918",
+      "reuse_boundary": "Reuse official frame_select, tool-call loop, tool-role messages, and visual-budget fallback semantics.",
+      "excluded_boundary": "Do not claim the unpublished training pipeline; do not attribute KTO or GRPO gains to SFT."
+    },
+    {
+      "name": "time_search_r",
+      "repository_url": "https://github.com/Time-Search/TimeSearch-R.git",
+      "commit": "e427ee64b54a0668520baa4086f7120fd63813f4",
+      "paper_url": "https://arxiv.org/abs/2511.05489",
+      "reuse_boundary": "Reuse tools-disabled completeness self-verification as a stop/evidence audit concept.",
+      "excluded_boundary": "Do not reuse SigLIP or DPP retrieval; do not report GRPO-CSV gains as SFT gains."
+    },
+    {
+      "name": "frame_thinker",
+      "repository_url": "https://github.com/lcqysl/FrameThinker.git",
+      "commit": "3c917f3a7d311e91ae2ac1ebdb30723850e4508e",
+      "paper_url": "https://arxiv.org/abs/2509.24304",
+      "reuse_boundary": "Reuse the five SFT trajectory templates and cognitive-consistency validation rules.",
+      "excluded_boundary": "Do not reuse RL rewards or claim final accuracy/frame improvements as SFT effects."
+    },
+    {
+      "name": "long_vt",
+      "repository_url": "https://github.com/EvolvingLMMs-Lab/LongVT.git",
+      "commit": "ab1fa2c911676dbcb253628c0b40df1fe256bca1",
+      "paper_url": "https://arxiv.org/abs/2511.20785",
+      "reuse_boundary": "Reuse real crop/tool-response episode structure and the documented need to control accumulated visual history.",
+      "excluded_boundary": "Do not import semantic scene tools; do not attribute RL or RFT results to SFT."
+    },
+    {
+      "name": "long_video_r1",
+      "repository_url": "https://github.com/qiujihao19/LongVideo-R1.git",
+      "commit": "5c3e7ba00e1ee24ede3f190da9bd992ae6e005bb",
+      "paper_url": "https://arxiv.org/abs/2602.20913",
+      "reuse_boundary": "Reuse global-to-local hierarchical episode layout and explicit continue/terminate supervision.",
+      "excluded_boundary": "Do not use ground-truth clue intervals, external 32B/72B tools, or RL results."
+    },
+    {
+      "name": "long_video_agent",
+      "repository_url": "https://github.com/longvideoagent/LongVideoAgent.git",
+      "commit": "6edd180b0c5b41c0c5f00e3d96f482a4eb5b27e2",
+      "paper_url": "https://arxiv.org/abs/2512.20618",
+      "reuse_boundary": "Reuse role isolation and text-only observations returned from a frozen perception role to a trainable controller.",
+      "excluded_boundary": "Do not use subtitles, proprietary grounding/vision services, or report its RL gains as SFT gains."
+    },
+    {
+      "name": "video_mind",
+      "repository_url": "https://github.com/yeliudev/VideoMind.git",
+      "commit": "6721d2564eeb9ea8ab6c0ab8eaa39bd231ee8927",
+      "paper_url": "https://arxiv.org/abs/2503.13444",
+      "reuse_boundary": "Reuse role-specific adapter separation and independent planner/grounder/verifier supervision boundaries.",
+      "excluded_boundary": "Do not collapse role adapters into one LoRA or import unrelated datasets/models into the fixed experiment."
+    }
+  ],
+  "orchestration": {
+    "source_lock_path": "configs/source_locks/role_separated_process_sft_sources.lock.json",
+    "role_ablation_output": "results/eval/perception_memory_eva_sft/dev_role_ablation",
+    "gate_cli": "scripts/gate_perception_memory.py",
+    "setsid": true,
+    "nohup": true,
+    "resume": true,
+    "stop_if_dev_gate_fails": true,
+    "test_launch_from_role_ablation_forbidden": true
+  }
+}

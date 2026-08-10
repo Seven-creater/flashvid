@@ -15,6 +15,29 @@ from flashvid_eval.perception_memory_gate import (
 )
 
 
+def _training_quantity_report(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PerceptionMemoryGateError("training_quantity must be an object")
+    fields = (
+        "observed_questions",
+        "observed_prefixes",
+        "candidate_fix_questions",
+    )
+    result: dict[str, Any] = {"policy": "report_only", "blocking": False}
+    for field in fields:
+        count = value.get(field)
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+        ):
+            raise PerceptionMemoryGateError(
+                f"training_quantity.{field} must be null or a non-negative integer"
+            )
+        result[field] = count
+    return result
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
@@ -49,16 +72,20 @@ def evaluate_config(payload: dict[str, Any]) -> dict[str, Any]:
         )
     manifests = {str(key): str(value) for key, value in raw_manifests.items()}
     baseline = method_from_config(baseline_raw)
+    training_quantity = _training_quantity_report(payload.get("training_quantity"))
     if phase == "dev":
         raw_candidates = payload.get("candidates")
         if not isinstance(raw_candidates, list):
             raise PerceptionMemoryGateError("dev candidates must be an array")
-        return evaluate_dev_gate(
+        report = evaluate_dev_gate(
             baseline=baseline,
             candidates=[method_from_config(item) for item in raw_candidates],
             expected_manifest_sha256=manifests,
             expected_counts=counts,
         )
+        if training_quantity is not None:
+            report["training_quantity"] = training_quantity
+        return report
     if phase == "test":
         raw_candidate = payload.get("candidate")
         if not isinstance(raw_candidate, dict):
@@ -74,7 +101,7 @@ def evaluate_config(payload: dict[str, Any]) -> dict[str, Any]:
             raise PerceptionMemoryGateError(
                 "test dev_gate_report requires path and sha256"
             )
-        return evaluate_test_gate(
+        report = evaluate_test_gate(
             baseline=baseline,
             candidate=method_from_config(raw_candidate),
             expected_manifest_sha256=manifests,
@@ -82,6 +109,9 @@ def evaluate_config(payload: dict[str, Any]) -> dict[str, Any]:
             dev_gate_report_sha256=str(dev_gate_sha256),
             expected_counts=counts,
         )
+        if training_quantity is not None:
+            report["training_quantity"] = training_quantity
+        return report
     raise PerceptionMemoryGateError("phase must be dev or test")
 
 

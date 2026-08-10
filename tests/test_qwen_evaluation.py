@@ -488,6 +488,32 @@ def test_strict_parse_failure_and_summary_denominators(tmp_path: Path) -> None:
     assert summary["failure_class_counts"]["model_parse_failure"] == 1
 
 
+def test_agent_policy_failure_is_not_counted_as_infrastructure(tmp_path: Path) -> None:
+    class PolicyFailureRunner:
+        def run_fingerprint(self):
+            return "policy-failure"
+
+        def run(self, sample):
+            del sample
+            return {
+                "prediction": "A",
+                "error": "ControllerAttemptLimit: duplicate intervals",
+                "error_type": "ControllerAttemptLimit",
+                "failure_class": "agent_policy_failure",
+                "model_parse_failure": False,
+                "annotation_leak_check": "passed",
+                "run_fingerprint": "policy-failure",
+            }
+
+    summary = evaluate_qwen_runner(
+        [_sample()], PolicyFailureRunner(), "policy", tmp_path
+    )
+
+    assert summary["failure_class_counts"]["agent_policy_failure"] == 1
+    assert summary["failure_class_counts"]["infrastructure_error"] == 0
+    assert summary["common_valid"]["denominator"] == 0
+
+
 def test_resume_retry_replaces_stale_or_duplicate_rows_atomically(tmp_path: Path) -> None:
     class Runner:
         calls = 0

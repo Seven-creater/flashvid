@@ -827,12 +827,20 @@ def evaluate_qwen_runner(
     annotation_leak_failures = sum(
         row.get("failure_class") == "annotation_leak" for row in ordered
     )
+    agent_policy_failures = sum(
+        row.get("failure_class") == "agent_policy_failure" for row in ordered
+    )
     infrastructure_errors = sum(
         bool(
             row.get("error")
             and not row.get("data_unavailable")
             and not row.get("control_unavailable")
-            and row.get("failure_class") != "annotation_leak"
+            and row.get("failure_class")
+            not in {
+                "annotation_leak",
+                "model_parse_failure",
+                "agent_policy_failure",
+            }
         )
         for row in ordered
     )
@@ -866,6 +874,7 @@ def evaluate_qwen_runner(
         "data_unavailable": data_unavailable,
         "control_unavailable": control_unavailable,
         "model_parse_failure": model_parse_failures,
+        "agent_policy_failure": agent_policy_failures,
         "annotation_leak": annotation_leak_failures,
         "infrastructure_error": infrastructure_errors,
     }

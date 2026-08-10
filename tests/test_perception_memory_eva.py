@@ -1440,7 +1440,138 @@ def test_truncated_controller_action_gets_one_bounded_retry(tmp_path: Path) -> N
         "controller_response_truncated"
     )
     assert controllers[1]["retry_reason"] == "controller_response_truncated"
+    assert [item["attempt_index"] for item in controllers] == [0, 1]
+    assert len({item["retry_group_id"] for item in controllers}) == 1
+    assert len({item["seed"] for item in controllers}) == 1
     assert len(session.requests) == 1
+
+    judge_trace = next(
+        item for item in result["request_trace"] if item["stage"] == "evidence_judge"
+    )
+    result["perception_states"][0]["judge_confirmations"] = [
+        {
+            "judge_seed": seed,
+            "prediction": "A",
+            "evidence_ids": ["E0001"],
+            "request_messages": judge_trace["messages"],
+            "raw_response": judge_trace["content"],
+            "evidence_complete": True,
+            "annotation_leak_check": "passed",
+            "error": None,
+        }
+        for seed in (17, 42, 73)
+    ]
+    result["_selection_stable"] = True
+    records = build_perception_memory_sft_records(result)
+    assert records[0]["metadata"]["episode_target_type"] == "tool"
+
+
+def test_first_controller_failure_on_new_step_does_not_link_previous_step(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the first interval"}}</tool_call>'
+    )
+    second_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the second interval"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(interval=(10.0, 20.0), sufficient=False),
+            ("<tool_call>{", "length"),
+            second_call,
+            _indexed_state_json(interval=(30.0, 40.0)),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"A","evidence_ids":["E0001"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    controllers = [
+        item for item in result["request_trace"] if item["stage"] == "controller"
+    ]
+    assert result["error"] is None
+    assert [item["step_index"] for item in controllers] == [0, 1, 1]
+    assert [item["attempt_index"] for item in controllers] == [0, 0, 1]
+    assert [item["retry_of_attempt"] for item in controllers] == [None, None, 0]
+    assert controllers[0]["retry_group_id"] != controllers[1]["retry_group_id"]
+    assert controllers[1]["retry_group_id"] == controllers[2]["retry_group_id"]
+
+
+def test_controller_attempt_limit_is_an_explicit_policy_failure(tmp_path: Path) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    invalid_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":10,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    client = _FakeClient([invalid_call, invalid_call])
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=1,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["final_prediction"] == "A"
+    assert result["fallback_to_candidate"] is True
+    assert result["controller_attempt_limit_reached"] is True
+    assert result["controller_attempts"] == 2
+    assert result["accepted_evidence_steps"] == 0
+    assert result["failure_class"] == "agent_policy_failure"
+    assert result["stop_reason"] == "controller_attempt_limit"
+    assert result["controller_attempt_limit_reason"] == "invalid_interval"
+    assert result["error_type"] == "ControllerAttemptLimit"
+    assert result["evidence_complete"] is False
+    assert session.requests == []
+
+
+def test_malformed_controller_attempt_limit_is_a_parse_failure(tmp_path: Path) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    client = _FakeClient(["not a tool call", "still not a tool call"])
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=1,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["final_prediction"] == "A"
+    assert result["fallback_to_candidate"] is True
+    assert result["failure_class"] == "model_parse_failure"
+    assert result["model_parse_failure"] is True
+    assert result["stop_reason"] == "controller_attempt_limit"
+    assert result["controller_attempt_limit_reason"] == "invalid_controller_action"
+    assert session.requests == []
 
 
 @pytest.mark.parametrize(
@@ -1512,6 +1643,9 @@ def test_bad_confirmation_retries_then_runs_second_perception_and_judge(
     assert result["decision_source"] == "confirmed_visual_change"
     assert len(confirmations) == 2
     assert [item["action_accepted"] for item in confirmations] == [False, True]
+    assert [item["attempt_index"] for item in confirmations] == [0, 1]
+    assert len({item["retry_group_id"] for item in confirmations}) == 1
+    assert len({item["seed"] for item in confirmations}) == 1
     assert confirmations[0]["action_rejection_reason"] == rejection_reason
     assert confirmations[1]["retry_reason"] == rejection_reason
     retry_prompt = json.dumps(confirmations[1]["messages"], ensure_ascii=False)

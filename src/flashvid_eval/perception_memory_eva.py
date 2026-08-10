@@ -1781,6 +1781,7 @@ class PerceptionMemoryEvaEvaluator:
         evidence_steps = 0
         controller_attempts = 0
         controller_attempt_limit_reached = False
+        controller_attempt_limit_reason: str | None = None
 
         try:
             video = self.index.resolve(sample.video)
@@ -1809,13 +1810,19 @@ class PerceptionMemoryEvaEvaluator:
                     self.trajectory_variant_id, float(session.metadata["duration"])
                 )
             last_controller_rejection: str | None = None
+            controller_step_attempts = 0
             while (
                 evidence_steps < self.max_turns
                 and controller_attempts < self.max_controller_attempts
             ):
                 controller_attempt_index = controller_attempts
                 controller_attempts += 1
+                attempt_index = controller_step_attempts
+                controller_step_attempts += 1
                 retry_reason = last_controller_rejection
+                controller_retry_group_id = _messages_sha256(
+                    build_controller_messages(sample, memory, session.metadata)
+                )
                 if controller_attempt_index == 0 and rescue_request is not None:
                     controller_messages = build_controller_messages(
                         sample, memory, session.metadata, feedback=feedback
@@ -1840,6 +1847,8 @@ class PerceptionMemoryEvaEvaluator:
                             "step_index": evidence_steps,
                             "prefix_index": -1,
                             "controller_attempt_index": controller_attempt_index,
+                            "retry_group_id": controller_retry_group_id,
+                            "attempt_index": attempt_index,
                             "retry_of_attempt": None,
                             "retry_reason": None,
                             "prompt_hash": _messages_sha256(controller_messages),
@@ -1863,7 +1872,7 @@ class PerceptionMemoryEvaEvaluator:
                             ),
                             stage="controller",
                             max_tokens=self.controller_max_tokens,
-                            seed_offset=controller_attempt_index * 10,
+                            seed_offset=evidence_steps * 10,
                             json_mode=False,
                             step_index=evidence_steps,
                             prefix_index=len(perception_states) - 1,
@@ -1878,10 +1887,10 @@ class PerceptionMemoryEvaEvaluator:
                         current.update(
                             {
                                 "controller_attempt_index": controller_attempt_index,
+                                "retry_group_id": controller_retry_group_id,
+                                "attempt_index": attempt_index,
                                 "retry_of_attempt": (
-                                    controller_attempt_index - 1
-                                    if controller_attempt_index
-                                    else None
+                                    attempt_index - 1 if retry_reason else None
                                 ),
                                 "retry_reason": retry_reason,
                                 "action_accepted": False,
@@ -1899,8 +1908,10 @@ class PerceptionMemoryEvaEvaluator:
                     request_trace[-1].update(
                         {
                             "controller_attempt_index": controller_attempt_index,
+                            "retry_group_id": controller_retry_group_id,
+                            "attempt_index": attempt_index,
                             "retry_of_attempt": (
-                                controller_attempt_index - 1 if retry_reason else None
+                                attempt_index - 1 if retry_reason else None
                             ),
                             "retry_reason": retry_reason,
                         }
@@ -2012,29 +2023,49 @@ class PerceptionMemoryEvaEvaluator:
                 evidence_steps += 1
                 feedback = ""
                 last_controller_rejection = None
+                controller_step_attempts = 0
             if not complete:
                 controller_attempt_limit_reached = (
                     controller_attempts >= self.max_controller_attempts
                     and evidence_steps < self.max_turns
                 )
-                decision = self._completeness(
-                    sample,
-                    memory,
-                    request_trace,
-                    self.max_turns * 10 + 1,
-                    step_index=(
-                        len(perception_states) - 1 if perception_states else None
-                    ),
-                    prefix_index=len(perception_states) - 1,
-                )
-                complete = bool(
-                    decision and decision.evidence_complete and memory.event_ledger
-                )
-                if complete and perception_states:
-                    perception_states[-1]["evidence_complete"] = True
-                stop_reason = (
-                    "max_turns_complete" if complete else "max_turns_incomplete"
-                )
+                if controller_attempt_limit_reached:
+                    controller_attempt_limit_reason = last_controller_rejection
+                    error = (
+                        "ControllerAttemptLimit: exhausted "
+                        f"{controller_attempts} controller attempts after "
+                        f"{evidence_steps} accepted evidence steps; final rejection: "
+                        f"{controller_attempt_limit_reason or 'unknown'}"
+                    )
+                    failure_class = (
+                        "model_parse_failure"
+                        if controller_attempt_limit_reason
+                        in {
+                            "invalid_controller_action",
+                            "controller_response_truncated",
+                        }
+                        else "agent_policy_failure"
+                    )
+                    stop_reason = "controller_attempt_limit"
+                else:
+                    decision = self._completeness(
+                        sample,
+                        memory,
+                        request_trace,
+                        self.max_turns * 10 + 1,
+                        step_index=(
+                            len(perception_states) - 1 if perception_states else None
+                        ),
+                        prefix_index=len(perception_states) - 1,
+                    )
+                    complete = bool(
+                        decision and decision.evidence_complete and memory.event_ledger
+                    )
+                    if complete and perception_states:
+                        perception_states[-1]["evidence_complete"] = True
+                    stop_reason = (
+                        "max_turns_complete" if complete else "max_turns_incomplete"
+                    )
 
             if complete:
                 first = self._judge(
@@ -2070,6 +2101,14 @@ class PerceptionMemoryEvaEvaluator:
                     confirmation_observation: FrameObservation | None = None
                     confirmation_feedback = ""
                     confirmation_retry_reason: str | None = None
+                    confirmation_retry_group_id = _messages_sha256(
+                        build_confirmation_controller_messages(
+                            sample,
+                            memory,
+                            session.metadata,
+                            (candidate, first.answer),
+                        )
+                    )
                     for confirmation_attempt in range(2):
                         try:
                             confirmation_text = self._chat(
@@ -2083,7 +2122,7 @@ class PerceptionMemoryEvaEvaluator:
                                 ),
                                 stage="confirmation_controller",
                                 max_tokens=self.controller_max_tokens,
-                                seed_offset=2001 + confirmation_attempt,
+                                seed_offset=2001,
                                 json_mode=False,
                                 step_index=len(perception_states),
                                 prefix_index=len(perception_states) - 1,
@@ -2098,6 +2137,8 @@ class PerceptionMemoryEvaEvaluator:
                             current.update(
                                 {
                                     "controller_attempt_index": confirmation_attempt,
+                                    "retry_group_id": confirmation_retry_group_id,
+                                    "attempt_index": confirmation_attempt,
                                     "retry_of_attempt": (
                                         confirmation_attempt - 1
                                         if confirmation_attempt
@@ -2123,6 +2164,8 @@ class PerceptionMemoryEvaEvaluator:
                         current.update(
                             {
                                 "controller_attempt_index": confirmation_attempt,
+                                "retry_group_id": confirmation_retry_group_id,
+                                "attempt_index": confirmation_attempt,
                                 "retry_of_attempt": (
                                     confirmation_attempt - 1
                                     if confirmation_retry_reason
@@ -2348,6 +2391,7 @@ class PerceptionMemoryEvaEvaluator:
             "controller_attempts": controller_attempts,
             "controller_attempt_limit": self.max_controller_attempts,
             "controller_attempt_limit_reached": controller_attempt_limit_reached,
+            "controller_attempt_limit_reason": controller_attempt_limit_reason,
             "tool_steps": tool_steps,
             "perception_states": perception_states,
             "judge_answers": [

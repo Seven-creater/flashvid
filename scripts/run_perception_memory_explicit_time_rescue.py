@@ -158,7 +158,69 @@ def _validate_manifest_row(
             or not isinstance(raw[1], (int, float))
         ):
             raise ValueError("source_requested_intervals must be numeric pairs")
-        intervals.append((float(raw[0]), float(raw[1])))
+        interval = (float(raw[0]), float(raw[1]))
+        if interval[1] <= interval[0]:
+            raise ValueError("source_requested_intervals must be increasing")
+        intervals.append(interval)
+
+    raw_steps = source.get("tool_steps", source.get("tool_calls"))
+    if not isinstance(raw_steps, list):
+        raise ValueError("repair source requires tool_steps")
+    source_intervals: list[tuple[float, float]] = []
+    for raw_step in raw_steps:
+        if not isinstance(raw_step, Mapping):
+            continue
+        raw_arguments = raw_step.get("arguments")
+        values = raw_arguments if isinstance(raw_arguments, Mapping) else raw_step
+        try:
+            interval = (float(values["start_time"]), float(values["end_time"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if interval[1] > interval[0]:
+            source_intervals.append(interval)
+    if intervals != source_intervals:
+        raise ValueError("source_requested_intervals differ from source tool_steps")
+
+    failed_step_index = row.get("failed_step_index")
+    if (
+        isinstance(failed_step_index, bool)
+        or not isinstance(failed_step_index, int)
+        or failed_step_index < 0
+        or failed_step_index >= len(raw_steps)
+    ):
+        raise ValueError("failed_step_index differs from source tool_steps")
+    failed_step = raw_steps[failed_step_index]
+    if not isinstance(failed_step, Mapping):
+        raise ValueError("failed_step_index does not identify a source tool step")
+    raw_arguments = failed_step.get("arguments")
+    failed_values = (
+        raw_arguments if isinstance(raw_arguments, Mapping) else failed_step
+    )
+    try:
+        source_failed_interval = (
+            float(failed_values["start_time"]),
+            float(failed_values["end_time"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("failed source tool step requires a numeric interval") from exc
+    raw_failed_interval = row.get("failed_step_requested_interval")
+    if (
+        not isinstance(raw_failed_interval, list)
+        or len(raw_failed_interval) != 2
+        or isinstance(raw_failed_interval[0], bool)
+        or not isinstance(raw_failed_interval[0], (int, float))
+        or isinstance(raw_failed_interval[1], bool)
+        or not isinstance(raw_failed_interval[1], (int, float))
+    ):
+        raise ValueError("failed_step_requested_interval must be a numeric pair")
+    failed_interval = (
+        float(raw_failed_interval[0]),
+        float(raw_failed_interval[1]),
+    )
+    if failed_interval != source_failed_interval:
+        raise ValueError(
+            "failed_step_requested_interval differs from source tool step"
+        )
 
     choices = public.get("choices")
     if not isinstance(choices, Mapping) or not choices:
@@ -208,6 +270,9 @@ def _run_one(
     frozen_scope_sha256: str,
 ) -> dict[str, Any]:
     sample, source_intervals = _validate_manifest_row(row)
+    failed_interval = tuple(
+        float(value) for value in row["failed_step_requested_interval"]
+    )
     source = row["source_row"]
     assert isinstance(source, Mapping)
     evaluator = PerceptionMemoryEvaEvaluator(
@@ -236,7 +301,7 @@ def _run_one(
     )
     result = evaluator.run(
         sample,
-        rescue_source_requested_intervals=source_intervals,
+        rescue_source_requested_intervals=(failed_interval,),
     )
     result.update(
         {
@@ -250,6 +315,11 @@ def _run_one(
             "rescue_manifest_sha256": manifest_sha256,
             "frozen_scope_sha256": frozen_scope_sha256,
             "repair_reason": row.get("reason"),
+            "failed_step_index": row["failed_step_index"],
+            "failed_step_requested_interval": list(failed_interval),
+            "source_requested_intervals_audit": [
+                list(interval) for interval in source_intervals
+            ],
         }
     )
     return result

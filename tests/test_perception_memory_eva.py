@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 
 import pytest
 
 from scripts.evaluate_mcq import (
     _candidate_superset_allowed,
+    _load_perception_memory_role_config,
     _validate_perception_memory_variant,
 )
 from flashvid_eval.client import ChatResult
@@ -16,7 +18,9 @@ from flashvid_eval.perception_memory_eva import (
     EvidenceDecision,
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
+    PERCEPTION_MEMORY_ROLE_NAMES,
     PerceptionMemoryEvaEvaluator,
+    PerceptionMemoryRoleBinding,
     REPAIR_ONLY_TRAJECTORY_VARIANTS,
     RESCUE_TRAJECTORY_VARIANTS,
     apply_candidate_gate,
@@ -26,6 +30,7 @@ from flashvid_eval.perception_memory_eva import (
     build_controller_messages,
     build_judge_messages,
     build_perception_messages,
+    controller_structured_outputs,
     duplicate_interval,
     explicit_time_rescue_request,
     interval_iou,
@@ -34,9 +39,11 @@ from flashvid_eval.perception_memory_eva import (
     parse_controller_action,
     parse_perception_state,
     perception_model_target,
+    perception_memory_role_for_stage,
     perception_response_format,
     rescue_frame_request,
     validate_perception_state_observation,
+    validate_perception_memory_role_config,
 )
 from flashvid_eval.perception_memory_sft import build_perception_memory_sft_records
 from flashvid_eval.privacy import assert_annotation_free_request
@@ -53,6 +60,87 @@ def _sample(candidate: str | None = "PRIVATE_CANDIDATE_SENTINEL") -> ModelSample
         choices={"A": "Sits down", "B": "Walks outside"},
         candidate_answer=candidate,
     )
+
+
+def _role_config_payload() -> dict[str, dict[str, str]]:
+    return {
+        role: {
+            "base_url": f"http://127.0.0.1:{8300 + index}/v1",
+            "model": f"qwen-{role}",
+            "artifact_sha256": f"{index + 1:x}" * 64,
+        }
+        for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+    }
+
+
+def test_perception_memory_role_config_is_exact_and_normalized() -> None:
+    validated = validate_perception_memory_role_config(_role_config_payload())
+
+    assert tuple(validated) == PERCEPTION_MEMORY_ROLE_NAMES
+    assert validated["planner"]["base_url"] == "http://127.0.0.1:8300/v1"
+    assert validated["answerer"]["artifact_sha256"] == "4" * 64
+
+    missing = _role_config_payload()
+    missing.pop("verifier")
+    with pytest.raises(ValueError, match="exactly"):
+        validate_perception_memory_role_config(missing)
+
+    extra_field = _role_config_payload()
+    extra_field["planner"]["unexpected"] = "x"
+    with pytest.raises(ValueError, match="exactly"):
+        validate_perception_memory_role_config(extra_field)
+
+    invalid_url = _role_config_payload()
+    invalid_url["observer"]["base_url"] = "file:///tmp/model"
+    with pytest.raises(ValueError, match="HTTP"):
+        validate_perception_memory_role_config(invalid_url)
+
+    invalid_hash = _role_config_payload()
+    invalid_hash["answerer"]["artifact_sha256"] = "not-a-sha"
+    with pytest.raises(ValueError, match="SHA-256"):
+        validate_perception_memory_role_config(invalid_hash)
+
+
+def test_role_config_loader_freezes_file_and_limits_path_transport_to_observer(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "roles.json"
+    path.write_text(json.dumps(_role_config_payload()), encoding="utf-8")
+
+    config_sha256, bindings, audit = _load_perception_memory_role_config(
+        path,
+        api_key="test-key",
+        timeout=12.0,
+        local_media_paths=True,
+    )
+
+    assert len(config_sha256) == 64
+    assert tuple(bindings) == PERCEPTION_MEMORY_ROLE_NAMES
+    assert audit["verifier"]["model"] == "qwen-verifier"
+    for role, binding in bindings.items():
+        assert binding.client.local_file_urls_as_paths is (role == "observer")
+        assert binding.artifact_sha256 == audit[role]["artifact_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("stage", "role"),
+    (
+        ("controller", "planner"),
+        ("confirmation_controller", "planner"),
+        ("perception", "observer"),
+        ("confirmation_perception", "observer"),
+        ("completeness", "verifier"),
+        ("evidence_judge", "answerer"),
+        ("confirmation_judge", "answerer"),
+    ),
+)
+def test_perception_memory_stage_role_mapping(stage: str, role: str) -> None:
+    assert perception_memory_role_for_stage(stage) == role
+
+
+def test_perception_memory_unknown_stage_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported"):
+        perception_memory_role_for_stage("mystery")
 
 
 def _observation(tmp_path: Path) -> FrameObservation:
@@ -563,10 +651,13 @@ class _FakeClient:
     def __init__(self, outputs: list[str | tuple[str, str]]) -> None:
         self.outputs = outputs
         self.messages: list[list[dict]] = []
+        self.models: list[str] = []
+        self.request_kwargs: list[dict[str, object]] = []
 
     def chat(self, model: str, messages: list[dict], **kwargs: object) -> ChatResult:
-        del model, kwargs
+        self.models.append(model)
         self.messages.append(messages)
+        self.request_kwargs.append(dict(kwargs))
         scripted = self.outputs.pop(0)
         content, finish_reason = (
             scripted if isinstance(scripted, tuple) else (scripted, "stop")
@@ -583,6 +674,113 @@ class _FakeClient:
             raw={},
             latency_s=0.01,
             finish_reason=finish_reason,
+        )
+
+
+def test_evaluator_routes_every_stage_to_its_frozen_role(
+    tmp_path: Path,
+) -> None:
+    clients = {
+        role: _FakeClient(["{}"] * (2 if role != "verifier" else 1))
+        for role in PERCEPTION_MEMORY_ROLE_NAMES
+    }
+    bindings = {
+        role: PerceptionMemoryRoleBinding(
+            client=clients[role],
+            model=f"model-{role}",
+            artifact_sha256=f"{index + 1:x}" * 64,
+        )
+        for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+    }
+    evaluator = PerceptionMemoryEvaEvaluator(
+        clients["planner"],
+        "legacy-model",
+        tmp_path,
+        tmp_path / "frames",
+        role_bindings=bindings,
+        role_config_sha256="a" * 64,
+    )
+    trace: list[dict] = []
+    stages = (
+        "controller",
+        "confirmation_controller",
+        "perception",
+        "confirmation_perception",
+        "completeness",
+        "evidence_judge",
+        "confirmation_judge",
+    )
+    for index, stage in enumerate(stages):
+        evaluator._chat(
+            trace,
+            [
+                {"role": "system", "content": "Public role instruction."},
+                {"role": "user", "content": "Public request."},
+            ],
+            stage=stage,
+            max_tokens=32,
+            seed_offset=index,
+            json_mode=True,
+        )
+
+    assert [item["role_name"] for item in trace] == [
+        "planner",
+        "planner",
+        "observer",
+        "observer",
+        "verifier",
+        "answerer",
+        "answerer",
+    ]
+    for role, client in clients.items():
+        assert client.models == [f"model-{role}"] * len(client.models)
+    audit = evaluator.static_audit_fields()
+    assert audit["role_config_sha256"] == "a" * 64
+    assert audit["role_models"] == {
+        role: f"model-{role}" for role in PERCEPTION_MEMORY_ROLE_NAMES
+    }
+    assert audit["role_artifact_sha256s"]["observer"] == "2" * 64
+
+
+def test_role_binding_or_hash_drift_changes_fingerprint(tmp_path: Path) -> None:
+    client = _FakeClient([])
+
+    def build(config_hash: str, answerer_hash: str) -> PerceptionMemoryEvaEvaluator:
+        bindings = {
+            role: PerceptionMemoryRoleBinding(
+                client=client,
+                model=f"model-{role}",
+                artifact_sha256=(
+                    answerer_hash if role == "answerer" else f"{index + 1:x}" * 64
+                ),
+            )
+            for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+        }
+        return PerceptionMemoryEvaEvaluator(
+            client,
+            "legacy-model",
+            tmp_path,
+            tmp_path / "frames",
+            role_bindings=bindings,
+            role_config_sha256=config_hash,
+        )
+
+    baseline = build("a" * 64, "4" * 64)
+    assert baseline.run_fingerprint() != build("b" * 64, "4" * 64).run_fingerprint()
+    assert baseline.run_fingerprint() != build("a" * 64, "f" * 64).run_fingerprint()
+
+    incomplete = {
+        role: PerceptionMemoryRoleBinding(client, role, "1" * 64)
+        for role in PERCEPTION_MEMORY_ROLE_NAMES[:-1]
+    }
+    with pytest.raises(ValueError, match="exactly"):
+        PerceptionMemoryEvaEvaluator(
+            client,
+            "legacy-model",
+            tmp_path,
+            tmp_path / "frames",
+            role_bindings=incomplete,
+            role_config_sha256="a" * 64,
         )
 
 
@@ -1573,6 +1771,23 @@ def test_controller_prompt_has_dynamic_valid_official_reference() -> None:
     assert '"arguments"' in reference
     assert '"args"' not in reference
     assert "PRIVATE_CANDIDATE_SENTINEL" not in prompt
+
+
+def test_controller_structured_output_accepts_only_canonical_eva_actions() -> None:
+    observe = (
+        '<tool_call>{"arguments":{"end_time":100.0,"evidence_request":'
+        '"Observe the action.","nframes":32,"resize":0.75,"start_time":0.0},'
+        '"tool":"frame_select"}</tool_call>'
+    )
+    stop = '{"action":"stop"}'
+    with_stop = controller_structured_outputs(allow_stop=True)["regex"]
+    observe_only = controller_structured_outputs(allow_stop=False)["regex"]
+    assert re.fullmatch(with_stop, observe)
+    assert re.fullmatch(with_stop, stop)
+    assert re.fullmatch(observe_only, observe)
+    assert not re.fullmatch(observe_only, stop)
+    assert not re.fullmatch(with_stop, observe.replace('"arguments"', '"args"'))
+    assert not re.fullmatch(with_stop, observe.replace("0.75", '"fit"'))
 
 
 def test_controller_reference_uses_public_explicit_time_and_avoids_observed() -> None:

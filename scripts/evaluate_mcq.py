@@ -20,7 +20,10 @@ from flashvid_eval.flashvid_hybrid import (
 from flashvid_eval.fast_hybrid_eva import FastHybridEvaEvaluator, OFFICIAL_EVA_COMMIT
 from flashvid_eval.perception_memory_eva import (
     DURATION_RESCUE_TRAJECTORY_VARIANTS,
+    PERCEPTION_MEMORY_ROLE_NAMES,
     PerceptionMemoryEvaEvaluator,
+    PerceptionMemoryRoleBinding,
+    validate_perception_memory_role_config,
 )
 from flashvid_eval.offline_budget import normalize_candidate
 from flashvid_eval.answers import extract_strict_answer_letter
@@ -96,6 +99,45 @@ def _validated_sha256(value: str | None, label: str) -> str:
     ):
         raise ValueError(f"{label} must be 64 hexadecimal characters")
     return value.lower()
+
+
+def _load_perception_memory_role_config(
+    path: Path,
+    *,
+    api_key: str,
+    timeout: float,
+    local_media_paths: bool,
+) -> tuple[
+    str,
+    dict[str, PerceptionMemoryRoleBinding],
+    dict[str, dict[str, str]],
+]:
+    """Load one exact four-role config before any model request."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Perception-Memory role config does not exist: {path}")
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        raise ValueError("Perception-Memory role config must be UTF-8") from error
+    except json.JSONDecodeError as error:
+        raise ValueError("Perception-Memory role config is not valid JSON") from error
+    validated = validate_perception_memory_role_config(payload)
+    bindings = {
+        role: PerceptionMemoryRoleBinding(
+            client=OpenAICompatibleClient(
+                validated[role]["base_url"],
+                api_key,
+                timeout,
+                local_file_urls_as_paths=(local_media_paths and role == "observer"),
+            ),
+            model=validated[role]["model"],
+            artifact_sha256=validated[role]["artifact_sha256"],
+        )
+        for role in PERCEPTION_MEMORY_ROLE_NAMES
+    }
+    return hashlib.sha256(raw).hexdigest(), bindings, validated
 
 
 def _validate_perception_memory_diagnostics_gate(path: Path) -> str:
@@ -640,6 +682,14 @@ def main() -> None:
             "default keeps file:// URLs for other OpenAI-compatible servers."
         ),
     )
+    parser.add_argument(
+        "--pm-role-config",
+        type=Path,
+        help=(
+            "Frozen Perception-Memory planner/observer/verifier/answerer endpoint "
+            "JSON. Valid only for perception_memory_eva."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-errors", action="store_true")
     parser.add_argument(
@@ -850,6 +900,10 @@ def main() -> None:
         help="Poll partial downloads until --sample accessible items exist.",
     )
     args = parser.parse_args()
+    if args.pm_role_config is not None and args.backend != "perception_memory_eva":
+        raise ValueError(
+            "--pm-role-config is valid only with --backend perception_memory_eva"
+        )
     local_media_transport = _local_media_transport(
         args.backend, args.local_media_paths
     )
@@ -1318,6 +1372,9 @@ def main() -> None:
         )
     elif args.backend in {"fast_hybrid_eva", "perception_memory_eva"}:
         diagnostics_gate_sha256 = None
+        pm_role_config_sha256 = None
+        pm_role_bindings = None
+        pm_role_config_audit = None
         if (
             args.backend == "fast_hybrid_eva"
             and args.agent_version not in {"fast_hybrid_v1", "fast_hybrid_v2"}
@@ -1343,6 +1400,17 @@ def main() -> None:
             diagnostics_gate_sha256 = _validate_perception_memory_diagnostics_gate(
                 args.diagnostics_gate_summary
             )
+            if args.pm_role_config is not None:
+                (
+                    pm_role_config_sha256,
+                    pm_role_bindings,
+                    pm_role_config_audit,
+                ) = _load_perception_memory_role_config(
+                    args.pm_role_config,
+                    api_key=args.api_key,
+                    timeout=args.timeout,
+                    local_media_paths=args.local_media_paths,
+                )
         if args.candidate_results is None or not args.candidate_results.is_file():
             raise ValueError(
                 f"{args.backend} requires --candidate-results with frozen clean Direct output"
@@ -1533,6 +1601,8 @@ def main() -> None:
                 seed=args.seed,
                 candidate_results_sha256=candidate_hash,
                 model_artifact_sha256=model_artifact_sha256,
+                role_bindings=pm_role_bindings,
+                role_config_sha256=pm_role_config_sha256,
                 manifest_sha256=manifest_hash,
                 experiment_config_sha256=experiment_config_sha256,
                 diagnostics_gate_sha256=diagnostics_gate_sha256,
@@ -1568,6 +1638,15 @@ def main() -> None:
                 "train600_manifest_sha256": train600_manifest_sha256,
                 "diagnostics_gate_sha256": diagnostics_gate_sha256,
                 "local_media_transport": local_media_transport,
+                "pm_role_config": (
+                    {
+                        "path": str(args.pm_role_config.resolve()),
+                        "sha256": pm_role_config_sha256,
+                        "roles": pm_role_config_audit,
+                    }
+                    if args.pm_role_config is not None
+                    else None
+                ),
                 "trajectory_schedule_id": args.trajectory_schedule_id,
                 "trajectory_variant_id": args.trajectory_variant_id,
                 "trajectory_replica_id": args.trajectory_replica_id,

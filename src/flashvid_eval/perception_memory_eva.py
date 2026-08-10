@@ -17,6 +17,7 @@ import hashlib
 import json
 import math
 import re
+import urllib.parse
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -56,6 +57,109 @@ RESCUE_TRAJECTORY_VARIANTS = frozenset(
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
 _MAX_NO_NOVEL_ACTION_REJECTIONS = 2
 PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
+CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v1"
+_CONTROLLER_FRAME_COUNTS = (8, 16, 32, 64, 128)
+PERCEPTION_MEMORY_ROLE_NAMES = (
+    "planner",
+    "observer",
+    "verifier",
+    "answerer",
+)
+_PERCEPTION_MEMORY_STAGE_ROLES = {
+    "controller": "planner",
+    "confirmation_controller": "planner",
+    "perception": "observer",
+    "confirmation_perception": "observer",
+    "completeness": "verifier",
+    "evidence_judge": "answerer",
+    "confirmation_judge": "answerer",
+}
+
+
+@dataclass(frozen=True)
+class PerceptionMemoryRoleBinding:
+    """One immutable model/client binding used by a runtime role."""
+
+    client: ChatClient
+    model: str
+    artifact_sha256: str | None
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.client, "chat", None)):
+            raise ValueError("role binding client must implement chat")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise ValueError("role binding model must be non-empty text")
+        if self.artifact_sha256 is not None and (
+            len(self.artifact_sha256) != 64
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in self.artifact_sha256
+            )
+        ):
+            raise ValueError("role binding artifact_sha256 must be a SHA-256")
+        object.__setattr__(self, "model", self.model.strip())
+        if self.artifact_sha256 is not None:
+            object.__setattr__(
+                self, "artifact_sha256", self.artifact_sha256.lower()
+            )
+
+
+def perception_memory_role_for_stage(stage: str) -> str:
+    """Map every model-call stage to exactly one frozen runtime role."""
+
+    normalized = str(stage).strip().casefold()
+    role = _PERCEPTION_MEMORY_STAGE_ROLES.get(normalized)
+    if role is None:
+        raise ValueError(f"unsupported Perception-Memory model stage: {stage!r}")
+    return role
+
+
+def validate_perception_memory_role_config(
+    payload: Any,
+) -> dict[str, dict[str, str]]:
+    """Validate the exact public JSON schema accepted by ``--pm-role-config``."""
+
+    if not isinstance(payload, Mapping) or set(payload) != set(
+        PERCEPTION_MEMORY_ROLE_NAMES
+    ):
+        raise ValueError(
+            "Perception-Memory role config must contain exactly planner, observer, "
+            "verifier, and answerer"
+        )
+    validated: dict[str, dict[str, str]] = {}
+    required = {"base_url", "model", "artifact_sha256"}
+    for role in PERCEPTION_MEMORY_ROLE_NAMES:
+        raw = payload[role]
+        if not isinstance(raw, Mapping) or set(raw) != required:
+            raise ValueError(
+                f"Perception-Memory role {role} must contain exactly "
+                "base_url, model, and artifact_sha256"
+            )
+        base_url = str(raw["base_url"] or "").strip().rstrip("/")
+        parsed = urllib.parse.urlparse(base_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"Perception-Memory role {role} requires an HTTP base_url")
+        model = str(raw["model"] or "").strip()
+        if not model:
+            raise ValueError(f"Perception-Memory role {role} model cannot be empty")
+        artifact = str(raw["artifact_sha256"] or "").strip().lower()
+        if len(artifact) != 64 or any(
+            character not in "0123456789abcdef" for character in artifact
+        ):
+            raise ValueError(
+                f"Perception-Memory role {role} artifact_sha256 must be a SHA-256"
+            )
+        validated[role] = {
+            "base_url": base_url,
+            "model": model,
+            "artifact_sha256": artifact,
+        }
+    return validated
 
 
 def _clean_text(value: Any, field_name: str) -> str:
@@ -357,8 +461,9 @@ def _controller_retry_feedback(
     return (
         f"{detail} Retry without prose or markdown. {stop_action}return exactly one "
         "official EVA <tool_call> JSON object whose tool is frame_select. Its "
-        "arguments must contain numeric start_time, end_time, and resize; a short "
-        "evidence_request; and exactly one numeric nframes or fps. Choose the "
+        "arguments must contain numeric start_time and end_time; resize exactly "
+        "0.75; a short evidence_request without quotation marks; and nframes equal "
+        "to one of 8, 16, 32, 64, or 128. Choose the "
         "interval from the question and current evidence gap; do not copy an "
         "illustrative interval."
     )
@@ -376,6 +481,26 @@ def _controller_tool_call(request: FrameRequest) -> str:
         )
         + "</tool_call>"
     )
+
+
+def controller_structured_outputs(*, allow_stop: bool) -> dict[str, Any]:
+    """Constrain vLLM to one canonical official EVA action surface form."""
+
+    number = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
+    tool_call = (
+        r'<tool_call>\{"arguments":\{"end_time":'
+        + number
+        + r',"evidence_request":"[^"\\]{1,160}","nframes":'
+        + r'(?:8|16|32|64|128),"resize":0\.75,"start_time":'
+        + number
+        + r'\},"tool":"frame_select"\}</tool_call>'
+    )
+    regex = (
+        rf'(?:{tool_call}|\{{"action":"stop"\}})'
+        if allow_stop
+        else tool_call
+    )
+    return {"regex": regex}
 
 
 def _messages_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
@@ -1044,9 +1169,12 @@ def _controller_reference_request(
         if duplicate_interval(interval, memory.observed_intervals):
             continue
         span = end - start
-        nframes = min(64, max(8, int(math.ceil(span * 2.0))))
+        desired_frames = min(64, max(8, int(math.ceil(span * 2.0))))
         if explicit is None or interval != candidates[0][:2]:
-            nframes = min(nframes, 32)
+            desired_frames = min(desired_frames, 32)
+        nframes = next(
+            count for count in _CONTROLLER_FRAME_COUNTS if count >= desired_frames
+        )
         return FrameRequest(
             start_time=round(start, 3),
             end_time=round(end, 3),
@@ -1102,8 +1230,9 @@ def build_controller_messages(
         "You cannot see images. Never infer an action that is absent from the ledger. "
         "To observe, output only one official EVA <tool_call> JSON object whose tool "
         "is frame_select. Its arguments must contain numeric start_time, end_time, "
-        "and resize; a precise evidence_request; and exactly one numeric nframes or "
-        "fps. The user message contains one currently valid, public-input-only "
+        "resize exactly 0.75, a precise evidence_request without quotation marks, "
+        "and nframes equal to one of 8, 16, 32, 64, or 128. Do not output fps. The "
+        "user message contains one currently valid, public-input-only "
         "reference action. Copy its wrapper and JSON key structure exactly; use the "
         "reference action itself when it addresses the missing evidence, otherwise "
         "change only its argument values. "
@@ -1402,8 +1531,9 @@ def build_confirmation_controller_messages(
                 "interval that can distinguish them. Re-observing a prior area is allowed "
                 "only with denser frames or wider before/after context. Return only one "
                 "official EVA frame_select tool call with start_time, end_time, exactly one "
-                "of nframes or fps, resize, and a symmetric evidence_request that tests "
-                "both hypotheses. Copy the reference wrapper and JSON key structure "
+                "nframes value from 8, 16, 32, 64, or 128, resize exactly 0.75, and "
+                "a symmetric evidence_request that tests both hypotheses. Copy the "
+                "reference wrapper and JSON key structure "
                 "exactly; never return bare JSON, args, markdown, or prose."
             ),
         },
@@ -1585,6 +1715,8 @@ class PerceptionMemoryEvaEvaluator:
         seed: int = 42,
         candidate_results_sha256: str | None = None,
         model_artifact_sha256: str | None = None,
+        role_bindings: Mapping[str, PerceptionMemoryRoleBinding] | None = None,
+        role_config_sha256: str | None = None,
         manifest_sha256: str | None = None,
         experiment_config_sha256: str | None = None,
         diagnostics_gate_sha256: str | None = None,
@@ -1620,10 +1752,51 @@ class PerceptionMemoryEvaEvaluator:
             raise ValueError("context_safety_tokens must be a non-negative integer")
         if context_safety_tokens >= server_max_model_len:
             raise ValueError("context_safety_tokens must be below server_max_model_len")
+        if role_bindings is None:
+            if role_config_sha256 is not None:
+                raise ValueError("role_config_sha256 requires explicit role_bindings")
+            default_binding = PerceptionMemoryRoleBinding(
+                client=client,
+                model=model,
+                artifact_sha256=model_artifact_sha256,
+            )
+            resolved_role_bindings = {
+                role: default_binding for role in PERCEPTION_MEMORY_ROLE_NAMES
+            }
+        else:
+            if set(role_bindings) != set(PERCEPTION_MEMORY_ROLE_NAMES):
+                raise ValueError(
+                    "role_bindings must contain exactly planner, observer, verifier, "
+                    "and answerer"
+                )
+            if role_config_sha256 is None or len(role_config_sha256) != 64 or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in role_config_sha256
+            ):
+                raise ValueError(
+                    "explicit role_bindings require a 64-character role_config_sha256"
+                )
+            resolved_role_bindings = {}
+            for role in PERCEPTION_MEMORY_ROLE_NAMES:
+                binding = role_bindings[role]
+                if not isinstance(binding, PerceptionMemoryRoleBinding):
+                    raise ValueError(
+                        f"role_bindings.{role} must be PerceptionMemoryRoleBinding"
+                    )
+                if binding.artifact_sha256 is None:
+                    raise ValueError(
+                        f"role_bindings.{role} requires artifact_sha256"
+                    )
+                resolved_role_bindings[role] = binding
         self.client = client
+        self.role_bindings = resolved_role_bindings
+        self.role_config_sha256 = (
+            role_config_sha256.lower() if role_config_sha256 is not None else None
+        )
+        observer_client = self.role_bindings["observer"].client
         self.local_media_transport = (
             "path"
-            if bool(getattr(client, "local_file_urls_as_paths", False))
+            if bool(getattr(observer_client, "local_file_urls_as_paths", False))
             else "file_url"
         )
         self.model = model
@@ -1704,7 +1877,19 @@ class PerceptionMemoryEvaEvaluator:
             "agent_version": self.version,
             "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
             "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
+            "controller_output_constraint_version": (
+                CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+            ),
             "model": self.model,
+            "role_config_sha256": self.role_config_sha256,
+            "role_models": {
+                role: self.role_bindings[role].model
+                for role in PERCEPTION_MEMORY_ROLE_NAMES
+            },
+            "role_artifact_sha256s": {
+                role: self.role_bindings[role].artifact_sha256
+                for role in PERCEPTION_MEMORY_ROLE_NAMES
+            },
             "implementation_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
             "implementation_bundle_sha256": implementation_bundle_sha256,
             "frame_tool_identity": copy.deepcopy(selector),
@@ -1757,14 +1942,15 @@ class PerceptionMemoryEvaEvaluator:
         seed_offset: int,
         json_mode: bool,
         response_format: dict[str, Any] | None = None,
+        structured_outputs: dict[str, Any] | None = None,
         step_index: int | None = None,
         prefix_index: int | None = None,
     ) -> str:
         assert_annotation_free_request({"messages": messages})
-        if stage in {"controller", "confirmation_controller"} and messages_have_media(
-            messages
-        ):
-            raise AssertionError("controller request contains media")
+        role_name = perception_memory_role_for_stage(stage)
+        role_binding = self.role_bindings[role_name]
+        if role_name != "observer" and messages_have_media(messages):
+            raise AssertionError(f"{role_name} request contains media")
         prompt_hash = hashlib.sha256(
             json.dumps(
                 messages,
@@ -1779,20 +1965,30 @@ class PerceptionMemoryEvaEvaluator:
             if response_format is not None
             else ({"type": "json_object"} if json_mode else None)
         )
-        result = self.client.chat(
-            self.model,
+        effective_structured_outputs = (
+            copy.deepcopy(structured_outputs)
+            if structured_outputs is not None
+            else None
+        )
+        extra_body: dict[str, Any] = {"return_token_ids": True}
+        if effective_structured_outputs is not None:
+            extra_body["structured_outputs"] = effective_structured_outputs
+        result = role_binding.client.chat(
+            role_binding.model,
             messages,
             max_tokens=max_tokens,
             temperature=0.0,
             seed=self.seed + seed_offset,
             response_format=effective_response_format,
             chat_template_kwargs={"enable_thinking": False},
-            extra_body={"return_token_ids": True},
+            extra_body=extra_body,
         )
         trace.append(
             {
                 "stage": stage,
-                "model": self.model,
+                "role_name": role_name,
+                "model": role_binding.model,
+                "model_artifact_sha256": role_binding.artifact_sha256,
                 "messages": copy.deepcopy(messages),
                 "content": result.content,
                 "reasoning_content": result.reasoning_content,
@@ -1804,6 +2000,7 @@ class PerceptionMemoryEvaEvaluator:
                 "prefix_index": prefix_index,
                 "prompt_hash": prompt_hash,
                 "response_format": copy.deepcopy(effective_response_format),
+                "structured_outputs": copy.deepcopy(effective_structured_outputs),
             }
         )
         if result.finish_reason == "length":
@@ -1892,10 +2089,16 @@ class PerceptionMemoryEvaEvaluator:
                 raise
             except Exception as exc:
                 if len(trace) == trace_length:
+                    role_name = perception_memory_role_for_stage(stage)
+                    role_binding = self.role_bindings[role_name]
                     trace.append(
                         {
                             "stage": stage,
-                            "model": self.model,
+                            "role_name": role_name,
+                            "model": role_binding.model,
+                            "model_artifact_sha256": (
+                                role_binding.artifact_sha256
+                            ),
                             "messages": copy.deepcopy(attempt_messages),
                             "content": "",
                             "reasoning_content": "",
@@ -2115,7 +2318,11 @@ class PerceptionMemoryEvaEvaluator:
                     request_trace.append(
                         {
                             "stage": "controller",
-                            "model": self.model,
+                            "role_name": "planner",
+                            "model": self.role_bindings["planner"].model,
+                            "model_artifact_sha256": self.role_bindings[
+                                "planner"
+                            ].artifact_sha256,
                             "messages": copy.deepcopy(controller_messages),
                             "content": controller_text,
                             "reasoning_content": "",
@@ -2157,6 +2364,9 @@ class PerceptionMemoryEvaEvaluator:
                             max_tokens=self.controller_max_tokens,
                             seed_offset=evidence_steps * 10,
                             json_mode=False,
+                            structured_outputs=controller_structured_outputs(
+                                allow_stop=True
+                            ),
                             step_index=evidence_steps,
                             prefix_index=len(perception_states) - 1,
                         )
@@ -2461,6 +2671,9 @@ class PerceptionMemoryEvaEvaluator:
                                 max_tokens=self.controller_max_tokens,
                                 seed_offset=2001,
                                 json_mode=False,
+                                structured_outputs=controller_structured_outputs(
+                                    allow_stop=False
+                                ),
                                 step_index=len(perception_states),
                                 prefix_index=len(perception_states) - 1,
                             )
@@ -2765,6 +2978,7 @@ class PerceptionMemoryEvaEvaluator:
 
 
 __all__ = [
+    "CONTROLLER_OUTPUT_CONSTRAINT_VERSION",
     "CompletenessDecision",
     "ControllerAction",
     "DURATION_RESCUE_TRAJECTORY_VARIANTS",
@@ -2773,8 +2987,10 @@ __all__ = [
     "FinalDecision",
     "OptionLedger",
     "OptionObservation",
+    "PERCEPTION_MEMORY_ROLE_NAMES",
     "PerceptionMemoryEvaEvaluator",
     "PerceptionModelFailure",
+    "PerceptionMemoryRoleBinding",
     "PerceptionState",
     "PERCEPTION_NORMALIZATION_VERSION",
     "PERCEPTION_RESPONSE_SCHEMA_VERSION",
@@ -2789,6 +3005,7 @@ __all__ = [
     "build_judge_messages",
     "build_perception_messages",
     "build_perception_retry_messages",
+    "controller_structured_outputs",
     "duplicate_interval",
     "explicit_time_rescue_request",
     "interval_iou",
@@ -2798,8 +3015,10 @@ __all__ = [
     "parse_evidence_decision",
     "parse_perception_state",
     "perception_model_target",
+    "perception_memory_role_for_stage",
     "perception_response_format",
     "normalize_perception_state",
     "rescue_frame_request",
     "validate_perception_state_observation",
+    "validate_perception_memory_role_config",
 ]

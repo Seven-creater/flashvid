@@ -58,6 +58,75 @@ def test_commands_preserve_frozen_judges_and_selection_gate(tmp_path: Path) -> N
     assert build[build.index("--minimum-candidate-fixes-per-dataset") + 1] == "20"
 
 
+def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+
+def test_repair_partition_accepts_audited_exclusions_and_rejects_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(autopilot, "EXPECTED_REPAIR_ROWS", 3)
+    repair = tmp_path / "repair"
+    scope_path = repair / "repair_scope/frozen_scope.json"
+    scope_path.parent.mkdir(parents=True)
+    scope_path.write_text(
+        json.dumps(
+            {
+                "base_success_ids": ["t1", "t2"],
+                "base_failure_ids": ["t3"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    success_path = repair / "merged/merged_success.jsonl"
+    failure_path = repair / "merged/double_failures.jsonl"
+    _write_jsonl(
+        success_path,
+        [{"source_trajectory_id": "t1"}, {"source_trajectory_id": "t2"}],
+    )
+    _write_jsonl(failure_path, [{"source_trajectory_id": "t3"}])
+    success_record = autopilot._jsonl_record(success_path)
+    failure_record = autopilot._jsonl_record(failure_path)
+    summary_path = repair / "merged/merge_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "status": "completed_with_failures",
+                "source_rows": 3,
+                "merged_success": 2,
+                "double_failures": 1,
+                "double_failure_ids": ["t3"],
+                "frozen_scope_sha256": autopilot._file_sha256(scope_path),
+                "prefix_bind_passed": True,
+                "artifacts": {
+                    "merged_success.jsonl": {
+                        "rows": 2,
+                        "sha256": success_record["sha256"],
+                    },
+                    "double_failures.jsonl": {
+                        "rows": 1,
+                        "sha256": failure_record["sha256"],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    success, audit = autopilot._audit_repair_partition(repair)
+    assert success == success_path
+    assert audit["merged_success"]["rows"] == 2
+    assert audit["excluded_double_failures"]["rows"] == 1
+    assert audit["partition_complete"] is True
+
+    _write_jsonl(failure_path, [{"source_trajectory_id": "t2"}])
+    with pytest.raises(RuntimeError, match="partitions overlap"):
+        autopilot._audit_repair_partition(repair)
+
+
 def test_training_smoke_is_bound_and_first_formal_run_is_not_resume(
     tmp_path: Path,
 ) -> None:
@@ -200,6 +269,9 @@ def test_successful_pipeline_is_resumable_without_reissuing_commands(
     repair_audit = {
         "repair_status": {"path": "status.json", "sha256": "c" * 64},
         "merged": autopilot._jsonl_record(merged),
+        "repair_partition": {
+            "excluded_double_failures": {"rows": 0, "sha256": "e" * 64}
+        },
         "merge_summary_sha256": "d" * 64,
     }
     monkeypatch.setattr(

@@ -392,6 +392,93 @@ def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
     }
 
 
+def _unique_trajectory_ids(
+    rows: Sequence[Mapping[str, Any]], *, label: str
+) -> set[str]:
+    values = [str(row.get("source_trajectory_id") or "").strip() for row in rows]
+    if any(not value for value in values):
+        raise RuntimeError(f"{label} contains an empty source_trajectory_id")
+    if len(values) != len(set(values)):
+        raise RuntimeError(f"{label} contains duplicate source_trajectory_id values")
+    return set(values)
+
+
+def _audit_repair_partition(repair_run_root: Path) -> tuple[Path, dict[str, Any]]:
+    merged_dir = repair_run_root / "merged"
+    success_path = merged_dir / "merged_success.jsonl"
+    failure_path = merged_dir / "double_failures.jsonl"
+    summary_path = merged_dir / "merge_summary.json"
+    scope_path = repair_run_root / "repair_scope/frozen_scope.json"
+    summary = _read_json(summary_path)
+    scope = _read_json(scope_path)
+    successes = read_jsonl(success_path)
+    failures = read_jsonl(failure_path)
+    success_ids = _unique_trajectory_ids(successes, label="merged success")
+    failure_ids = _unique_trajectory_ids(failures, label="double failures")
+    if success_ids & failure_ids:
+        raise RuntimeError("repair success/failure partitions overlap")
+
+    frozen_success = scope.get("base_success_ids")
+    frozen_failure = scope.get("base_failure_ids")
+    if not isinstance(frozen_success, list) or not isinstance(frozen_failure, list):
+        raise RuntimeError("frozen repair scope has no complete trajectory ID lists")
+    frozen_values = [str(value).strip() for value in [*frozen_success, *frozen_failure]]
+    if any(not value for value in frozen_values) or len(frozen_values) != len(
+        set(frozen_values)
+    ):
+        raise RuntimeError("frozen repair scope contains empty or duplicate IDs")
+    frozen_ids = set(frozen_values)
+    if len(frozen_ids) != EXPECTED_REPAIR_ROWS:
+        raise RuntimeError("frozen repair scope is not the registered 2917 rows")
+    if success_ids | failure_ids != frozen_ids:
+        raise RuntimeError("repair partitions do not exactly cover the frozen scope")
+
+    success_record = _jsonl_record(success_path)
+    failure_record = _jsonl_record(failure_path)
+    artifacts = summary.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise RuntimeError("repair merge summary has no artifact records")
+    for name, record in (
+        ("merged_success.jsonl", success_record),
+        ("double_failures.jsonl", failure_record),
+    ):
+        expected = artifacts.get(name)
+        if not isinstance(expected, Mapping) or expected.get("rows") != record["rows"]:
+            raise RuntimeError(f"repair merge summary row count changed: {name}")
+        if expected.get("sha256") != record["sha256"]:
+            raise RuntimeError(f"repair merge summary SHA-256 changed: {name}")
+    scope_sha256 = _file_sha256(scope_path)
+    if summary.get("frozen_scope_sha256") != scope_sha256:
+        raise RuntimeError("repair merge is bound to a different frozen scope")
+    if summary.get("prefix_bind_passed") is not True:
+        raise RuntimeError("repair success partition did not pass prefix binding")
+    if summary.get("status") not in {"passed", "completed_with_failures"}:
+        raise RuntimeError("repair merge has an unsupported status")
+    if (
+        summary.get("source_rows") != EXPECTED_REPAIR_ROWS
+        or summary.get("merged_success") != success_record["rows"]
+        or summary.get("double_failures") != failure_record["rows"]
+        or success_record["rows"] + failure_record["rows"] != EXPECTED_REPAIR_ROWS
+    ):
+        raise RuntimeError("repair merge summary does not match the complete partition")
+    if set(summary.get("double_failure_ids") or []) != failure_ids:
+        raise RuntimeError("repair merge summary double-failure IDs changed")
+
+    return success_path, {
+        "merged_success": success_record,
+        "excluded_double_failures": failure_record,
+        "excluded_trajectory_ids_sha256": _canonical_sha256(sorted(failure_ids)),
+        "frozen_scope": {
+            "path": str(scope_path.resolve()),
+            "rows": len(frozen_ids),
+            "sha256": scope_sha256,
+        },
+        "partition_complete": True,
+        "partition_disjoint": True,
+        "prefix_bind_passed": True,
+    }
+
+
 def _wait_for_repair(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     status_path = args.repair_run_root / "status.json"
     deadline = time.monotonic() + args.wait_timeout
@@ -405,14 +492,8 @@ def _wait_for_repair(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
         if time.monotonic() >= deadline:
             raise TimeoutError("repair pipeline did not complete before the timeout")
         time.sleep(args.poll_seconds)
-    merged_dir = args.repair_run_root / "merged"
-    merged = merged_dir / "merged_success.jsonl"
-    summary = _read_json(merged_dir / "merge_summary.json")
-    if summary.get("status") != "passed" or summary.get("double_failures") != 0:
-        raise RuntimeError("repair merge contains unresolved failures")
-    record = _jsonl_record(merged)
-    if record["rows"] != EXPECTED_REPAIR_ROWS:
-        raise RuntimeError("repair merge is not the complete 2917-row scope")
+    merged, partition = _audit_repair_partition(args.repair_run_root)
+    record = partition["merged_success"]
     expected_sha = ((status.get("stages") or {}).get("merge") or {}).get(
         "merged_success_sha256"
     )
@@ -421,7 +502,10 @@ def _wait_for_repair(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
     return merged, {
         "repair_status": {"path": str(status_path.resolve()), "sha256": _file_sha256(status_path)},
         "merged": record,
-        "merge_summary_sha256": _file_sha256(merged_dir / "merge_summary.json"),
+        "repair_partition": partition,
+        "merge_summary_sha256": _file_sha256(
+            args.repair_run_root / "merged/merge_summary.json"
+        ),
     }
 
 
@@ -513,8 +597,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             _save_state(status_path, state)
         else:
             merged, audit = _wait_for_repair(args)
-            if audit["merged"]["sha256"] != state["stages"]["wait_repair"]["merged"]["sha256"]:
-                raise RuntimeError("passed repair artifact changed")
+            frozen_audit = state["stages"]["wait_repair"]
+            if (
+                audit["merged"]["sha256"] != frozen_audit["merged"]["sha256"]
+                or audit["repair_partition"]
+                != frozen_audit.get("repair_partition")
+            ):
+                raise RuntimeError("passed repair partition changed")
 
         judgments = args.run_root / "prefix_judgments.jsonl"
         progress = judgments.with_suffix(judgments.suffix + ".progress.jsonl")

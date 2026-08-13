@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
@@ -16,6 +17,7 @@ TEST_FLOORS = {"lvbench": 45, "lsdbench": 63, "cgbench": 43}
 DEV_SEEDS = frozenset({17, 42, 73})
 TEST_SEEDS = frozenset({42})
 _MODEL_ARTIFACT_FIELD = "model_artifact_sha256"
+_ROLE_NAMES = ("planner", "observer", "verifier", "answerer")
 _RUNTIME_FIELDS = (
     "backend",
     "agent_version",
@@ -31,6 +33,13 @@ _RUNTIME_FIELDS = (
     "controller_max_tokens",
     "perception_max_tokens",
     "judge_max_tokens",
+    "role_config_sha256",
+    "role_separated_runtime_version",
+    "role_prompt_schema_bundle_sha256",
+)
+_SPLIT_SOURCE_FIELDS = ("manifest_sha256", "candidate_results_sha256")
+_STABLE_RUNTIME_FIELDS = tuple(
+    field for field in _RUNTIME_FIELDS if field not in _SPLIT_SOURCE_FIELDS
 )
 
 
@@ -74,6 +83,45 @@ def _validated_manifest_sha256(
         )
         for dataset in DATASETS
     }
+
+
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_role_audit_fields(
+    row: Mapping[str, Any], identity: tuple[str, str]
+) -> None:
+    if row.get("role_separated_runtime_version") != "role_separated_visual_csv_v1":
+        raise PerceptionMemoryGateError(
+            f"{identity}: role-separated runtime version changed"
+        )
+    _validated_sha256(
+        row.get("role_prompt_schema_bundle_sha256"),
+        f"{identity}: role_prompt_schema_bundle_sha256",
+    )
+    models = row.get("role_models")
+    artifacts = row.get("role_artifact_sha256s")
+    if not isinstance(models, Mapping) or set(models) != set(_ROLE_NAMES):
+        raise PerceptionMemoryGateError(f"{identity}: invalid role_models")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(_ROLE_NAMES):
+        raise PerceptionMemoryGateError(
+            f"{identity}: invalid role_artifact_sha256s"
+        )
+    for role in _ROLE_NAMES:
+        if not str(models[role] or "").strip():
+            raise PerceptionMemoryGateError(
+                f"{identity}: role_models.{role} must be non-empty"
+            )
+        _validated_sha256(
+            artifacts[role], f"{identity}: role_artifact_sha256s.{role}"
+        )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -227,6 +275,7 @@ def _load_seed_run(
                     raise PerceptionMemoryGateError(
                         f"{identity}: missing runtime audit field {field}"
                     )
+            _validate_role_audit_fields(row, identity)
             if row.get("manifest_sha256") != expected_manifest_sha256[dataset]:
                 raise PerceptionMemoryGateError(
                     f"{identity}: manifest SHA-256 does not match frozen config"
@@ -255,6 +304,8 @@ def _audit_scope(
     reference: Mapping[tuple[str, str], Mapping[str, Any]],
     other: Mapping[tuple[str, str], Mapping[str, Any]],
     label: str,
+    *,
+    allow_planner_treatment: bool = False,
 ) -> None:
     if set(other) != set(reference):
         missing = sorted(set(reference) - set(other))
@@ -268,7 +319,17 @@ def _audit_scope(
         ):
             raise PerceptionMemoryGateError(f"{label}: answer mismatch at {identity}")
         for field in _RUNTIME_FIELDS:
+            if field == "role_config_sha256" and allow_planner_treatment:
+                continue
             if other[identity].get(field) != reference[identity].get(field):
+                raise PerceptionMemoryGateError(
+                    f"{label}: runtime field mismatch at {identity}: {field}"
+                )
+        for field in ("role_models", "role_artifact_sha256s"):
+            current = other[identity][field]
+            baseline = reference[identity][field]
+            roles = ("observer", "verifier", "answerer") if allow_planner_treatment else _ROLE_NAMES
+            if any(current[role] != baseline[role] for role in roles):
                 raise PerceptionMemoryGateError(
                     f"{label}: runtime field mismatch at {identity}: {field}"
                 )
@@ -388,6 +449,55 @@ def _require_valid_baseline(report: Mapping[str, Any]) -> None:
         raise PerceptionMemoryGateError("untrained baseline reran frozen candidates")
 
 
+def _method_runtime_binding(
+    method_id: str,
+    rows_by_seed: Mapping[int, Mapping[tuple[str, str], Mapping[str, Any]]],
+) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
+    runtime_identity: dict[str, Any] | None = None
+    split_sources: dict[str, dict[str, str]] = {}
+    for seed in sorted(rows_by_seed):
+        for identity in sorted(rows_by_seed[seed]):
+            row = rows_by_seed[seed][identity]
+            current_identity = {
+                field: deepcopy(row[field]) for field in _STABLE_RUNTIME_FIELDS
+            }
+            current_identity.update(
+                {
+                    _MODEL_ARTIFACT_FIELD: row[_MODEL_ARTIFACT_FIELD],
+                    "role_models": deepcopy(row["role_models"]),
+                    "role_artifact_sha256s": deepcopy(
+                        row["role_artifact_sha256s"]
+                    ),
+                }
+            )
+            if runtime_identity is None:
+                runtime_identity = current_identity
+            elif current_identity != runtime_identity:
+                raise PerceptionMemoryGateError(
+                    f"{method_id}: runtime identity changed within method at "
+                    f"seed{seed}/{identity}"
+                )
+            dataset = identity[0]
+            current_sources = {
+                field: _validated_sha256(
+                    row[field], f"{method_id}/seed{seed}/{identity}: {field}"
+                )
+                for field in _SPLIT_SOURCE_FIELDS
+            }
+            previous_sources = split_sources.setdefault(dataset, current_sources)
+            if current_sources != previous_sources:
+                raise PerceptionMemoryGateError(
+                    f"{method_id}: split source changed within {dataset}"
+                )
+    if runtime_identity is None:
+        raise PerceptionMemoryGateError(f"{method_id}: no result rows")
+    if set(split_sources) != set(DATASETS):
+        raise PerceptionMemoryGateError(
+            f"{method_id}: split sources must cover all datasets"
+        )
+    return runtime_identity, split_sources
+
+
 def _load_method(
     method: MethodRuns,
     expected_counts: Mapping[str, int],
@@ -426,9 +536,16 @@ def _load_method(
             f"found {sorted(model_artifacts)}"
         )
     model_artifact_sha256 = next(iter(model_artifacts))
+    runtime_identity, split_sources = _method_runtime_binding(
+        method.method_id,
+        rows_by_seed,
+    )
     return rows_by_seed, {
         "method_id": method.method_id,
         "model_artifact_sha256": model_artifact_sha256,
+        "runtime_identity": runtime_identity,
+        "runtime_identity_sha256": _canonical_sha256(runtime_identity),
+        "split_sources": split_sources,
         "summary": _method_summary(list(seed_reports.values())),
         "seeds": seed_reports,
     }, files
@@ -442,7 +559,23 @@ def _audit_methods(
     if set(candidate_rows) != set(baseline_rows):
         raise PerceptionMemoryGateError(f"{label}: seed scope mismatch")
     for seed in baseline_rows:
-        _audit_scope(baseline_rows[seed], candidate_rows[seed], f"{label}/seed{seed}")
+        baseline_seed = baseline_rows[seed]
+        candidate_seed = candidate_rows[seed]
+        _audit_scope(
+            baseline_seed,
+            candidate_seed,
+            f"{label}/seed{seed}",
+            allow_planner_treatment=True,
+        )
+        for identity in baseline_seed:
+            baseline_roles = baseline_seed[identity]["role_artifact_sha256s"]
+            candidate_roles = candidate_seed[identity]["role_artifact_sha256s"]
+            for role in ("observer", "verifier", "answerer"):
+                if candidate_roles[role] != baseline_roles[role]:
+                    raise PerceptionMemoryGateError(
+                        f"{label}/seed{seed}: frozen {role} artifact changed at "
+                        f"{identity}"
+                    )
 
 
 def _paired_costs(
@@ -515,6 +648,9 @@ def _dev_point(
     return {
         "method_id": candidate["method_id"],
         "model_artifact_sha256": candidate["model_artifact_sha256"],
+        "runtime_identity": deepcopy(candidate["runtime_identity"]),
+        "runtime_identity_sha256": candidate["runtime_identity_sha256"],
+        "split_sources": deepcopy(candidate["split_sources"]),
         "summary": current,
         "dataset_deltas": dataset_deltas,
         "total_token_ratio": total_ratio,
@@ -650,6 +786,7 @@ def evaluate_test_gate(
         raise PerceptionMemoryGateError(
             "Dev gate report must contain one passed selected method"
         )
+    selected_entry = selected_entries[0]
     dev_baseline = dev_report.get("baseline")
     if not isinstance(dev_baseline, Mapping) or dev_baseline.get("method_id") != baseline.method_id:
         raise PerceptionMemoryGateError(
@@ -668,12 +805,37 @@ def evaluate_test_gate(
         raise PerceptionMemoryGateError(
             "Test baseline model artifact does not match the Dev gate report"
         )
-    if selected_entries[0].get("model_artifact_sha256") != candidate_report.get(
+    if selected_entry.get("model_artifact_sha256") != candidate_report.get(
         "model_artifact_sha256"
     ):
         raise PerceptionMemoryGateError(
             "Test candidate model artifact does not match the Dev gate selection"
         )
+    for label, dev_method, test_method in (
+        ("baseline", dev_baseline, baseline_report),
+        ("candidate", selected_entry, candidate_report),
+    ):
+        runtime_identity = dev_method.get("runtime_identity")
+        runtime_identity_sha256 = dev_method.get("runtime_identity_sha256")
+        if not isinstance(runtime_identity, Mapping):
+            raise PerceptionMemoryGateError(
+                f"Dev gate report is missing {label} runtime identity"
+            )
+        if _canonical_sha256(runtime_identity) != _validated_sha256(
+            runtime_identity_sha256,
+            f"Dev gate {label} runtime_identity_sha256",
+        ):
+            raise PerceptionMemoryGateError(
+                f"Dev gate {label} runtime identity hash is invalid"
+            )
+        if (
+            dict(runtime_identity) != test_method.get("runtime_identity")
+            or runtime_identity_sha256
+            != test_method.get("runtime_identity_sha256")
+        ):
+            raise PerceptionMemoryGateError(
+                f"Test {label} runtime identity does not match the Dev gate report"
+            )
     _audit_methods(baseline_rows, candidate_rows, candidate.method_id)
     base = baseline_report["summary"]
     current = candidate_report["summary"]

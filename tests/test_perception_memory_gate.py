@@ -21,6 +21,23 @@ EXPECTED_MANIFESTS = {
     dataset: f"{DATASETS.index(dataset) + 2}" * 64 for dataset in DATASETS
 }
 DEV_SEEDS = (17, 42, 73)
+_STABLE_RUNTIME_FIELDS = (
+    "backend",
+    "agent_version",
+    "implementation_sha256",
+    "implementation_bundle_sha256",
+    "frame_tool_identity",
+    "experiment_config_sha256",
+    "diagnostics_gate_sha256",
+    "max_turns",
+    "max_frames_per_call",
+    "controller_max_tokens",
+    "perception_max_tokens",
+    "judge_max_tokens",
+    "role_config_sha256",
+    "role_separated_runtime_version",
+    "role_prompt_schema_bundle_sha256",
+)
 
 
 def _artifact(method_id: str) -> str:
@@ -60,6 +77,21 @@ def _row(
         "experiment_config_sha256": "8" * 64,
         "diagnostics_gate_sha256": "9" * 64,
         "model_artifact_sha256": model_artifact_sha256,
+        "role_config_sha256": "f" * 64,
+        "role_separated_runtime_version": "role_separated_visual_csv_v1",
+        "role_prompt_schema_bundle_sha256": "b" * 64,
+        "role_models": {
+            "planner": "Qwen3.5-9B-Planner",
+            "observer": "Qwen3.5-9B",
+            "verifier": "Qwen3.5-9B",
+            "answerer": "Qwen3.5-9B",
+        },
+        "role_artifact_sha256s": {
+            "planner": model_artifact_sha256,
+            "observer": "c" * 64,
+            "verifier": "d" * 64,
+            "answerer": "e" * 64,
+        },
         "max_turns": 6,
         "max_frames_per_call": 128,
         "controller_max_tokens": 512,
@@ -142,6 +174,46 @@ def _write_dev_gate_report(
     baseline: MethodRuns,
     candidate: MethodRuns,
 ) -> tuple[Path, str]:
+    def binding(method: MethodRuns) -> tuple[dict, dict]:
+        first_run = method.runs[0]
+        rows_by_dataset = {
+            dataset: [
+                json.loads(line)
+                for line in first_run.result_paths[dataset].read_text().splitlines()
+            ]
+            for dataset in DATASETS
+        }
+        row = rows_by_dataset[DATASETS[0]][0]
+        identity = {field: row[field] for field in _STABLE_RUNTIME_FIELDS}
+        identity.update(
+            {
+                "model_artifact_sha256": row["model_artifact_sha256"],
+                "role_models": row["role_models"],
+                "role_artifact_sha256s": row["role_artifact_sha256s"],
+            }
+        )
+        identity_sha256 = hashlib.sha256(
+            json.dumps(
+                identity, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        split_sources = {
+            dataset: {
+                "manifest_sha256": rows[0]["manifest_sha256"],
+                "candidate_results_sha256": rows[0][
+                    "candidate_results_sha256"
+                ],
+            }
+            for dataset, rows in rows_by_dataset.items()
+        }
+        return {
+            "runtime_identity": identity,
+            "runtime_identity_sha256": identity_sha256,
+            "split_sources": split_sources,
+        }, row
+
+    baseline_binding, baseline_row = binding(baseline)
+    candidate_binding, candidate_row = binding(candidate)
     payload = {
         "schema_version": 1,
         "phase": "dev",
@@ -150,19 +222,35 @@ def _write_dev_gate_report(
         "selected_method_id": candidate.method_id,
         "baseline": {
             "method_id": baseline.method_id,
-            "model_artifact_sha256": _artifact(baseline.method_id),
+            "model_artifact_sha256": baseline_row["model_artifact_sha256"],
+            **baseline_binding,
         },
         "candidates": [
             {
                 "method_id": candidate.method_id,
-                "model_artifact_sha256": _artifact(candidate.method_id),
+                "model_artifact_sha256": candidate_row[
+                    "model_artifact_sha256"
+                ],
                 "passed": True,
+                **candidate_binding,
             }
         ],
     }
     path = tmp_path / "dev_gate_report.json"
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _rewrite_method_rows(method: MethodRuns, update) -> None:
+    for run in method.runs:
+        for path in run.result_paths.values():
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            for row in rows:
+                update(row)
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
 
 
 def test_dev_gate_uses_all_seeds_and_selects_unique_deterministic_winner(
@@ -213,6 +301,11 @@ def test_dev_gate_uses_all_seeds_and_selects_unique_deterministic_winner(
     selected = next(
         item for item in report["candidates"] if item["method_id"] == "checkpoint-2"
     )
+    assert selected["runtime_identity"]["role_models"]["planner"] == (
+        "Qwen3.5-9B-Planner"
+    )
+    assert len(selected["runtime_identity_sha256"]) == 64
+    assert set(selected["split_sources"]) == set(DATASETS)
     assert selected["total_token_ratio"] == pytest.approx(0.6)
     assert selected["visual_token_ratio"] == pytest.approx(0.5)
     assert all(selected["conditions"].values())
@@ -433,7 +526,108 @@ def test_same_runtime_audit_rejects_changed_runtime_bundle(
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     rows[0][field] = value
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    with pytest.raises(PerceptionMemoryGateError, match="runtime field mismatch"):
+    with pytest.raises(
+        PerceptionMemoryGateError,
+        match="runtime field mismatch|role-separated runtime version changed",
+    ):
+        evaluate_dev_gate(
+            baseline=baseline,
+            candidates=[candidate],
+            expected_manifest_sha256=EXPECTED_MANIFESTS,
+            expected_counts=counts,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("role_separated_runtime_version", "different-role-runtime"),
+        ("role_prompt_schema_bundle_sha256", "f" * 64),
+    ],
+)
+def test_gate_rejects_role_runtime_or_prompt_schema_drift(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    counts = {dataset: 2 for dataset in DATASETS}
+    baseline = _write_method(
+        tmp_path,
+        "untrained",
+        DEV_SEEDS,
+        counts,
+        {dataset: 1 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+        incomplete_stops=3,
+    )
+    candidate = _write_method(
+        tmp_path,
+        "checkpoint",
+        DEV_SEEDS,
+        counts,
+        {dataset: 2 for dataset in DATASETS},
+        total_tokens=60,
+        visual_tokens=40,
+        incomplete_stops=0,
+    )
+    path = candidate.runs[0].result_paths["lvbench"]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0][field] = value
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    with pytest.raises(
+        PerceptionMemoryGateError,
+        match="runtime field mismatch|role-separated runtime version changed",
+    ):
+        evaluate_dev_gate(
+            baseline=baseline,
+            candidates=[candidate],
+            expected_manifest_sha256=EXPECTED_MANIFESTS,
+            expected_counts=counts,
+        )
+
+
+def test_gate_allows_only_planner_artifact_to_change(tmp_path: Path) -> None:
+    counts = {dataset: 2 for dataset in DATASETS}
+    baseline = _write_method(
+        tmp_path,
+        "untrained",
+        DEV_SEEDS,
+        counts,
+        {dataset: 1 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+        incomplete_stops=3,
+    )
+    candidate = _write_method(
+        tmp_path,
+        "checkpoint",
+        DEV_SEEDS,
+        counts,
+        {dataset: 2 for dataset in DATASETS},
+        total_tokens=60,
+        visual_tokens=40,
+        incomplete_stops=0,
+    )
+    for run in candidate.runs:
+        for path in run.result_paths.values():
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            for row in rows:
+                row["role_config_sha256"] = "0" * 64
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+    report = evaluate_dev_gate(
+        baseline=baseline,
+        candidates=[candidate],
+        expected_manifest_sha256=EXPECTED_MANIFESTS,
+        expected_counts=counts,
+    )
+    assert report["passed"] is True
+
+    path = candidate.runs[0].result_paths["cgbench"]
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]["role_artifact_sha256s"]["observer"] = "f" * 64
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    with pytest.raises(PerceptionMemoryGateError, match="role_artifact_sha256s"):
         evaluate_dev_gate(
             baseline=baseline,
             candidates=[candidate],
@@ -482,6 +676,148 @@ def test_final_test_gate_enforces_accuracy_floors_and_30_percent_reduction(
     assert report["total_token_ratio"] == pytest.approx(0.7)
     assert report["visual_token_ratio"] == pytest.approx(0.7)
     assert all(report["conditions"].values())
+
+
+def test_test_gate_allows_split_specific_manifest_and_candidate_source(
+    tmp_path: Path,
+) -> None:
+    dev_root = tmp_path / "dev"
+    test_root = tmp_path / "test"
+    dev_counts = {dataset: 2 for dataset in DATASETS}
+    test_counts = {dataset: 100 for dataset in DATASETS}
+    dev_baseline = _write_method(
+        dev_root,
+        "untrained",
+        DEV_SEEDS,
+        dev_counts,
+        {dataset: 1 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+        incomplete_stops=3,
+    )
+    dev_candidate = _write_method(
+        dev_root,
+        "selected-sft",
+        DEV_SEEDS,
+        dev_counts,
+        {dataset: 2 for dataset in DATASETS},
+        total_tokens=60,
+        visual_tokens=40,
+        incomplete_stops=0,
+    )
+    dev_report, dev_sha256 = _write_dev_gate_report(
+        tmp_path, dev_baseline, dev_candidate
+    )
+    test_baseline = _write_method(
+        test_root,
+        "untrained",
+        (42,),
+        test_counts,
+        {"lvbench": 45, "lsdbench": 63, "cgbench": 43},
+        total_tokens=100,
+        visual_tokens=80,
+        incomplete_stops=20,
+    )
+    test_candidate = _write_method(
+        test_root,
+        "selected-sft",
+        (42,),
+        test_counts,
+        {"lvbench": 47, "lsdbench": 65, "cgbench": 45},
+        total_tokens=70,
+        visual_tokens=56,
+        incomplete_stops=5,
+    )
+    _rewrite_method_rows(
+        test_baseline,
+        lambda row: row.update(
+            manifest_sha256="a" * 64,
+            candidate_results_sha256="0" * 64,
+        ),
+    )
+    _rewrite_method_rows(
+        test_candidate,
+        lambda row: row.update(
+            manifest_sha256="a" * 64,
+            candidate_results_sha256="0" * 64,
+        ),
+    )
+    test_manifests = {dataset: "a" * 64 for dataset in DATASETS}
+
+    report = evaluate_test_gate(
+        baseline=test_baseline,
+        candidate=test_candidate,
+        expected_manifest_sha256=test_manifests,
+        dev_gate_report_path=dev_report,
+        dev_gate_report_sha256=dev_sha256,
+    )
+
+    assert report["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("target", "field"),
+    [
+        ("candidate", "implementation_bundle_sha256"),
+        ("candidate", "role_config_sha256"),
+        ("candidate", "role_prompt_schema_bundle_sha256"),
+        ("candidate", "role_models"),
+        ("candidate", "role_artifact_sha256s"),
+        ("baseline", "implementation_bundle_sha256"),
+    ],
+)
+def test_test_gate_rejects_runtime_identity_drift_from_dev_winner(
+    tmp_path: Path, target: str, field: str
+) -> None:
+    counts = {dataset: 100 for dataset in DATASETS}
+    baseline = _write_method(
+        tmp_path / "test",
+        "untrained",
+        (42,),
+        counts,
+        {dataset: 50 for dataset in DATASETS},
+        total_tokens=100,
+        visual_tokens=80,
+        incomplete_stops=10,
+    )
+    candidate = _write_method(
+        tmp_path / "test",
+        "selected-sft",
+        (42,),
+        counts,
+        {dataset: 52 for dataset in DATASETS},
+        total_tokens=60,
+        visual_tokens=40,
+        incomplete_stops=1,
+    )
+    dev_report, dev_sha256 = _write_dev_gate_report(
+        tmp_path, baseline, candidate
+    )
+    method = candidate if target == "candidate" else baseline
+
+    def drift(row: dict) -> None:
+        if field in {"role_models", "role_artifact_sha256s"}:
+            row[field]["planner"] = (
+                "different-planner"
+                if field == "role_models"
+                else "0" * 64
+            )
+        else:
+            row[field] = "0" * 64
+
+    _rewrite_method_rows(method, drift)
+
+    with pytest.raises(
+        PerceptionMemoryGateError,
+        match=f"Test {target} runtime identity",
+    ):
+        evaluate_test_gate(
+            baseline=baseline,
+            candidate=candidate,
+            expected_manifest_sha256=EXPECTED_MANIFESTS,
+            dev_gate_report_path=dev_report,
+            dev_gate_report_sha256=dev_sha256,
+        )
 
 
 def test_config_interface_produces_machine_readable_dev_report(tmp_path: Path) -> None:
@@ -803,6 +1139,16 @@ def test_test_gate_rejects_model_artifact_not_selected_on_dev(tmp_path: Path) ->
         visual_tokens=80,
         incomplete_stops=10,
     )
+    dev_candidate = _write_method(
+        tmp_path / "dev",
+        "selected-sft",
+        (42,),
+        counts,
+        {dataset: 52 for dataset in DATASETS},
+        total_tokens=60,
+        visual_tokens=40,
+        incomplete_stops=1,
+    )
     candidate = _write_method(
         tmp_path,
         "selected-sft",
@@ -814,7 +1160,9 @@ def test_test_gate_rejects_model_artifact_not_selected_on_dev(tmp_path: Path) ->
         incomplete_stops=1,
         model_artifact_sha256="e" * 64,
     )
-    dev_report, dev_sha256 = _write_dev_gate_report(tmp_path, baseline, candidate)
+    dev_report, dev_sha256 = _write_dev_gate_report(
+        tmp_path, baseline, dev_candidate
+    )
     with pytest.raises(PerceptionMemoryGateError, match="candidate model artifact"):
         evaluate_test_gate(
             baseline=baseline,

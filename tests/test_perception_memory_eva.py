@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ from flashvid_eval.perception_memory_eva import (
     build_cited_judge_messages,
     build_perception_messages,
     build_role_separated_controller_messages,
+    evidence_request_addresses_unresolved,
     build_runtime_visual_csv_messages,
     controller_structured_outputs,
     duplicate_interval,
@@ -63,6 +65,17 @@ def _sample(candidate: str | None = "PRIVATE_CANDIDATE_SENTINEL") -> ModelSample
         choices={"A": "Sits down", "B": "Walks outside"},
         candidate_answer=candidate,
     )
+
+
+def test_evidence_request_must_name_one_unresolved_item() -> None:
+    unresolved = ("what happens after the door opens", "which person returns")
+    assert evidence_request_addresses_unresolved(
+        "Observe what happens after the door opens in the next interval", unresolved
+    )
+    assert not evidence_request_addresses_unresolved(
+        "Inspect more relevant visual evidence", unresolved
+    )
+    assert evidence_request_addresses_unresolved("anything", ())
 
 
 def _role_config_payload() -> dict[str, dict[str, str]]:
@@ -743,7 +756,7 @@ class _FakeSession:
 
     def select(self, request: FrameRequest) -> FrameObservation:
         assert request.evidence_request
-        return self.observation
+        return replace(self.observation, request=request)
 
 
 class _FakeFrameTool:

@@ -434,16 +434,18 @@ def test_replay_prefix_selection_materializes_evidence_answer_and_sft(
     assert selected[0]["retained_visual_tokens"] == 100
     assert selected[0]["retained_tool_steps"] == 2
     records = build_perception_memory_sft_records(selected[0])
-    final_records = [
-        record
-        for record in records
-        if record["metadata"]["episode_target_type"] == "final"
+    assert len(records) == 1
+    assert records[0]["metadata"]["process_role"] == "planner"
+    assert records[0]["metadata"]["assistant_target_types"] == [
+        "tool",
+        "tool",
+        "stop",
     ]
-    assert len(final_records) == 1
-    assert json.loads(final_records[0]["messages"][-1]["content"]) == {
-        "answer": "B",
-        "evidence_ids": ["E0001"],
-    }
+    assert records[0]["messages"][-1]["content"] == '{"action":"stop"}'
+    assert all(
+        target != "final"
+        for target in records[0]["metadata"]["assistant_target_types"]
+    )
 
 
 def test_replay_prefix_selection_rejects_non_unanimous_evidence_answer(

@@ -168,6 +168,11 @@ def test_role_ablation_is_complete_dev_only_and_contains_no_test_manifest() -> N
     assert all(
         run["execution"]["status"] == "waiting_for_frozen_base_inputs"
         and run["execution"]["cli"] == "scripts/run_role_ablation_pair.py"
+        and set(run["execution"]["paired_bindings"]) == {"control", "treatment"}
+        and run["execution"]["paired_bindings"]["control"]
+        == config["role_ablation"]["artifacts"]["base"]
+        and run["execution"]["paired_bindings"]["treatment"]
+        == config["role_ablation"]["artifacts"]["candidate"]
         for run in fixed
     )
     assert all(

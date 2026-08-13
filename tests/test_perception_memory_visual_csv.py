@@ -11,6 +11,7 @@ from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_visual_csv import (
     VisualCsvConfig,
     VisualCsvVerifier,
+    balance_visual_csv_selection,
     attach_visual_csv_results,
     bind_visual_csv_jobs,
     build_visual_csv_messages,
@@ -20,6 +21,13 @@ from flashvid_eval.perception_memory_visual_csv import (
 )
 from scripts import judge_perception_memory_visual_csv as visual_csv_cli
 from scripts import select_perception_memory_visual_csv_trajectories as selector_cli
+
+
+VERIFIER_SHA = "a" * 64
+
+
+def _visual_config(**overrides: object) -> VisualCsvConfig:
+    return VisualCsvConfig(verifier_artifact_sha256=VERIFIER_SHA, **overrides)
 
 
 def _response(
@@ -57,6 +65,10 @@ class _Client:
             latency_s=0.01,
             finish_reason="stop",
         )
+
+
+def _verifier(client: _Client | None = None, **config: object) -> VisualCsvVerifier:
+    return VisualCsvVerifier(client or _Client(), _visual_config(**config))
 
 
 class _SeedFailureClient(_Client):
@@ -228,7 +240,7 @@ def test_three_seed_verification_persists_predictions_indices_and_boolean(
     client = _Client(
         _response(evidence_complete=False, missing_evidence=["later action"])
     )
-    verifier = VisualCsvVerifier(client)
+    verifier = _verifier(client)
 
     row = verifier.verify(job)
 
@@ -254,30 +266,36 @@ def test_three_seed_verification_persists_predictions_indices_and_boolean(
 
 def test_resume_rejects_source_config_and_seed_drift(tmp_path: Path) -> None:
     job = bind_visual_csv_jobs([_trajectory(tmp_path)])[0]
-    row = VisualCsvVerifier(_Client()).verify(job)
+    row = _verifier(_Client()).verify(job)
 
-    VisualCsvVerifier(_Client()).verify(job, existing=row)
+    _verifier(_Client()).verify(job, existing=row)
     with pytest.raises(RuntimeError, match="config"):
         VisualCsvVerifier(
-            _Client(), VisualCsvConfig(max_tokens=257)
+            _Client(), VisualCsvConfig(verifier_artifact_sha256=VERIFIER_SHA, max_tokens=257)
+        ).verify(job, existing=row)
+
+    with pytest.raises(RuntimeError, match="artifact|config"):
+        VisualCsvVerifier(
+            _Client(),
+            VisualCsvConfig(verifier_artifact_sha256="b" * 64),
         ).verify(job, existing=row)
 
     changed_job = deepcopy(job)
     object.__setattr__(changed_job, "source_sha256", "a" * 64)
     with pytest.raises(RuntimeError, match="source"):
-        VisualCsvVerifier(_Client()).verify(changed_job, existing=row)
+        _verifier(_Client()).verify(changed_job, existing=row)
 
     duplicate = deepcopy(row)
     duplicate["visual_csv_confirmations"][1]["judge_seed"] = 17
     with pytest.raises(RuntimeError, match="duplicate"):
-        VisualCsvVerifier(_Client()).verify(job, existing=duplicate)
+        _verifier(_Client()).verify(job, existing=duplicate)
 
     tampered = deepcopy(row)
     tampered["visual_csv_confirmations"][0]["request_messages"][1]["content"][0][
         "text"
     ] = "changed request"
     with pytest.raises(RuntimeError, match="provenance"):
-        VisualCsvVerifier(_Client()).verify(job, existing=tampered)
+        _verifier(_Client()).verify(job, existing=tampered)
 
 
 def test_retry_errors_reissues_only_infrastructure_seed(tmp_path: Path) -> None:
@@ -285,16 +303,16 @@ def test_retry_errors_reissues_only_infrastructure_seed(tmp_path: Path) -> None:
     first_client = _SeedFailureClient(
         infrastructure_seeds=(42,), invalid_seeds=(73,)
     )
-    failed = VisualCsvVerifier(first_client).verify(job)
+    failed = _verifier(first_client).verify(job)
     assert failed["visual_csv_status"] == "complete_with_failures"
 
     skipped_client = _Client()
-    skipped = VisualCsvVerifier(skipped_client).verify(job, existing=failed)
+    skipped = _verifier(skipped_client).verify(job, existing=failed)
     assert skipped["visual_csv_status"] == "complete_with_failures"
     assert skipped_client.calls == []
 
     retry_client = _Client()
-    retried = VisualCsvVerifier(retry_client).verify(
+    retried = _verifier(retry_client).verify(
         job, existing=failed, retry_errors=True
     )
     assert [call["seed"] for call in retry_client.calls] == [42]
@@ -312,12 +330,14 @@ def test_offline_attach_and_label_uses_three_predictions_not_model_boolean(
 ) -> None:
     trajectory = _trajectory(tmp_path)
     jobs = bind_visual_csv_jobs([trajectory])
-    verifier = VisualCsvVerifier(
-        _Client(_response(evidence_complete=False, missing_evidence=["more"])),
+    verifier = _verifier(
+        _Client(_response(evidence_complete=False, missing_evidence=["more"]))
     )
     rows = [verifier.verify(job) for job in jobs]
 
-    attached = attach_visual_csv_results([trajectory], rows)
+    attached = attach_visual_csv_results(
+        [trajectory], rows, verifier_artifact_sha256=VERIFIER_SHA
+    )
     labeled = label_visual_csv_prefixes(
         attached, {("lvbench", "sample-1"): "A"}
     )
@@ -348,7 +368,190 @@ def test_offline_attach_and_label_uses_three_predictions_not_model_boolean(
     )
 
 
-def test_offline_selector_keeps_earliest_correct_prefix_and_strips_private_values(
+def test_attach_rejects_frame_bytes_changed_after_visual_judging(
+    tmp_path: Path,
+) -> None:
+    trajectory = _trajectory(tmp_path)
+    jobs = bind_visual_csv_jobs([trajectory])
+    rows = [_verifier(_Client()).verify(job) for job in jobs]
+    Path(jobs[0].frame_paths[0]).write_bytes(b"replaced-after-judging")
+
+    with pytest.raises(ValueError, match="provenance|content"):
+        attach_visual_csv_results(
+            [trajectory], rows, verifier_artifact_sha256=VERIFIER_SHA
+        )
+
+
+def test_attach_rejects_same_model_name_with_changed_verifier_weights(
+    tmp_path: Path,
+) -> None:
+    trajectory = _trajectory(tmp_path)
+    rows = [_verifier().verify(job) for job in bind_visual_csv_jobs([trajectory])]
+
+    with pytest.raises(ValueError, match="artifact"):
+        attach_visual_csv_results(
+            [trajectory], rows, verifier_artifact_sha256="b" * 64
+        )
+
+
+def test_balanced_selector_matches_real_samples_across_all_quality_strata() -> None:
+    intervals = {
+        "single_frame_select": [(0.0, 10.0)],
+        "timestamp_grounded_select": [(60.0, 70.0)],
+        "hierarchical_refinement": [
+            (0.0, 100.0),
+            (20.0, 80.0),
+            (30.0, 60.0),
+        ],
+        "multi_interval_exploration": [
+            (0.0, 10.0),
+            (20.0, 30.0),
+            (40.0, 50.0),
+        ],
+    }
+    stable: dict[tuple[str, str], list[dict]] = {}
+    for family, values in intervals.items():
+        for stratum in ("candidate_correct", "candidate_wrong"):
+            sample_id = f"{family}-{stratum}"
+            complete_index = len(values) - 1
+            stable[("lvbench", sample_id)] = [
+                {
+                    "dataset": "lvbench",
+                    "sample_id": sample_id,
+                    "trajectory_id": f"lvbench:{sample_id}:0",
+                    "candidate_training_stratum": stratum,
+                    "earliest_complete_prefix_index": complete_index,
+                    "retained_total_tokens": 10,
+                    "retained_visual_tokens": 5,
+                    "retained_tool_steps": len(values),
+                    "retained_latency_s": 0.1,
+                    "public_sample": {
+                        "dataset": "lvbench",
+                        "sample_id": sample_id,
+                        "video": "video.mp4",
+                        "question": (
+                            "What happens from 01:00 to 01:10?"
+                            if family == "timestamp_grounded_select"
+                            else "What happens?"
+                        ),
+                        "choices": {"A": "one", "B": "two"},
+                    },
+                    "tool_steps": [
+                        {
+                            "resolved_start_time": start,
+                            "resolved_end_time": end,
+                        }
+                        for start, end in values
+                    ],
+                    "perception_states": [
+                        {"evidence_complete": index == complete_index}
+                        for index in range(len(values))
+                    ],
+                }
+            ]
+
+    selected, diagnostics = balance_visual_csv_selection(stable)
+
+    assert diagnostics["status"] == "applied", diagnostics
+    assert diagnostics["equal_cell_quota"] == 1
+    assert diagnostics["observed_incomplete_continue"] == diagnostics["stop"] == 8
+    assert selected is not None and len(selected) == 8
+    assert {row["visual_path_family"] for row in selected} == set(intervals)
+
+
+def test_balanced_selector_searches_matching_and_continue_jointly() -> None:
+    """A feasible assignment must not be hidden by the first max matching."""
+    families = (
+        "single_frame_select",
+        "timestamp_grounded_select",
+        "hierarchical_refinement",
+        "multi_interval_exploration",
+    )
+    candidates = (
+        {0: 0, 3: 0, 1: 0, 2: 0},
+        {10: 0, 11: 0},
+        {4: 0, 5: 0, 2: 0, 1: 0},
+        {8: 0, 10: 0, 9: 0},
+        {1: 1, 3: 1, 5: 1, 0: 2},
+        {10: 2, 11: 2, 9: 2},
+        {5: 1, 0: 1, 4: 2, 1: 1},
+        {8: 2, 6: 2, 9: 2, 11: 2},
+    )
+    stable: dict[tuple[str, str], list[dict]] = {}
+    for cell_index, by_sample in enumerate(candidates):
+        family = families[cell_index // 2]
+        stratum = ("candidate_correct", "candidate_wrong")[cell_index % 2]
+        for sample_number, continue_count in by_sample.items():
+            identity = ("lvbench", f"sample-{stratum}-{sample_number}")
+            intervals = (
+                [(60.0, 70.0)]
+                if family == "timestamp_grounded_select"
+                else [(0.0, 10.0)]
+            )
+            if family == "hierarchical_refinement":
+                intervals = [(0.0, 100.0), (20.0, 80.0), (30.0, 60.0)]
+            elif family == "multi_interval_exploration":
+                intervals = [(0.0, 10.0), (20.0, 30.0), (40.0, 50.0)]
+            while len(intervals) <= continue_count:
+                if family == "hierarchical_refinement":
+                    start, end = intervals[-1]
+                    intervals.append((start + 1.0, end - 1.0))
+                elif family == "multi_interval_exploration":
+                    start = intervals[-1][1] + 10.0
+                    intervals.append((start, start + 10.0))
+                else:
+                    raise AssertionError("single-step family cannot require CONTINUE")
+            stable.setdefault(identity, []).append(
+                {
+                    "dataset": "lvbench",
+                    "sample_id": identity[1],
+                    "trajectory_id": f"{cell_index}:{sample_number}",
+                    "candidate_training_stratum": stratum,
+                    "earliest_complete_prefix_index": continue_count,
+                    "retained_total_tokens": 1,
+                    "retained_visual_tokens": 1,
+                    "retained_tool_steps": len(intervals),
+                    "retained_latency_s": 0.1,
+                    "public_sample": {
+                        "dataset": "lvbench",
+                        "sample_id": identity[1],
+                        "video": "v.mp4",
+                        "question": (
+                            "What happens at 01:05?"
+                            if family == "timestamp_grounded_select"
+                            else "What happens?"
+                        ),
+                        "choices": {"A": "one", "B": "two"},
+                    },
+                        "tool_steps": [
+                            {
+                                "resolved_start_time": start,
+                                "resolved_end_time": end,
+                                "frame_paths": [f"frame-{index}.jpg"],
+                                "timestamps": [(start + end) / 2],
+                                "actual_timestamps": [(start + end) / 2],
+                            }
+                            for index, (start, end) in enumerate(intervals)
+                        ],
+                        "perception_states": [
+                            {
+                                "frame_paths": [f"frame-{index}.jpg"],
+                                "timestamps": [(start + end) / 2],
+                                "evidence_complete": index == continue_count,
+                            }
+                            for index, (start, end) in enumerate(intervals)
+                        ],
+                }
+            )
+
+    selected, diagnostics = balance_visual_csv_selection(stable)
+
+    assert diagnostics["status"] == "applied", diagnostics
+    assert selected is not None and len(selected) == 8
+    assert sum(row["earliest_complete_prefix_index"] for row in selected) == 8
+
+
+def test_offline_selector_labels_earliest_prefix_but_blocks_unbalanced_pool(
     tmp_path: Path,
 ) -> None:
     expensive = _selectable_trajectory(tmp_path, variant="expensive", request_tokens=20)
@@ -356,28 +559,25 @@ def test_offline_selector_keeps_earliest_correct_prefix_and_strips_private_value
     results: list[dict] = []
     for trajectory in (expensive, cheap):
         first, second = bind_visual_csv_jobs([trajectory])
-        results.append(VisualCsvVerifier(_Client(_response(answer="B"))).verify(first))
-        results.append(VisualCsvVerifier(_Client(_response(answer="A"))).verify(second))
+        results.append(_verifier(_Client(_response(answer="B"))).verify(first))
+        results.append(_verifier(_Client(_response(answer="A"))).verify(second))
 
     labeled, selected, summary = select_visual_csv_trajectories(
-        [expensive, cheap], results, {("lvbench", "sample-1"): "A"}
+        [expensive, cheap],
+        results,
+        {("lvbench", "sample-1"): "A"},
+        verifier_artifact_sha256=VERIFIER_SHA,
     )
 
     assert [state["evidence_complete"] for state in labeled[0]["perception_states"]] == [
         False,
         True,
     ]
-    assert len(selected) == 1
-    winner = selected[0]
-    assert winner["trajectory_id"].endswith(":cheap")
-    assert winner["earliest_complete_prefix_index"] == 1
-    assert winner["candidate_training_stratum"] == "candidate_wrong"
-    assert winner["final_prediction"] == "A"
-    assert winner["_selection_stable"] is True
-    assert len(winner["perception_states"]) == len(winner["tool_steps"]) == 2
-    assert len(winner["request_trace"]) == 4
+    assert selected == ()
     assert summary["stable_trajectories"] == 2
-    assert summary["candidate_fixes"] == 1
+    assert summary["candidate_fixes"] == 0
+    assert summary["quality_balancing"]["status"] == "blocked"
+    assert summary["stable_samples_not_selected_for_balance"] == 1
     serialized = json.dumps((labeled, selected), ensure_ascii=False)
     for forbidden in (
         "SECRET_CANDIDATE_VALUE",
@@ -393,13 +593,16 @@ def test_offline_selector_fails_closed_on_missing_trace_action(tmp_path: Path) -
     trajectory["request_trace"][2]["action_accepted"] = False
     jobs = bind_visual_csv_jobs([trajectory])
     results = [
-        VisualCsvVerifier(_Client(_response(answer="B"))).verify(jobs[0]),
-        VisualCsvVerifier(_Client(_response(answer="A"))).verify(jobs[1]),
+        _verifier(_Client(_response(answer="B"))).verify(jobs[0]),
+        _verifier(_Client(_response(answer="A"))).verify(jobs[1]),
     ]
 
     with pytest.raises(ValueError, match="accepted next Planner action"):
         select_visual_csv_trajectories(
-            [trajectory], results, {("lvbench", "sample-1"): "A"}
+            [trajectory],
+            results,
+            {("lvbench", "sample-1"): "A"},
+            verifier_artifact_sha256=VERIFIER_SHA,
         )
 
 
@@ -423,8 +626,8 @@ def test_selector_cli_binds_train600_and_publishes_all_outputs(
     trajectory_path.write_text(json.dumps(trajectory) + "\n", encoding="utf-8")
     jobs = bind_visual_csv_jobs([trajectory])
     results = [
-        VisualCsvVerifier(_Client(_response(answer="B"))).verify(jobs[0]),
-        VisualCsvVerifier(_Client(_response(answer="A"))).verify(jobs[1]),
+        _verifier(_Client(_response(answer="B"))).verify(jobs[0]),
+        _verifier(_Client(_response(answer="A"))).verify(jobs[1]),
     ]
     result_path = tmp_path / "visual.csv.jsonl"
     result_path.write_text(
@@ -433,6 +636,7 @@ def test_selector_cli_binds_train600_and_publishes_all_outputs(
     args = argparse.Namespace(
         trajectories=[trajectory_path],
         visual_csv_results=[result_path],
+        verifier_artifact_sha256=VERIFIER_SHA,
         answers=answers_path,
         expected_answers_sha256=answers_sha,
         labeled_output=tmp_path / "selection/labeled.jsonl",
@@ -443,9 +647,10 @@ def test_selector_cli_binds_train600_and_publishes_all_outputs(
 
     report = selector_cli.run(args)
 
-    assert report["selected"] == 1
+    assert report["selected"] == 0
     assert report["samples"] == 600
     assert report["training_quantity_policy"] == "advisory_only"
+    assert report["quality_balancing"]["status"] == "blocked"
     assert all(path.is_file() for path in (args.labeled_output, args.selected_output, args.summary))
     assert "candidate_answer" not in args.selected_output.read_text(encoding="utf-8")
 
@@ -474,6 +679,7 @@ def test_cli_is_multi_endpoint_resumable_and_fingerprint_locked(
         base_urls=["http://one/v1", "http://two/v1"],
         api_key="no",
         model="Qwen3.5-9B",
+        verifier_artifact_sha256=VERIFIER_SHA,
         judge_seed=[17, 42, 73],
         max_tokens=256,
         temperature=0.2,
@@ -529,6 +735,7 @@ def test_cli_retry_errors_only_reissues_infrastructure_seeds(
         base_urls=["http://one/v1"],
         api_key="no",
         model="Qwen3.5-9B",
+        verifier_artifact_sha256=VERIFIER_SHA,
         judge_seed=[17, 42, 73],
         max_tokens=256,
         temperature=0.2,

@@ -537,6 +537,14 @@ def materialize_role_ablation(
                         else "scripts/evaluate_mcq.py"
                     ),
                     "paired_role": fixed_role,
+                    "paired_bindings": (
+                        {
+                            "control": dict(artifacts["base"]),
+                            "treatment": dict(artifacts["candidate"]),
+                        }
+                        if fixed_role is not None
+                        else None
+                    ),
                     "frozen_input_cli": (
                         "scripts/freeze_role_ablation_inputs.py"
                         if cell["id"] == "base_all"

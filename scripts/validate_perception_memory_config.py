@@ -158,10 +158,17 @@ def validate_config(config: Mapping[str, Any]) -> list[str]:
 
     data = _mapping(config.get("process_sft_data"), "process_sft_data", errors)
     _require(data.get("source_split") == "train600_only", "SFT data must use Train600 only", errors)
-    _require(data.get("minimum_stable_questions") == 360, "need >=360 stable questions", errors)
-    _require(data.get("minimum_stable_per_dataset") == 100, "need >=100 stable questions per dataset", errors)
-    _require(data.get("minimum_candidate_fixes") == 90, "need >=90 candidate fixes", errors)
-    _require(data.get("minimum_candidate_fixes_per_dataset") == 20, "need >=20 candidate fixes per dataset", errors)
+    for key in (
+        "minimum_stable_questions",
+        "minimum_stable_per_dataset",
+        "minimum_candidate_fixes",
+        "minimum_candidate_fixes_per_dataset",
+    ):
+        _require(key not in data, f"{key} must not block SFT startup", errors)
+    _require(data.get("completion_gate_kind") == "visual_csv", "new SFT data must use visual_csv completion", errors)
+    _require(data.get("planner_complete_episode_required") is True, "Planner complete episodes are required", errors)
+    _require(data.get("observer_complete_episode_optional") is True, "Observer episodes must remain optional", errors)
+    _require(data.get("quantity_distribution_advisory_only") is True, "SFT quantities must be advisory only", errors)
     _require(data.get("stable_evidence_only_judges_required") == 3, "stable prefix gate must be 3/3", errors)
     _require(
         data.get("coverage_variants_for_samples_without_stable_positive") == 4,

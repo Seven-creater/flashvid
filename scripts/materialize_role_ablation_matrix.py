@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from flashvid_eval.role_separated_orchestration import (
+    freeze_role_ablation_dev30,
     load_config,
     materialize_role_ablation,
 )
@@ -36,19 +37,45 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--split", default="dev")
+    parser.add_argument(
+        "--derive-dev10",
+        action="store_true",
+        help="Verify each frozen Dev50 SHA and atomically derive its first 10 rows.",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     plan = materialize_role_ablation(config, split=args.split)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    derived_manifests = (
+        freeze_role_ablation_dev30(
+            config, output_dir=args.output_dir / "frozen"
+        )
+        if args.derive_dev10
+        else None
+    )
     files: list[dict[str, str]] = []
     for run in plan["runs"]:
-        path = args.output_dir / f"{run['id']}.json"
-        _write_json(path, run)
+        run_dir = args.output_dir / run["id"]
+        path = run_dir / "run.json"
+        role_config_path = run_dir / "role_config.json"
+        _write_json(role_config_path, run["pm_role_config"])
+        materialized_run = dict(run)
+        materialized_run["pm_role_config_sha256"] = hashlib.sha256(
+            role_config_path.read_bytes()
+        ).hexdigest()
+        if derived_manifests is not None:
+            materialized_run["manifests"] = derived_manifests
+        materialized_run["pm_role_config_path"] = str(role_config_path.resolve())
+        _write_json(path, materialized_run)
         files.append(
             {
                 "id": run["id"],
                 "path": str(path.resolve()),
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "role_config_path": str(role_config_path.resolve()),
+                "role_config_sha256": hashlib.sha256(
+                    role_config_path.read_bytes()
+                ).hexdigest(),
             }
         )
     plan["files"] = files

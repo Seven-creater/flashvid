@@ -670,7 +670,7 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
             "prompt_hash": "f" * 64,
         }
     )
-    records = build_perception_memory_sft_records(result)
+    records = build_perception_memory_sft_records(result, include_observer=True)
     assert result["request_trace"][3]["content"].startswith("```json\n")
     first_state = result["perception_states"][0]["perception_response"]
     assert (
@@ -685,17 +685,20 @@ def test_replay_prefix_schema_becomes_exportable_after_offline_three_seed_gate(
     assert len(first_state["temporal_changes"]) == 4
     assert len(first_state["unresolved"]) == 3
     assert len(first_state["next_evidence_needed"].split()) == 20
-    assert [record["metadata"]["episode_target_type"] for record in records] == [
+    assert [record["metadata"]["process_role"] for record in records] == [
+        "planner",
+        "observer",
+        "observer",
+    ]
+    assert records[0]["metadata"]["assistant_target_types"] == [
         "tool",
-        "memory",
         "tool",
-        "memory",
-        "final",
+        "stop",
     ]
     perception_targets = [
         json.loads(record["messages"][-1]["content"])
         for record in records
-        if record["metadata"]["process_role"] == "perception"
+        if record["metadata"]["process_role"] == "observer"
     ]
     assert all(
         set(fact) == {"frame_index", "fact"}
@@ -861,11 +864,15 @@ def test_capped_tool_target_and_frames_round_trip_to_process_sft(
         }
         for seed in (17, 42, 73)
     ]
-    records = build_perception_memory_sft_records(result)
+    records = build_perception_memory_sft_records(result, include_observer=True)
+    tool_target = next(
+        message["content"]
+        for message in records[0]["messages"]
+        if message["role"] == "assistant"
+        and message["content"].startswith("<tool_call>")
+    )
     exported_tool = json.loads(
-        records[0]["messages"][-1]["content"]
-        .removeprefix("<tool_call>")
-        .removesuffix("</tool_call>")
+        tool_target.removeprefix("<tool_call>").removesuffix("</tool_call>")
     )
     assert exported_tool["arguments"]["nframes"] == 128
     assert "fps" not in exported_tool["arguments"]

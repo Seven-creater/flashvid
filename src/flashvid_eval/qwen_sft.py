@@ -1260,6 +1260,7 @@ def build_sft_record(
     trajectory: Mapping[str, Any],
     *,
     require_complete_trajectory: bool = True,
+    require_final_target: bool = True,
     episode_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     source = trajectory.get("training_messages")
@@ -1311,7 +1312,7 @@ def build_sft_record(
                 trained_targets.append(target)
         messages.append(message)
     if require_complete_trajectory:
-        if "final" not in trained_targets:
+        if require_final_target and "final" not in trained_targets:
             raise ValueError("SFT trajectory requires a trainable final assistant turn")
         if not any(target in {"plan", "tool", "memory", "stop"} for target in trained_targets):
             raise ValueError("SFT trajectory requires at least one trainable agent action")
@@ -1434,8 +1435,20 @@ def validate_exported_sft_record(record: Mapping[str, Any]) -> None:
             raise ValueError("episode target metadata does not match assistant target")
         if trainable != 1:
             raise ValueError("request-level SFT episode must train exactly one assistant turn")
-    elif trainable != len(targets) or "final" not in targets:
-        raise ValueError("assistant loss mask does not match recorded targets")
+    else:
+        process_role = str(metadata.get("process_role") or "").strip().casefold()
+        if trainable != len(targets):
+            raise ValueError("assistant loss mask does not match recorded targets")
+        if process_role == "planner":
+            if "stop" not in targets or any(
+                target not in {"plan", "tool", "stop"} for target in targets
+            ):
+                raise ValueError("planner episode requires action turns ending in stop")
+        elif process_role == "observer":
+            if not targets or any(target != "memory" for target in targets):
+                raise ValueError("observer episode may train only memory turns")
+        elif "final" not in targets:
+            raise ValueError("assistant loss mask does not match recorded targets")
 
 
 def _find_hidden_reasoning(value: Any, path: str = "$") -> str | None:

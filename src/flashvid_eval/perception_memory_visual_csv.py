@@ -1252,6 +1252,158 @@ def _selected_cost(row: Mapping[str, Any]) -> tuple[float, float, int, float, st
     )
 
 
+def balance_visual_csv_selection(
+    stable_by_sample: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]],
+) -> tuple[list[dict[str, Any]] | None, dict[str, Any]]:
+    """Find a deterministic real-sample subset satisfying the frozen quality gate."""
+
+    # Lazy import avoids a module-import cycle: the SFT exporter imports the visual
+    # CSV contracts, while selection only needs the frozen classifier at runtime.
+    from .perception_memory_sft import (  # noqa: PLC0415
+        CANDIDATE_TRAINING_STRATA,
+        QUALITY_RATIO_MAX,
+        QUALITY_RATIO_MIN,
+        VISUAL_PATH_FAMILIES,
+        classify_visual_path,
+    )
+
+    cells = tuple(
+        (family, stratum)
+        for family in VISUAL_PATH_FAMILIES
+        for stratum in CANDIDATE_TRAINING_STRATA
+    )
+    options: dict[
+        tuple[str, str], dict[tuple[str, str], list[dict[str, Any]]]
+    ] = {cell: {} for cell in cells}
+    invalid_path_trajectories: list[str] = []
+    for identity, raw_rows in stable_by_sample.items():
+        strata = {
+            str(row.get("candidate_training_stratum") or "") for row in raw_rows
+        }
+        if len(strata) != 1 or next(iter(strata)) not in CANDIDATE_TRAINING_STRATA:
+            raise ValueError(f"candidate stratum drift across trajectories for {identity}")
+        stratum = next(iter(strata))
+        for raw in raw_rows:
+            row = deepcopy(dict(raw))
+            try:
+                family = classify_visual_path(row)
+            except ValueError:
+                invalid_path_trajectories.append(str(row.get("trajectory_id") or ""))
+                continue
+            row["visual_path_family"] = family
+            options[(family, stratum)].setdefault(identity, []).append(row)
+    for by_sample in options.values():
+        for rows in by_sample.values():
+            rows.sort(key=_selected_cost)
+
+    availability = {
+        f"{family}/{stratum}": len(options[(family, stratum)])
+        for family, stratum in cells
+    }
+    maximum_quota = min(availability.values(), default=0)
+    diagnostics: dict[str, Any] = {
+        "policy": "exact_candidate_and_path_matching_with_continue_dp_v1",
+        "candidate_path_cell_availability": availability,
+        "maximum_equal_cell_quota": maximum_quota,
+        "invalid_path_trajectories": sorted(invalid_path_trajectories),
+    }
+    if maximum_quota <= 0:
+        diagnostics.update(
+            status="blocked",
+            reason="at least one candidate/path stratum has no stable trajectory",
+        )
+        return None, diagnostics
+
+    def search_jointly(quota: int) -> list[dict[str, Any]] | None:
+        """Jointly assign unique samples and trajectory variants.
+
+        A single maximum matching can hide a feasible CONTINUE-balanced matching.
+        This bounded DFS therefore searches the two constraints together.  The
+        frozen four path families imply at most six CONTINUE turns per record;
+        ratio bounds prune the practical Train600 search aggressively.
+        """
+        slots = sorted(
+            (cell for cell in cells for _ in range(quota)),
+            key=lambda cell: (len(options[cell]), cell),
+        )
+        count = len(slots)
+        minimum_continue = math.ceil(QUALITY_RATIO_MIN * count)
+        maximum_continue = math.floor(QUALITY_RATIO_MAX * count)
+        candidates: dict[
+            tuple[str, str], list[tuple[tuple[str, str], int, dict[str, Any]]]
+        ] = {}
+        for cell in cells:
+            values: list[tuple[tuple[str, str], int, dict[str, Any]]] = []
+            for identity, rows in options[cell].items():
+                by_continue: dict[int, dict[str, Any]] = {}
+                for row in rows:
+                    continue_count = int(row.get("earliest_complete_prefix_index", -1))
+                    if continue_count < 0:
+                        raise ValueError(
+                            "stable trajectory lacks its complete prefix index"
+                        )
+                    current = by_continue.get(continue_count)
+                    if current is None or _selected_cost(row) < _selected_cost(current):
+                        by_continue[continue_count] = row
+                values.extend(
+                    (identity, continue_count, row)
+                    for continue_count, row in by_continue.items()
+                )
+            candidates[cell] = sorted(
+                values,
+                key=lambda item: (_selected_cost(item[2]), item[0], item[1]),
+            )
+
+        chosen: list[dict[str, Any]] = []
+        used: set[tuple[str, str]] = set()
+
+        def visit(slot_index: int, continue_total: int) -> bool:
+            if continue_total > maximum_continue:
+                return False
+            remaining = count - slot_index
+            if continue_total + 6 * remaining < minimum_continue:
+                return False
+            if slot_index == count:
+                return minimum_continue <= continue_total <= maximum_continue
+            cell = slots[slot_index]
+            for identity, continue_count, row in candidates[cell]:
+                if identity in used:
+                    continue
+                used.add(identity)
+                chosen.append(row)
+                if visit(slot_index + 1, continue_total + continue_count):
+                    return True
+                chosen.pop()
+                used.remove(identity)
+            return False
+
+        return [deepcopy(row) for row in chosen] if visit(0, 0) else None
+
+    for quota in range(maximum_quota, 0, -1):
+        selected = search_jointly(quota)
+        if selected is not None:
+            selected.sort(key=lambda row: (str(row["dataset"]), str(row["sample_id"])))
+            diagnostics.update(
+                status="applied",
+                reason=None,
+                equal_cell_quota=quota,
+                selected=len(selected),
+                observed_incomplete_continue=sum(
+                    int(row["earliest_complete_prefix_index"]) for row in selected
+                ),
+                stop=len(selected),
+            )
+            return selected, diagnostics
+    diagnostics.update(
+        status="blocked",
+        reason=(
+            "stable pool cannot jointly satisfy unique-sample matching and the "
+            "observed CONTINUE/STOP ratio"
+        ),
+    )
+    return None, diagnostics
+
+
 def _truncate_visual_csv_trajectory(
     row: Mapping[str, Any], prefix_index: int, prediction: str
 ) -> dict[str, Any]:
@@ -1392,14 +1544,15 @@ def select_visual_csv_trajectories(
             )
             stable_by_sample.setdefault(identity, []).append(stable_row)
 
-    selected = [
-        deepcopy(min(stable_by_sample[identity], key=_selected_cost))
-        for identity in sorted(stable_by_sample)
-    ]
+    balanced_selected, balance = balance_visual_csv_selection(stable_by_sample)
+    # Formal selected output is trainable input, so never publish an unbalanced
+    # fallback that merely relies on a later caller remembering to reject it.
+    selected = balanced_selected if balanced_selected is not None else []
     selected_by_dataset = Counter(str(row["dataset"]) for row in selected)
     selected_by_stratum = Counter(
         str(row["candidate_training_stratum"]) for row in selected
     )
+    selected_by_path = Counter(str(row.get("visual_path_family") or "") for row in selected)
     all_answer_samples = set(answers)
     no_stable = sorted(all_answer_samples - set(stable_by_sample))
     no_stable_ids = {
@@ -1420,6 +1573,11 @@ def select_visual_csv_trajectories(
         "selected": len(selected),
         "selected_by_dataset": dict(sorted(selected_by_dataset.items())),
         "selected_by_candidate_stratum": dict(sorted(selected_by_stratum.items())),
+        "selected_by_visual_path": dict(sorted(selected_by_path.items())),
+        "quality_balancing": balance,
+        "stable_samples_not_selected_for_balance": (
+            len(stable_by_sample) - len(selected)
+        ),
         "candidate_fixes": selected_by_stratum.get("candidate_wrong", 0),
         "no_stable": len(no_stable),
         "no_stable_by_dataset": {
@@ -1442,8 +1600,10 @@ __all__ = [
     "VisualCsvJob",
     "VisualCsvVerifier",
     "attach_visual_csv_results",
+    "balance_visual_csv_selection",
     "bind_visual_csv_jobs",
     "build_visual_csv_messages",
+    "frame_content_sha256s",
     "label_visual_csv_prefixes",
     "parse_visual_csv_response",
     "select_visual_csv_trajectories",

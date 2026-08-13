@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -24,8 +25,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from .datasets import VideoIndex
 from .perception_memory_visual_csv import (
+    VISUAL_CSV_SCHEMA_VERSION,
     VisualCsvJob,
     build_visual_csv_messages,
+    frame_content_sha256s,
     parse_visual_csv_response,
     visual_csv_response_format,
 )
@@ -82,6 +85,37 @@ _PERCEPTION_MEMORY_STAGE_ROLES = {
     "evidence_judge": "answerer",
     "confirmation_judge": "answerer",
 }
+
+
+def role_prompt_schema_bundle_sha256() -> str:
+    """Fingerprint only the frozen four-role prompt/schema surface."""
+
+    builders = (
+        controller_structured_outputs,
+        parse_controller_action,
+        build_role_separated_controller_messages,
+        build_role_separated_confirmation_controller_messages,
+        build_perception_messages,
+        build_perception_retry_messages,
+        perception_response_format,
+        bind_perception_state,
+        build_runtime_visual_csv_messages,
+        parse_visual_csv_response,
+        build_cited_judge_messages,
+        parse_evidence_decision,
+    )
+    payload = {
+        "role_separated_runtime_version": ROLE_SEPARATED_RUNTIME_VERSION,
+        "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
+        "controller_output_constraint_version": CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+        "visual_csv_schema_version": VISUAL_CSV_SCHEMA_VERSION,
+        "contracts": {
+            function.__name__: inspect.getsource(function) for function in builders
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -489,6 +523,23 @@ def _controller_tool_call(request: FrameRequest) -> str:
         )
         + "</tool_call>"
     )
+
+
+def evidence_request_addresses_unresolved(
+    evidence_request: str, unresolved: Sequence[str]
+) -> bool:
+    """Require explicit-role plans to name the unresolved evidence they pursue."""
+
+    if not unresolved:
+        return True
+    request_tokens = set(re.findall(r"\w+", evidence_request.casefold()))
+    if not request_tokens:
+        return False
+    for item in unresolved:
+        needed = set(re.findall(r"\w+", str(item).casefold()))
+        if needed and needed.issubset(request_tokens):
+            return True
+    return False
 
 
 def controller_structured_outputs(*, allow_stop: bool) -> dict[str, Any]:
@@ -975,6 +1026,119 @@ class EvidenceMemory:
                 letter: OptionLedger() for letter in self.option_letters
             }
 
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, Any], option_letters: Sequence[str]
+    ) -> "EvidenceMemory":
+        """Rehydrate one canonical public ledger without weakening its schema."""
+
+        required = {
+            "event_ledger",
+            "option_ledger",
+            "unresolved",
+            "observed_intervals",
+        }
+        if not isinstance(value, Mapping) or set(value) != required:
+            raise ValueError("evidence memory must contain exactly the ledger fields")
+        letters = tuple(str(letter).strip().upper() for letter in option_letters)
+        if (
+            not letters
+            or len(letters) != len(set(letters))
+            or any(len(letter) != 1 or not "A" <= letter <= "H" for letter in letters)
+        ):
+            raise ValueError("evidence memory option labels must be unique A-H letters")
+
+        raw_events = value["event_ledger"]
+        if not isinstance(raw_events, list):
+            raise ValueError("event_ledger must be an array")
+        events: list[EvidenceEvent] = []
+        evidence_ids: set[str] = set()
+        for index, raw in enumerate(raw_events):
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "evidence_id",
+                "interval",
+                "timestamp",
+                "fact",
+                "source",
+            }:
+                raise ValueError(f"event_ledger[{index}] has an invalid schema")
+            evidence_id = _clean_text(
+                raw["evidence_id"], f"event_ledger[{index}].evidence_id"
+            )
+            if not re.fullmatch(r"E\d{4}", evidence_id) or evidence_id in evidence_ids:
+                raise ValueError("event_ledger evidence IDs must be unique E#### values")
+            evidence_ids.add(evidence_id)
+            interval = raw["interval"]
+            if (
+                not isinstance(interval, list)
+                or len(interval) != 2
+                or isinstance(interval[0], bool)
+                or isinstance(interval[1], bool)
+            ):
+                raise ValueError(f"event_ledger[{index}].interval is invalid")
+            start = _finite_number(interval[0], f"event_ledger[{index}].interval[0]")
+            end = _finite_number(interval[1], f"event_ledger[{index}].interval[1]")
+            if end <= start:
+                raise ValueError(f"event_ledger[{index}].interval is invalid")
+            timestamp = raw["timestamp"]
+            parsed_timestamp = (
+                None
+                if timestamp is None
+                else _finite_number(timestamp, f"event_ledger[{index}].timestamp")
+            )
+            events.append(
+                EvidenceEvent(
+                    evidence_id=evidence_id,
+                    interval=(start, end),
+                    timestamp=parsed_timestamp,
+                    fact=_clean_text(raw["fact"], f"event_ledger[{index}].fact"),
+                    source=_clean_text(raw["source"], f"event_ledger[{index}].source"),
+                )
+            )
+
+        raw_options = value["option_ledger"]
+        if not isinstance(raw_options, Mapping) or set(raw_options) != set(letters):
+            raise ValueError("option_ledger must exactly match the public choices")
+        options: dict[str, OptionLedger] = {}
+        for letter in letters:
+            raw = raw_options[letter]
+            if not isinstance(raw, Mapping) or set(raw) != {
+                "supports",
+                "contradicts",
+            }:
+                raise ValueError(f"option_ledger.{letter} has an invalid schema")
+            supports = _string_list(raw["supports"], f"option_ledger.{letter}.supports")
+            contradicts = _string_list(
+                raw["contradicts"], f"option_ledger.{letter}.contradicts"
+            )
+            if any(item not in evidence_ids for item in (*supports, *contradicts)):
+                raise ValueError(f"option_ledger.{letter} cites unknown evidence")
+            options[letter] = OptionLedger(
+                tuple(dict.fromkeys(supports)), tuple(dict.fromkeys(contradicts))
+            )
+
+        raw_unresolved = value["unresolved"]
+        unresolved = list(_string_list(raw_unresolved, "unresolved"))
+        raw_intervals = value["observed_intervals"]
+        if not isinstance(raw_intervals, list):
+            raise ValueError("observed_intervals must be an array")
+        observed_intervals: list[tuple[float, float]] = []
+        for index, raw in enumerate(raw_intervals):
+            if not isinstance(raw, list) or len(raw) != 2:
+                raise ValueError(f"observed_intervals[{index}] is invalid")
+            start = _finite_number(raw[0], f"observed_intervals[{index}][0]")
+            end = _finite_number(raw[1], f"observed_intervals[{index}][1]")
+            if end <= start:
+                raise ValueError(f"observed_intervals[{index}] is invalid")
+            observed_intervals.append((start, end))
+        return cls(
+            option_letters=letters,
+            event_ledger=events,
+            option_ledger=options,
+            unresolved=list(dict.fromkeys(unresolved)),
+            observed_intervals=observed_intervals,
+        )
+
     def _evidence_id(
         self,
         fact: str,
@@ -1367,8 +1531,18 @@ def build_role_separated_controller_messages(
 ) -> list[dict[str, Any]]:
     """Build the explicit-role planner request with accepted-action history only."""
 
+    messages = build_controller_messages(
+        sample, memory, video_metadata, feedback=feedback
+    )
+    if memory.unresolved:
+        messages[0] = copy.deepcopy(messages[0])
+        messages[0]["content"] += (
+            " When unresolved evidence is listed, an observation's evidence_request "
+            "must explicitly include every word of one unresolved item so the action "
+            "can be checked against its stated evidence gap."
+        )
     return _with_accepted_planner_history(
-        build_controller_messages(sample, memory, video_metadata, feedback=feedback),
+        messages,
         accepted_history,
     )
 
@@ -1767,6 +1941,7 @@ def build_runtime_visual_csv_messages(
     if not frames:
         raise ValueError("runtime visual CSV requires at least one observed frame")
     public_sample = replace(sample, candidate_answer=None)
+    content_sha256s = frame_content_sha256s(tuple(item[0] for item in frames))
     source_sha256 = hashlib.sha256(
         json.dumps(
             {
@@ -1774,6 +1949,7 @@ def build_runtime_visual_csv_messages(
                 "sample_id": sample.sample_id,
                 "prefix_index": prefix_index,
                 "frames": frames,
+                "frame_content_sha256s": content_sha256s,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1789,6 +1965,7 @@ def build_runtime_visual_csv_messages(
         sample=public_sample,
         frame_paths=tuple(item[0] for item in frames),
         timestamps=tuple(item[1] for item in frames),
+        frame_content_sha256s=content_sha256s,
         source_sha256=source_sha256,
     )
     return build_visual_csv_messages(job)
@@ -2246,6 +2423,11 @@ class PerceptionMemoryEvaEvaluator:
                 if self.role_config_sha256 is not None
                 else None
             ),
+            "role_prompt_schema_bundle_sha256": (
+                role_prompt_schema_bundle_sha256()
+                if self.role_config_sha256 is not None
+                else None
+            ),
             "scoring_deferred": self.scoring_deferred,
             "train600_manifest_sha256": self.train600_manifest_sha256,
             "trajectory_schedule_id": self.trajectory_schedule_id,
@@ -2640,6 +2822,15 @@ class PerceptionMemoryEvaEvaluator:
                     "cited_frame_indices": list(cited_frame_indices)[
                         :_MAX_ANSWERER_CITED_FRAMES
                     ],
+                    "evidence_memory_at_stage": memory.to_dict(),
+                    "evidence_memory_sha256": hashlib.sha256(
+                        json.dumps(
+                            memory.to_dict(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 }
             )
         return parse_evidence_decision(
@@ -2900,6 +3091,25 @@ class PerceptionMemoryEvaEvaluator:
                         interval_rejection, float(session.metadata["duration"])
                     )
                     last_controller_rejection = interval_rejection
+                    continue
+                if (
+                    self.role_config_sha256 is not None
+                    and memory.unresolved
+                    and not evidence_request_addresses_unresolved(
+                        action.request.evidence_request, memory.unresolved
+                    )
+                ):
+                    request_trace[-1]["action_accepted"] = False
+                    request_trace[-1]["action_rejection_reason"] = (
+                        "unrelated_evidence_request"
+                    )
+                    feedback = (
+                        "The evidence_request did not explicitly name any current "
+                        "unresolved item. Copy one unresolved item verbatim into the "
+                        "next evidence_request, then select the interval needed to "
+                        "resolve it."
+                    )
+                    last_controller_rejection = "unrelated_evidence_request"
                     continue
                 requested_interval = (
                     action.request.start_time,
@@ -3538,6 +3748,7 @@ __all__ = [
     "build_perception_retry_messages",
     "controller_structured_outputs",
     "duplicate_interval",
+    "evidence_request_addresses_unresolved",
     "explicit_time_rescue_request",
     "interval_iou",
     "messages_have_media",
@@ -3548,6 +3759,7 @@ __all__ = [
     "perception_model_target",
     "perception_state_payload",
     "perception_memory_role_for_stage",
+    "role_prompt_schema_bundle_sha256",
     "perception_response_format",
     "normalize_perception_state",
     "rescue_frame_request",

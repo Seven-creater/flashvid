@@ -1,7 +1,7 @@
 # Role-separated Process SFT runbook
 
-This runbook freezes the experiment-control layer only. It does not change the
-Perception-Memory EVA runtime, its SFT exporter, or result reporting.
+This runbook covers the frozen four-role runtime, visual-only completeness
+labels, complete Process-SFT episodes, and experiment controls.
 
 ## 1. Validate and lock primary sources
 
@@ -24,10 +24,12 @@ domestic mirror.
 
 ## 2. Keep roles separated
 
-- Controller: the only trainable LoRA; text-only, with zero media inputs.
-- Perception: frozen Qwen3.5-9B base; current frame batch only; candidate blind.
-- Judge family: frozen Qwen3.5-9B base for completeness, evidence answer, and
-  confirmation; candidate blind.
+- Planner: the only trainable LoRA; text-only, with zero media inputs.
+- Observer: frozen Qwen3.5-9B base; current frame batch only; candidate blind.
+- Verifier: frozen Qwen3.5-9B base; public question/options plus accumulated
+  real frames only; no ledger, candidate, annotation, or prior reasoning.
+- Answerer: frozen Qwen3.5-9B base; ledger plus at most 16 Verifier-cited
+  decisive frames; candidate blind.
 - A single adapter must never be mounted on all roles in the selected training
   run. The legacy shared-adapter cells exist only for Dev attribution.
 
@@ -43,14 +45,48 @@ blocking.
 python scripts/materialize_role_ablation_matrix.py \
   --config configs/experiments/role_separated_process_sft.json \
   --split dev \
-  --output-dir results/eval/perception_memory_eva_sft/dev_role_ablation
+  --derive-dev10 \
+  --output-dir results/eval/role_separated_process_sft/role_ablation
 ```
 
-This writes the frozen 2^3 Controller/Perception/Judge matrix at seed 42. The
-files are orchestration skeletons marked `requires_role_endpoint_router`; do
-not execute them until the existing runtime can bind role-specific endpoints
-without changing its prompt or tool semantics. The materializer rejects every
-split other than Dev. It never reads, copies, or scores Test300.
+This verifies every frozen Dev50 SHA, derives its first ten rows atomically,
+and writes the six pre-registered Dev30 cells at seed 42: all Base, each old
+LoRA role in isolation, and all four roles on the old LoRA. Each run directory
+contains an exact `role_config.json` accepted by `--pm-role-config`. First run
+`base_all`, then freeze its label-free role inputs:
+
+```bash
+python scripts/freeze_role_ablation_inputs.py \
+  --input BASE_DEV30_RESULTS.jsonl \
+  --output results/eval/role_separated_process_sft/role_ablation/frozen_role_inputs.jsonl
+```
+
+Planner-only and all-role cells are end-to-end system interventions. Observer,
+Verifier, and Answerer cells use `scripts/run_role_ablation_pair.py`: both arms
+receive the same request SHA, frame paths, timestamps, and per-frame content
+SHA. Observer pairs can additionally pass frozen Base Verifier/Answerer
+bindings to report the conditional downstream answer. These fixed-schedule
+results are conditional role effects, not full-runtime causal effects. The
+materializer rejects every split other than Dev and never reads or scores
+Test300.
+
+Each fixed-role command must be bound to its materialized run file and SHA; the
+endpoint, model, and artifact identities are read from that immutable file, not
+accepted as free command-line overrides:
+
+```bash
+RUN_JSON=results/eval/role_separated_process_sft/role_ablation/observer_old_lora/run.json
+RUN_SHA=$(sha256sum "$RUN_JSON" | awk '{print $1}')
+FROZEN=results/eval/role_separated_process_sft/role_ablation/frozen_role_inputs.jsonl
+FROZEN_SHA=$(sha256sum "$FROZEN" | awk '{print $1}')
+python scripts/run_role_ablation_pair.py \
+  --input "$FROZEN" \
+  --expected-input-sha256 "$FROZEN_SHA" \
+  --output results/eval/role_separated_process_sft/role_ablation/observer_old_lora/paired.jsonl \
+  --run-config "$RUN_JSON" \
+  --expected-run-sha256 "$RUN_SHA" \
+  --local-media-paths
+```
 
 The role matrix diagnoses where the old shared LoRA causes regressions. It may
 select the role boundary for training, but it may not select or edit prompts.
@@ -58,17 +94,31 @@ select the role boundary for training, but it may not select or edit prompts.
 ## 4. Train and evaluate on Dev
 
 Use the existing ms-swift trainer and Perception-Memory exporter after the role
-binding has been supplied. Preserve the five frozen process families:
+binding has been supplied. Preserve the four frozen visual path families:
 
-1. direct answer;
-2. single frame selection;
-3. timestamp-grounded selection;
-4. hierarchical refinement;
-5. multi-interval exploration.
+1. single frame selection;
+2. timestamp-grounded selection;
+3. hierarchical refinement;
+4. multi-interval exploration.
 
-Incomplete prefixes target `continue + next frame_select`; only evidence-only
-3/3 correct complete prefixes may target stop/final answer. Tool observations,
-images, user input, and hidden reasoning remain masked.
+Every training question must execute at least one real `frame_select`; a
+candidate-only/direct-answer trajectory is not a Process-SFT training sample.
+
+Run `scripts/judge_perception_memory_visual_csv.py`, then
+`scripts/select_perception_memory_visual_csv_trajectories.py`; the latter joins
+labels offline and deterministically searches the real stable-trajectory pool
+for a subset satisfying all three frozen quality contracts. It never copies or
+synthesizes a STOP. The build must stop when no real subset can satisfy:
+
+- frozen-candidate correct/wrong strata at 1:1 (within 10%);
+- observed incomplete CONTINUE and STOP decisions at 1:1 (within 10%);
+- all four visual-path families non-empty with max/min no greater than 1.1.
+
+Visual-CSV provenance includes ordered paths, timestamps, and the SHA-256 of
+every frame file. Any byte change between judging, offline labeling, and build
+is a hard failure. Incomplete prefixes target `continue + next frame_select`;
+only visual-only 3/3 correct complete prefixes may target STOP. Tool
+observations, images, user input, and hidden reasoning remain masked.
 
 Use `scripts/gate_perception_memory.py` for the existing strict gate. The Dev
 payload may include non-blocking counts:

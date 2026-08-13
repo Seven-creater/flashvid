@@ -32,15 +32,17 @@ def test_config_rejects_test_hash_or_split_isolation_drift() -> None:
     assert any("train_dev_final_pairwise_disjoint" in error for error in errors)
 
 
-def test_config_rejects_weakened_data_or_dev_gates() -> None:
+def test_config_requires_visual_csv_episodes_and_keeps_dev_gates() -> None:
     config = _config()
     config["process_sft_data"]["minimum_stable_questions"] = 359
-    config["process_sft_data"]["minimum_candidate_fixes_per_dataset"] = 19
+    config["process_sft_data"]["completion_gate_kind"] = "legacy_prefix_judge"
+    config["process_sft_data"]["planner_complete_episode_required"] = False
     config["dev_selection"]["initial_seeds"] = [17]
     config["dev_selection"]["maximum_mean_total_token_ratio"] = 1.0
     errors = validate_config(config)
-    assert any(">=360" in error for error in errors)
-    assert any(">=20" in error for error in errors)
+    assert any("must not block SFT startup" in error for error in errors)
+    assert any("visual_csv" in error for error in errors)
+    assert any("Planner complete episodes" in error for error in errors)
     assert any("seed 42" in error for error in errors)
     assert any("total-token ratio" in error for error in errors)
 

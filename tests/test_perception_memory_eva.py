@@ -78,6 +78,23 @@ def test_evidence_request_must_name_one_unresolved_item() -> None:
     assert evidence_request_addresses_unresolved("anything", ())
 
 
+def test_evidence_request_ignores_state_words_but_keeps_key_entities() -> None:
+    unresolved = (
+        "The origin of the blue bag (e.g., from a motorcycle) is not shown.",
+    )
+
+    assert evidence_request_addresses_unresolved(
+        "Inspect the first half for the origin of the blue bag from a motorcycle.",
+        unresolved,
+    )
+    assert not evidence_request_addresses_unresolved(
+        "Inspect the first half for the origin of the blue bag.", unresolved
+    )
+    assert not evidence_request_addresses_unresolved(
+        "Inspect more relevant visual evidence.", unresolved
+    )
+
+
 def _role_config_payload() -> dict[str, dict[str, str]]:
     return {
         role: {
@@ -309,6 +326,31 @@ def test_role_separated_planner_history_keeps_only_exact_accepted_pairs() -> Non
     assert "Evidence memory:" in messages[-1]["content"]
     assert "Current retry only." in messages[-1]["content"]
     assert not messages_have_media(messages)
+
+
+def test_role_separated_reference_is_valid_for_current_unresolved_gap() -> None:
+    sample = _sample()
+    memory = EvidenceMemory(sample.option_letters)
+    memory.observed_intervals.append((0.0, 100.0))
+    memory.unresolved = [
+        "The origin of the blue bag (e.g., from a motorcycle) is not shown."
+    ]
+
+    messages = build_role_separated_controller_messages(
+        sample,
+        memory,
+        {"duration": 100.0, "width": 1920, "height": 1080},
+        (),
+    )
+    reference = str(messages[-1]["content"]).split(
+        "Exact currently-valid output reference: ", 1
+    )[1]
+    action = parse_controller_action(reference)
+
+    assert action is not None and action.request is not None
+    assert evidence_request_addresses_unresolved(
+        action.request.evidence_request, memory.unresolved
+    )
 
 
 def test_role_separated_visual_csv_is_ledger_free_and_answerer_caps_citations(
@@ -1877,6 +1919,52 @@ def test_two_duplicate_actions_stop_as_audited_incomplete_fallback(
     assert result["accepted_evidence_steps"] == 1
     assert result["no_novel_action_rejections"] == 2
     assert result["no_novel_action_reason"] == "duplicate_interval"
+
+
+def test_two_unrelated_actions_stop_as_audited_incomplete_fallback(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "video.mp4").write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the first action"}}</tool_call>'
+    )
+    unrelated = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"inspect scenery color"}}</tool_call>'
+    )
+    observer_payload = json.loads(_indexed_state_json(sufficient=False))
+    observer_payload.pop("evidence_sufficient")
+    observer_payload.pop("next_evidence_needed")
+    client = _FakeClient(
+        [first_call, json.dumps(observer_payload), unrelated, unrelated]
+    )
+    bindings = {
+        role: PerceptionMemoryRoleBinding(client, "Qwen3.5-9B", "a" * 64)
+        for role in PERCEPTION_MEMORY_ROLE_NAMES
+    }
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=3,
+        role_bindings=bindings,
+        role_config_sha256="b" * 64,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["fallback_to_candidate"] is True
+    assert result["stop_reason"] == "evidence_incomplete_no_novel_action"
+    assert result["controller_attempts"] == 3
+    assert result["no_novel_action_rejections"] == 2
+    assert result["no_novel_action_reason"] == "unrelated_evidence_request"
 
 
 def test_two_incomplete_stop_requests_become_audited_safe_fallback(

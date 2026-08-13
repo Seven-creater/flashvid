@@ -69,7 +69,54 @@ _MAX_ANSWERER_CITED_FRAMES = 16
 ROLE_SEPARATED_RUNTIME_VERSION = "role_separated_visual_csv_v1"
 PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
 CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v1"
+EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION = "evidence_request_content_signature_v1"
 _CONTROLLER_FRAME_COUNTS = (8, 16, 32, 64, 128)
+_EVIDENCE_REQUEST_IGNORED_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "being",
+        "by",
+        "confirmed",
+        "definitively",
+        "directly",
+        "determined",
+        "e",
+        "eg",
+        "evidence",
+        "for",
+        "from",
+        "g",
+        "identified",
+        "in",
+        "is",
+        "it",
+        "not",
+        "observed",
+        "of",
+        "on",
+        "or",
+        "seen",
+        "shown",
+        "the",
+        "to",
+        "unclear",
+        "unknown",
+        "unresolved",
+        "visible",
+        "was",
+        "were",
+        "whether",
+        "with",
+    }
+)
+_MAX_EVIDENCE_REQUEST_CHARS = 160
 PERCEPTION_MEMORY_ROLE_NAMES = (
     "planner",
     "observer",
@@ -108,6 +155,9 @@ def role_prompt_schema_bundle_sha256() -> str:
         "role_separated_runtime_version": ROLE_SEPARATED_RUNTIME_VERSION,
         "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
         "controller_output_constraint_version": CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+        "evidence_request_content_signature_version": (
+            EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
+        ),
         "visual_csv_schema_version": VISUAL_CSV_SCHEMA_VERSION,
         "contracts": {
             function.__name__: inspect.getsource(function) for function in builders
@@ -525,6 +575,18 @@ def _controller_tool_call(request: FrameRequest) -> str:
     )
 
 
+def _evidence_content_signature(text: str) -> tuple[str, ...]:
+    """Extract deterministic content words from an evidence-gap description."""
+
+    return tuple(
+        dict.fromkeys(
+            token
+            for token in re.findall(r"[a-z0-9]+", str(text).casefold())
+            if len(token) > 1 and token not in _EVIDENCE_REQUEST_IGNORED_WORDS
+        )
+    )
+
+
 def evidence_request_addresses_unresolved(
     evidence_request: str, unresolved: Sequence[str]
 ) -> bool:
@@ -532,11 +594,11 @@ def evidence_request_addresses_unresolved(
 
     if not unresolved:
         return True
-    request_tokens = set(re.findall(r"\w+", evidence_request.casefold()))
+    request_tokens = set(_evidence_content_signature(evidence_request))
     if not request_tokens:
         return False
     for item in unresolved:
-        needed = set(re.findall(r"\w+", str(item).casefold()))
+        needed = set(_evidence_content_signature(str(item)))
         if needed and needed.issubset(request_tokens):
             return True
     return False
@@ -1393,6 +1455,16 @@ def _controller_reference_request(
                 ),
             )
         )
+
+    if memory.unresolved:
+        signature = _evidence_content_signature(memory.unresolved[0])
+        if signature:
+            focused_request = "Inspect for " + " ".join(signature)
+            focused_request = focused_request[:_MAX_EVIDENCE_REQUEST_CHARS]
+            candidates = [
+                (start, end, focused_request)
+                for start, end, _evidence_request in candidates
+            ]
 
     for start, end, evidence_request in candidates:
         if end - start < 0.001:
@@ -2382,6 +2454,9 @@ class PerceptionMemoryEvaEvaluator:
             "controller_output_constraint_version": (
                 CONTROLLER_OUTPUT_CONSTRAINT_VERSION
             ),
+            "evidence_request_content_signature_version": (
+                EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
+            ),
             "model": self.model,
             "role_config_sha256": self.role_config_sha256,
             "role_models": {
@@ -3110,6 +3185,16 @@ class PerceptionMemoryEvaEvaluator:
                         "resolve it."
                     )
                     last_controller_rejection = "unrelated_evidence_request"
+                    no_novel_action_rejections += 1
+                    if (
+                        evidence_steps > 0
+                        and no_novel_action_rejections
+                        >= _MAX_NO_NOVEL_ACTION_REJECTIONS
+                    ):
+                        stopped_without_novel_action = True
+                        no_novel_action_reason = "unrelated_evidence_request"
+                        stop_reason = "evidence_incomplete_no_novel_action"
+                        break
                     continue
                 requested_interval = (
                     action.request.start_time,

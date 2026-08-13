@@ -314,13 +314,11 @@ def visual_csv_response_format(option_letters: Sequence[str]) -> dict[str, Any]:
                         "type": "array",
                         "items": {"type": "integer", "minimum": 0},
                         "minItems": 1,
-                        "uniqueItems": True,
                     },
                     "evidence_complete": {"type": "boolean"},
                     "missing_evidence": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
-                        "uniqueItems": True,
                     },
                 },
                 "required": sorted(_DECISION_KEYS),

@@ -18,6 +18,7 @@ from flashvid_eval.perception_memory_visual_csv import (
     label_visual_csv_prefixes,
     parse_visual_csv_response,
     select_visual_csv_trajectories,
+    visual_csv_response_format,
 )
 from scripts import judge_perception_memory_visual_csv as visual_csv_cli
 from scripts import select_perception_memory_visual_csv_trajectories as selector_cli
@@ -231,6 +232,18 @@ def test_missing_frame_and_misaligned_prefix_fail_closed(tmp_path: Path) -> None
 )
 def test_parser_rejects_bad_indices_or_completeness_contract(text: str) -> None:
     assert parse_visual_csv_response(text, ("A", "B"), 2) is None
+
+
+def test_response_schema_uses_vllm_subset_while_parser_enforces_uniqueness() -> None:
+    schema = visual_csv_response_format(("A", "B"))["json_schema"]["schema"]
+
+    assert "uniqueItems" not in json.dumps(schema)
+    assert parse_visual_csv_response(_response(indices=[0, 0]), ("A", "B"), 2) is None
+    duplicate_missing = _response(
+        evidence_complete=False,
+        missing_evidence=["later action", "later action"],
+    )
+    assert parse_visual_csv_response(duplicate_missing, ("A", "B"), 2) is None
 
 
 def test_three_seed_verification_persists_predictions_indices_and_boolean(

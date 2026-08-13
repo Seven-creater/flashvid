@@ -26,6 +26,8 @@ from .perception_memory_eva import (
     DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION,
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
+    ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+    ROLE_SEPARATED_RUNTIME_VERSION,
     PerceptionState,
     bind_perception_state,
     build_controller_messages,
@@ -36,6 +38,8 @@ from .perception_memory_eva import (
     perception_model_target,
     perception_response_format,
     perception_state_payload,
+    parse_controller_action,
+    role_prompt_schema_bundle_sha256,
     validate_perception_state_observation,
 )
 from .privacy import AnnotationLeakError, assert_annotation_free_request
@@ -44,6 +48,9 @@ from .runner import parse_question_time_range
 from .schemas import ModelSample
 
 
+CONTROLLER_OUTPUT_CONSTRAINT_VERSION = (
+    ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+)
 REPLAY_VERSION = "perception_memory_replay_v5"
 FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
 FRAME_SUBSAMPLE_VERSION = "v1"
@@ -671,6 +678,11 @@ class ReplayConfig:
                 _sha256_text(value, field)
 
     def fingerprint(self) -> str:
+        role_schema_sha256 = (
+            role_prompt_schema_bundle_sha256()
+            if self.role_separated_observer
+            else None
+        )
         return canonical_sha256(
             {
                 "version": REPLAY_VERSION,
@@ -693,6 +705,17 @@ class ReplayConfig:
                 ),
                 "request_timeout_s": float(self.request_timeout_s),
                 "role_separated_observer": self.role_separated_observer,
+                "role_separated_runtime_version": (
+                    ROLE_SEPARATED_RUNTIME_VERSION
+                    if self.role_separated_observer
+                    else None
+                ),
+                "controller_output_constraint_version": (
+                    CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                    if self.role_separated_observer
+                    else None
+                ),
+                "role_prompt_schema_bundle_sha256": role_schema_sha256,
                 "served_model_artifact_sha256": self.served_model_artifact_sha256,
                 "experiment_config_sha256": self.experiment_config_sha256,
                 "training_source_lock_sha256": self.training_source_lock_sha256,
@@ -865,6 +888,18 @@ class PerceptionMemoryReplay:
             )
             assert_annotation_free_request({"messages": controller_messages})
             tool_target = _tool_target(cached.request)
+            if self.config.role_separated_observer:
+                parsed_target = parse_controller_action(
+                    tool_target, role_separated=True
+                )
+                if (
+                    parsed_target is None
+                    or parsed_target.action != "observe"
+                    or parsed_target.request is None
+                ):
+                    raise ValueError(
+                        "role-separated cached Planner target violates frozen v2 schema"
+                    )
             trace.append(
                 {
                     "stage": "controller",
@@ -1134,6 +1169,21 @@ class PerceptionMemoryReplay:
             "source_model_artifact_sha256": source_model_artifact_sha256,
             "served_model_artifact_sha256": model_artifact_sha256,
             "role_separated_observer": self.config.role_separated_observer,
+            **(
+                {
+                    "role_separated_runtime_version": (
+                        ROLE_SEPARATED_RUNTIME_VERSION
+                    ),
+                    "controller_output_constraint_version": (
+                        CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                    ),
+                    "role_prompt_schema_bundle_sha256": (
+                        role_prompt_schema_bundle_sha256()
+                    ),
+                }
+                if self.config.role_separated_observer
+                else {}
+            ),
             "evidence_request_policy": DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
             "evidence_request_policy_version": (
                 DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
@@ -1266,6 +1316,19 @@ def _failure_row(
             else config.fingerprint()
         ),
         "role_separated_observer": config.role_separated_observer,
+        **(
+            {
+                "role_separated_runtime_version": ROLE_SEPARATED_RUNTIME_VERSION,
+                "controller_output_constraint_version": (
+                    CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                ),
+                "role_prompt_schema_bundle_sha256": (
+                    role_prompt_schema_bundle_sha256()
+                ),
+            }
+            if config.role_separated_observer
+            else {}
+        ),
         "evidence_request_policy": DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
         "evidence_request_policy_version": (
             DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
@@ -1441,6 +1504,19 @@ def replay_jsonl(
             }
         ),
         "config_sha256": replayer.config.fingerprint(),
+        **(
+            {
+                "role_separated_runtime_version": ROLE_SEPARATED_RUNTIME_VERSION,
+                "controller_output_constraint_version": (
+                    CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                ),
+                "role_prompt_schema_bundle_sha256": (
+                    role_prompt_schema_bundle_sha256()
+                ),
+            }
+            if role_separated
+            else {}
+        ),
         "experiment_config_sha256": (
             replayer.config.experiment_config_sha256
             if role_separated

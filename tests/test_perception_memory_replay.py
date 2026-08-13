@@ -9,6 +9,11 @@ import pytest
 
 import flashvid_eval.perception_memory_replay as replay_module
 from flashvid_eval.client import ChatResult
+from flashvid_eval.perception_memory_eva import (
+    ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+    ROLE_SEPARATED_RUNTIME_VERSION,
+    role_prompt_schema_bundle_sha256,
+)
 from flashvid_eval.perception_memory_replay import (
     PerceptionMemoryReplay,
     ReplayConfig,
@@ -478,6 +483,15 @@ def test_role_replay_derives_later_request_from_current_unresolved(
     assert later["request"]["evidence_request"] == "Inspect for what happens next"
     assert later["evidence_request_source"] == "deterministic_runtime_reference"
     assert "evidence_request" not in later["source_cached_request"]
+
+
+def test_role_replay_rejects_invalid_final_planner_target(tmp_path: Path) -> None:
+    source = _many_frame_source(tmp_path, 10)
+    source["tool_steps"][0]["evidence_request"] = 'invalid "quoted" request'
+    with pytest.raises(ValueError, match="violates frozen v2 schema"):
+        PerceptionMemoryReplay(FakeClient([]), _role_replay_config()).replay(
+            source, source_file_sha256="a" * 64
+        )
 
 
 @pytest.mark.parametrize("language", ["", "json"])
@@ -1068,6 +1082,12 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
         training_source_lock_sha256="1" * 64,
     ).fingerprint()
     assert role_separated != baseline
+    assert role_separated == ReplayConfig(
+        role_separated_observer=True,
+        served_model_artifact_sha256="e" * 64,
+        experiment_config_sha256="f" * 64,
+        training_source_lock_sha256="1" * 64,
+    ).fingerprint()
     assert (
         role_separated
         != ReplayConfig(
@@ -1077,6 +1097,26 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
             training_source_lock_sha256="1" * 64,
         ).fingerprint()
     )
+    monkeypatch.setattr(
+        replay_module, "ROLE_SEPARATED_RUNTIME_VERSION", "drifted-runtime"
+    )
+    assert _role_replay_config().fingerprint() != role_separated
+    monkeypatch.setattr(
+        replay_module, "ROLE_SEPARATED_RUNTIME_VERSION", ROLE_SEPARATED_RUNTIME_VERSION
+    )
+    monkeypatch.setattr(
+        replay_module, "CONTROLLER_OUTPUT_CONSTRAINT_VERSION", "drifted-constraint"
+    )
+    assert _role_replay_config().fingerprint() != role_separated
+    monkeypatch.setattr(
+        replay_module,
+        "CONTROLLER_OUTPUT_CONSTRAINT_VERSION",
+        ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+    )
+    monkeypatch.setattr(
+        replay_module, "role_prompt_schema_bundle_sha256", lambda: "2" * 64
+    )
+    assert _role_replay_config().fingerprint() != role_separated
     monkeypatch.setattr(
         replay_module,
         "replay_implementation_dependency_hashes",
@@ -1283,6 +1323,41 @@ def test_role_jsonl_uses_training_lock_without_test_diagnostics(tmp_path: Path) 
     assert "diagnostics_gate_sha256" not in row
     assert "audit_summary_sha256" not in row
     assert "diagnostics_gate_sha256" not in summary
+    for artifact in (row, summary):
+        assert artifact["role_separated_runtime_version"] == (
+            ROLE_SEPARATED_RUNTIME_VERSION
+        )
+        assert artifact["controller_output_constraint_version"] == (
+            ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+        )
+        assert artifact["role_prompt_schema_bundle_sha256"] == (
+            role_prompt_schema_bundle_sha256()
+        )
+
+    invalid_source = _source(tmp_path, "lvbench:s1:teacher:invalid-target")
+    invalid_source["tool_steps"] = invalid_source["tool_steps"][:1]
+    invalid_source["tool_steps"][0]["evidence_request"] = 'invalid "quoted" request'
+    invalid_path = tmp_path / "invalid-source.jsonl"
+    invalid_output = tmp_path / "invalid-output.jsonl"
+    invalid_path.write_text(json.dumps(invalid_source) + "\n", encoding="utf-8")
+    invalid_summary = replay_jsonl(
+        input_path=invalid_path,
+        output_path=invalid_output,
+        training_source_lock_path=lock,
+        replayer=PerceptionMemoryReplay(FakeClient([]), config),
+    )
+    invalid_row = json.loads(invalid_output.read_text(encoding="utf-8"))
+    assert invalid_summary["failed"] == 1
+    for artifact in (invalid_row, invalid_summary):
+        assert artifact["role_separated_runtime_version"] == (
+            ROLE_SEPARATED_RUNTIME_VERSION
+        )
+        assert artifact["controller_output_constraint_version"] == (
+            ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+        )
+        assert artifact["role_prompt_schema_bundle_sha256"] == (
+            role_prompt_schema_bundle_sha256()
+        )
 
     lock.write_text('{"split":"changed"}', encoding="utf-8")
     with pytest.raises(ValueError, match="source lock SHA-256"):

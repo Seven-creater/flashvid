@@ -30,12 +30,18 @@ _HASH_FIELDS = (
     "config_sha256",
     "experiment_config_sha256",
     "diagnostics_gate_sha256",
+    "training_source_lock_sha256",
+    "role_prompt_schema_bundle_sha256",
     "manifest_sha256",
     "train600_manifest_sha256",
     "dataset_manifest_sha256",
     "candidate_results_sha256",
     "model_artifact_sha256",
     "teacher_model_sha256",
+)
+_ROLE_RUNTIME_FIELDS = (
+    "role_separated_runtime_version",
+    "controller_output_constraint_version",
 )
 
 
@@ -87,6 +93,24 @@ def _hash_field_coverage(
             missing += 1
             continue
         values.append(_validate_digest(value, f"trajectory[{index}].{field}"))
+    return {
+        "covered_rows": len(trajectories) - missing,
+        "missing_rows": missing,
+        "values": sorted(set(values)),
+    }
+
+
+def _string_field_coverage(
+    trajectories: Sequence[Mapping[str, Any]], field: str
+) -> dict[str, Any]:
+    values: list[str] = []
+    missing = 0
+    for row in trajectories:
+        value = str(row.get(field) or "").strip()
+        if value:
+            values.append(value)
+        else:
+            missing += 1
     return {
         "covered_rows": len(trajectories) - missing,
         "missing_rows": missing,
@@ -171,6 +195,10 @@ def _provenance_coverage(
             field: _hash_field_coverage(trajectories, field)
             for field in _HASH_FIELDS
         },
+        "role_runtime_fields": {
+            field: _string_field_coverage(trajectories, field)
+            for field in _ROLE_RUNTIME_FIELDS
+        },
         "top_level_prompt_hashes": {
             "count": len(top_level_prompts),
             "values": sorted(set(top_level_prompts)),
@@ -183,14 +211,21 @@ def _provenance_coverage(
     }
 
 
-def _validate_provenance(coverage: Mapping[str, Any], row_count: int) -> None:
+def _validate_provenance(
+    coverage: Mapping[str, Any],
+    row_count: int,
+    *,
+    expected_training_source_lock_sha256: str | None = None,
+    expected_role_separated_runtime_version: str | None = None,
+    expected_role_prompt_schema_bundle_sha256: str | None = None,
+    expected_controller_output_constraint_version: str | None = None,
+) -> None:
     models = coverage["models"]
     if models["covered_rows"] != row_count or models["values"] != ["Qwen3.5-9B"]:
         raise ValueError("selected trajectories must all use the frozen Qwen3.5-9B")
     hash_fields = coverage["hash_fields"]
     singleton_fields = (
         "experiment_config_sha256",
-        "diagnostics_gate_sha256",
         "train600_manifest_sha256",
         "model_artifact_sha256",
     )
@@ -198,6 +233,78 @@ def _validate_provenance(coverage: Mapping[str, Any], row_count: int) -> None:
         item = hash_fields[field]
         if item["covered_rows"] != row_count or len(item["values"]) != 1:
             raise ValueError(f"selected trajectories have incomplete or mixed {field}")
+    diagnostics = hash_fields["diagnostics_gate_sha256"]
+    training_lock = hash_fields["training_source_lock_sha256"]
+    diagnostics_complete = (
+        diagnostics["covered_rows"] == row_count
+        and len(diagnostics["values"]) == 1
+    )
+    training_lock_complete = (
+        training_lock["covered_rows"] == row_count
+        and len(training_lock["values"]) == 1
+    )
+    if diagnostics_complete == training_lock_complete:
+        raise ValueError(
+            "selected trajectories must use exactly one complete source gate: "
+            "diagnostics_gate_sha256 or training_source_lock_sha256"
+        )
+    if diagnostics["covered_rows"] not in {0, row_count}:
+        raise ValueError("selected trajectories have partial diagnostics_gate_sha256")
+    if training_lock["covered_rows"] not in {0, row_count}:
+        raise ValueError("selected trajectories have partial training_source_lock_sha256")
+    if expected_training_source_lock_sha256 is not None:
+        expected = _validate_digest(
+            expected_training_source_lock_sha256,
+            "expected_training_source_lock_sha256",
+        )
+        if not training_lock_complete or training_lock["values"] != [expected]:
+            raise ValueError(
+                "selected trajectories are not bound to the expected training source lock"
+            )
+    expected_role_contract = {
+        "role_separated_runtime_version": expected_role_separated_runtime_version,
+        "role_prompt_schema_bundle_sha256": (
+            expected_role_prompt_schema_bundle_sha256
+        ),
+        "controller_output_constraint_version": (
+            expected_controller_output_constraint_version
+        ),
+    }
+    supplied_contract_fields = {
+        field for field, value in expected_role_contract.items() if value is not None
+    }
+    if training_lock_complete:
+        if supplied_contract_fields != set(expected_role_contract):
+            raise ValueError(
+                "role-separated trajectories require the complete expected runtime contract"
+            )
+        expected_role_contract["role_prompt_schema_bundle_sha256"] = _validate_digest(
+            expected_role_contract["role_prompt_schema_bundle_sha256"],
+            "expected_role_prompt_schema_bundle_sha256",
+        )
+        for field in _ROLE_RUNTIME_FIELDS:
+            expected = str(expected_role_contract[field] or "").strip()
+            if not expected:
+                raise ValueError(f"expected_{field} must be non-empty")
+            item = coverage["role_runtime_fields"][field]
+            if item["covered_rows"] != row_count or item["values"] != [expected]:
+                raise ValueError(
+                    f"selected trajectories are not bound to the expected {field}"
+                )
+        prompt_bundle = hash_fields["role_prompt_schema_bundle_sha256"]
+        if (
+            prompt_bundle["covered_rows"] != row_count
+            or prompt_bundle["values"]
+            != [expected_role_contract["role_prompt_schema_bundle_sha256"]]
+        ):
+            raise ValueError(
+                "selected trajectories are not bound to the expected "
+                "role_prompt_schema_bundle_sha256"
+            )
+    elif supplied_contract_fields:
+        raise ValueError(
+            "expected role runtime contract is only valid with a training source lock"
+        )
     for field in ("dataset_manifest_sha256", "candidate_results_sha256"):
         item = hash_fields[field]
         if item["covered_rows"] != row_count or not item["values"]:
@@ -410,6 +517,10 @@ def build(
     include_observer: bool = False,
     completion_gate_kind: str = "visual_csv",
     include_experiment_config_sha256: str | None = None,
+    expected_training_source_lock_sha256: str | None = None,
+    expected_role_separated_runtime_version: str | None = None,
+    expected_role_prompt_schema_bundle_sha256: str | None = None,
+    expected_controller_output_constraint_version: str | None = None,
     overwrite: bool = False,
 ) -> dict[str, Any]:
     if not selected_paths:
@@ -464,7 +575,22 @@ def build(
     output_payload = _jsonl_bytes(records)
     output_sha256 = _sha256_bytes(output_payload)
     provenance = _provenance_coverage(trajectories)
-    _validate_provenance(provenance, len(trajectories))
+    _validate_provenance(
+        provenance,
+        len(trajectories),
+        expected_training_source_lock_sha256=(
+            expected_training_source_lock_sha256
+        ),
+        expected_role_separated_runtime_version=(
+            expected_role_separated_runtime_version
+        ),
+        expected_role_prompt_schema_bundle_sha256=(
+            expected_role_prompt_schema_bundle_sha256
+        ),
+        expected_controller_output_constraint_version=(
+            expected_controller_output_constraint_version
+        ),
+    )
     summary: dict[str, Any] = {
         "schema_version": 1,
         "selected_inputs": input_entries,
@@ -496,6 +622,20 @@ def build(
             "completion_gate_kind": completion_gate_kind,
             "quality_contract_version": QUALITY_CONTRACT_VERSION,
             "visual_path_classifier_version": VISUAL_PATH_CLASSIFIER_VERSION,
+            "training_source_lock_sha256": (
+                expected_training_source_lock_sha256
+            ),
+            "role_runtime_contract": {
+                "role_separated_runtime_version": (
+                    expected_role_separated_runtime_version
+                ),
+                "role_prompt_schema_bundle_sha256": (
+                    expected_role_prompt_schema_bundle_sha256
+                ),
+                "controller_output_constraint_version": (
+                    expected_controller_output_constraint_version
+                ),
+            },
         },
         "provenance_coverage": provenance,
         "sorting": ["trajectory_id", "process_role", "terminal_prefix_index"],
@@ -534,6 +674,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="visual_csv",
     )
     parser.add_argument("--include-experiment-config-sha256")
+    parser.add_argument("--expected-training-source-lock-sha256")
+    parser.add_argument("--expected-role-separated-runtime-version")
+    parser.add_argument("--expected-role-prompt-schema-bundle-sha256")
+    parser.add_argument("--expected-controller-output-constraint-version")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -545,6 +689,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             completion_gate_kind=args.completion_gate_kind,
             include_experiment_config_sha256=(
                 args.include_experiment_config_sha256
+            ),
+            expected_training_source_lock_sha256=(
+                args.expected_training_source_lock_sha256
+            ),
+            expected_role_separated_runtime_version=(
+                args.expected_role_separated_runtime_version
+            ),
+            expected_role_prompt_schema_bundle_sha256=(
+                args.expected_role_prompt_schema_bundle_sha256
+            ),
+            expected_controller_output_constraint_version=(
+                args.expected_controller_output_constraint_version
             ),
             overwrite=args.overwrite,
         )

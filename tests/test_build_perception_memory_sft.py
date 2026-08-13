@@ -9,6 +9,10 @@ import pytest
 
 from scripts import build_perception_memory_sft as builder
 
+ROLE_RUNTIME_VERSION = "role_separated_visual_csv_v2"
+ROLE_PROMPT_BUNDLE_SHA256 = "6" * 64
+CONTROLLER_CONSTRAINT_VERSION = "eva_tool_call_regex_v2"
+
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.write_text(
@@ -41,6 +45,29 @@ def _trajectory(dataset: str, sample_id: str, trajectory_id: str, marker: str) -
                 ],
             }
         ],
+    }
+
+
+def _role_separated_trajectory(
+    dataset: str, sample_id: str, trajectory_id: str, marker: str
+) -> dict:
+    row = _trajectory(dataset, sample_id, trajectory_id, marker)
+    row.pop("diagnostics_gate_sha256")
+    row["training_source_lock_sha256"] = "7" * 64
+    row["role_separated_runtime_version"] = ROLE_RUNTIME_VERSION
+    row["role_prompt_schema_bundle_sha256"] = ROLE_PROMPT_BUNDLE_SHA256
+    row["controller_output_constraint_version"] = CONTROLLER_CONSTRAINT_VERSION
+    return row
+
+
+def _role_contract_kwargs() -> dict[str, str]:
+    return {
+        "expected_training_source_lock_sha256": "7" * 64,
+        "expected_role_separated_runtime_version": ROLE_RUNTIME_VERSION,
+        "expected_role_prompt_schema_bundle_sha256": ROLE_PROMPT_BUNDLE_SHA256,
+        "expected_controller_output_constraint_version": (
+            CONTROLLER_CONSTRAINT_VERSION
+        ),
     }
 
 
@@ -324,6 +351,106 @@ def test_small_corpus_is_advisory_and_does_not_block_build(
     assert gate_calls[0]["kwargs"] == {"completion_gate_kind": "legacy_prefix_judge"}
     assert summary["selection_quality_gate"]["passed"] is True
     assert summary["quantity_distribution"]["selected_trajectories"] == 1
+
+
+def test_role_separated_build_uses_training_source_lock_instead_of_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_export_stubs(monkeypatch)
+    selected = tmp_path / "selected.jsonl"
+    _write_jsonl(
+        selected,
+        [_role_separated_trajectory("lvbench", "sample", "trajectory", "1")],
+    )
+
+    summary = builder.build(
+        selected_paths=[selected],
+        output=tmp_path / "sft.jsonl",
+        summary_path=tmp_path / "summary.json",
+        completion_gate_kind="legacy_prefix_judge",
+        **_role_contract_kwargs(),
+    )
+
+    coverage = summary["provenance_coverage"]["hash_fields"]
+    assert coverage["diagnostics_gate_sha256"]["covered_rows"] == 0
+    assert coverage["training_source_lock_sha256"]["values"] == ["7" * 64]
+    assert summary["export_policy"]["training_source_lock_sha256"] == "7" * 64
+    assert summary["export_policy"]["role_runtime_contract"] == {
+        "role_separated_runtime_version": ROLE_RUNTIME_VERSION,
+        "role_prompt_schema_bundle_sha256": ROLE_PROMPT_BUNDLE_SHA256,
+        "controller_output_constraint_version": CONTROLLER_CONSTRAINT_VERSION,
+    }
+
+
+def test_build_rejects_mixed_or_wrong_training_source_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_export_stubs(monkeypatch)
+    selected = tmp_path / "selected.jsonl"
+    row = _role_separated_trajectory("lvbench", "sample", "trajectory", "1")
+    row["diagnostics_gate_sha256"] = "9" * 64
+    _write_jsonl(selected, [row])
+
+    with pytest.raises(ValueError, match="exactly one complete source gate"):
+        builder.build(
+            selected_paths=[selected],
+            output=tmp_path / "mixed.jsonl",
+            summary_path=tmp_path / "mixed.json",
+            completion_gate_kind="legacy_prefix_judge",
+            **_role_contract_kwargs(),
+        )
+
+    row.pop("diagnostics_gate_sha256")
+    _write_jsonl(selected, [row])
+    with pytest.raises(ValueError, match="not bound to the expected"):
+        builder.build(
+            selected_paths=[selected],
+            output=tmp_path / "wrong.jsonl",
+            summary_path=tmp_path / "wrong.json",
+            completion_gate_kind="legacy_prefix_judge",
+            expected_training_source_lock_sha256="6" * 64,
+            expected_role_separated_runtime_version=ROLE_RUNTIME_VERSION,
+            expected_role_prompt_schema_bundle_sha256=ROLE_PROMPT_BUNDLE_SHA256,
+            expected_controller_output_constraint_version=(
+                CONTROLLER_CONSTRAINT_VERSION
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("role_separated_runtime_version", None),
+        ("role_prompt_schema_bundle_sha256", None),
+        ("controller_output_constraint_version", None),
+        ("role_separated_runtime_version", "drifted-runtime"),
+        ("role_prompt_schema_bundle_sha256", "4" * 64),
+        ("controller_output_constraint_version", "drifted-constraint"),
+    ),
+)
+def test_role_separated_build_rejects_missing_or_drifted_runtime_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: str | None,
+) -> None:
+    _install_export_stubs(monkeypatch)
+    selected = tmp_path / "selected.jsonl"
+    row = _role_separated_trajectory("lvbench", "sample", "trajectory", "1")
+    if replacement is None:
+        row.pop(field)
+    else:
+        row[field] = replacement
+    _write_jsonl(selected, [row])
+
+    with pytest.raises(ValueError, match="not bound to the expected"):
+        builder.build(
+            selected_paths=[selected],
+            output=tmp_path / "sft.jsonl",
+            summary_path=tmp_path / "summary.json",
+            completion_gate_kind="legacy_prefix_judge",
+            **_role_contract_kwargs(),
+        )
 
 
 def test_experiment_config_filter_excludes_rows_without_rewriting_provenance(

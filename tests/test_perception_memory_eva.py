@@ -29,7 +29,10 @@ from flashvid_eval.perception_memory_eva import (
     build_confirmation_controller_messages,
     build_controller_messages,
     build_judge_messages,
+    build_cited_judge_messages,
     build_perception_messages,
+    build_role_separated_controller_messages,
+    build_runtime_visual_csv_messages,
     controller_structured_outputs,
     duplicate_interval,
     explicit_time_rescue_request,
@@ -101,7 +104,7 @@ def test_perception_memory_role_config_is_exact_and_normalized() -> None:
         validate_perception_memory_role_config(invalid_hash)
 
 
-def test_role_config_loader_freezes_file_and_limits_path_transport_to_observer(
+def test_role_config_loader_freezes_file_and_enables_only_media_roles(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "roles.json"
@@ -118,7 +121,7 @@ def test_role_config_loader_freezes_file_and_limits_path_transport_to_observer(
     assert tuple(bindings) == PERCEPTION_MEMORY_ROLE_NAMES
     assert audit["verifier"]["model"] == "qwen-verifier"
     for role, binding in bindings.items():
-        assert binding.client.local_file_urls_as_paths is (role == "observer")
+        assert binding.client.local_file_urls_as_paths is (role != "planner")
         assert binding.artifact_sha256 == audit[role]["artifact_sha256"]
 
 
@@ -260,6 +263,68 @@ def test_controller_is_candidate_blind_and_text_only() -> None:
     assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized
     assert not messages_have_media(messages)
     assert_annotation_free_request({"messages": messages})
+
+
+def test_role_separated_planner_history_keeps_only_exact_accepted_pairs() -> None:
+    sample = _sample()
+    memory = EvidenceMemory(sample.option_letters)
+    accepted = (
+        (
+            {"role": "user", "content": "Exact prior ledger snapshot."},
+            '<tool_call>{"tool":"frame_select","arguments":'
+            '{"start_time":0,"end_time":10,"nframes":8,"resize":0.75,'
+            '"evidence_request":"inspect the first action"}}</tool_call>',
+        ),
+    )
+
+    messages = build_role_separated_controller_messages(
+        sample,
+        memory,
+        {"duration": 100.0, "width": 1920, "height": 1080},
+        accepted,
+        feedback="Current retry only.",
+    )
+
+    assert [item["role"] for item in messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert messages[1] == accepted[0][0]
+    assert messages[2]["content"] == accepted[0][1]
+    assert "Evidence memory:" in messages[-1]["content"]
+    assert "Current retry only." in messages[-1]["content"]
+    assert not messages_have_media(messages)
+
+
+def test_role_separated_visual_csv_is_ledger_free_and_answerer_caps_citations(
+    tmp_path: Path,
+) -> None:
+    sample = _sample()
+    memory = EvidenceMemory(sample.option_letters)
+    state = parse_perception_state(_state_json(), sample.option_letters)
+    assert state is not None
+    memory.merge(state)
+    frames = []
+    for index in range(20):
+        path = tmp_path / f"frame-{index}.jpg"
+        path.write_bytes(b"frame")
+        frames.append((str(path.resolve()), float(index)))
+
+    verifier = build_runtime_visual_csv_messages(sample, frames, prefix_index=0)
+    serialized_verifier = json.dumps(verifier, ensure_ascii=False)
+    assert "Evidence memory" not in serialized_verifier
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_verifier
+    assert serialized_verifier.count('"type": "image_url"') == 20
+
+    answerer = build_cited_judge_messages(
+        sample, memory, frames, tuple(range(20))
+    )
+    serialized_answerer = json.dumps(answerer, ensure_ascii=False)
+    assert "Evidence memory:" in serialized_answerer
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_answerer
+    assert serialized_answerer.count('"type": "image_url"') == 16
 
 
 def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(
@@ -564,6 +629,8 @@ def test_candidate_gate_requires_complete_supported_and_confirmed_change() -> No
         confirmation=evidence,
         complete=False,
         memory=memory,
+        first_valid_evidence_ids=memory.evidence_ids,
+        confirmation_valid_evidence_ids=evidence.evidence_ids,
     )
     assert incomplete.prediction == "A"
     assert incomplete.fallback_to_candidate
@@ -574,6 +641,8 @@ def test_candidate_gate_requires_complete_supported_and_confirmed_change() -> No
         confirmation=EvidenceDecision("A", (support,)),
         complete=True,
         memory=memory,
+        first_valid_evidence_ids=memory.evidence_ids,
+        confirmation_valid_evidence_ids=evidence.evidence_ids,
     )
     assert unconfirmed.prediction == "A"
 
@@ -583,9 +652,49 @@ def test_candidate_gate_requires_complete_supported_and_confirmed_change() -> No
         confirmation=evidence,
         complete=True,
         memory=memory,
+        first_valid_evidence_ids=memory.evidence_ids,
+        confirmation_valid_evidence_ids=evidence.evidence_ids,
     )
     assert changed.prediction == "B"
     assert changed.source == "confirmed_visual_change"
+
+
+def test_candidate_gate_binds_each_decision_to_its_evidence_stage() -> None:
+    state = parse_perception_state(_state_json(), ("A", "B"))
+    assert state is not None
+    memory = EvidenceMemory(("A", "B"))
+    memory.merge(state)
+    support = memory.option_ledger["B"].supports[0]
+    temporal_change = next(
+        item.evidence_id
+        for item in memory.event_ledger
+        if item.source == "temporal_change"
+    )
+    first = EvidenceDecision("B", (support, temporal_change))
+
+    unbound_first = apply_candidate_gate(
+        candidate="A",
+        first=first,
+        confirmation=first,
+        complete=True,
+        memory=memory,
+        first_valid_evidence_ids=(support,),
+        confirmation_valid_evidence_ids=(support, temporal_change),
+    )
+    assert unbound_first.prediction == "A"
+    assert unbound_first.fallback_to_candidate
+
+    stale_confirmation = apply_candidate_gate(
+        candidate="A",
+        first=first,
+        confirmation=first,
+        complete=True,
+        memory=memory,
+        first_valid_evidence_ids=(support, temporal_change),
+        confirmation_valid_evidence_ids=(),
+    )
+    assert stale_confirmation.prediction == "A"
+    assert stale_confirmation.fallback_to_candidate
 
 
 def test_completeness_and_judge_prompts_remain_candidate_blind() -> None:
@@ -740,6 +849,91 @@ def test_evaluator_routes_every_stage_to_its_frozen_role(
         role: f"model-{role}" for role in PERCEPTION_MEMORY_ROLE_NAMES
     }
     assert audit["role_artifact_sha256s"]["observer"] == "2" * 64
+
+
+def test_explicit_roles_use_visual_csv_cited_answer_and_accepted_planner_history(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    tool_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    observer_payload = json.loads(_indexed_state_json())
+    observer_payload.pop("evidence_sufficient")
+    observer_payload.pop("next_evidence_needed")
+    clients = {
+        "planner": _FakeClient([tool_call, '{"action":"stop"}']),
+        "observer": _FakeClient([json.dumps(observer_payload)]),
+        "verifier": _FakeClient(
+            [
+                json.dumps(
+                    {
+                        "answer": "A",
+                        "frame_indices": [0],
+                        "evidence_complete": True,
+                        "missing_evidence": [],
+                    }
+                )
+            ]
+        ),
+        "answerer": _FakeClient(
+            ['{"answer":"A","evidence_ids":["E0001"]}']
+        ),
+    }
+    bindings = {
+        role: PerceptionMemoryRoleBinding(
+            client=clients[role],
+            model=f"model-{role}",
+            artifact_sha256=f"{index + 1:x}" * 64,
+        )
+        for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+    }
+    evaluator = PerceptionMemoryEvaEvaluator(
+        clients["planner"],
+        "legacy-model",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_FakeFrameTool(_observation(tmp_path)),  # type: ignore[arg-type]
+        max_turns=2,
+        role_bindings=bindings,
+        role_config_sha256="a" * 64,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    assert result["error"] is None
+    assert result["final_prediction"] == "A"
+    assert len(result["frame_inventory"]) == 1
+    assert result["decisive_frame_indices"] == [0]
+    assert result["accepted_planner_actions"] == [tool_call]
+    planner_messages = clients["planner"].messages
+    assert [item["role"] for item in planner_messages[1]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert planner_messages[1][1] == planner_messages[0][-1]
+    assert planner_messages[1][2]["content"] == tool_call
+    assert all(not messages_have_media(messages) for messages in planner_messages)
+    verifier_messages = clients["verifier"].messages[0]
+    assert messages_have_media(verifier_messages)
+    serialized_verifier = json.dumps(verifier_messages, ensure_ascii=False)
+    assert "Evidence memory" not in serialized_verifier
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_verifier
+    answerer_messages = clients["answerer"].messages[0]
+    assert messages_have_media(answerer_messages)
+    serialized_answerer = json.dumps(answerer_messages, ensure_ascii=False)
+    assert "Evidence memory:" in serialized_answerer
+    assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_answerer
+    persisted = result["perception_states"][0]["perception_response"]
+    assert "evidence_sufficient" not in persisted
+    assert "next_evidence_needed" not in persisted
+    assert clients["verifier"].request_kwargs[0]["extra_body"]["tool_choice"] == "none"
+    assert clients["answerer"].request_kwargs[0]["extra_body"]["tool_choice"] == "none"
 
 
 def test_role_binding_or_hash_drift_changes_fingerprint(tmp_path: Path) -> None:
@@ -1086,8 +1280,9 @@ def test_rescue_first_action_is_private_free_then_controller_resumes_and_is_sft_
     ]
     result["_selection_stable"] = True
     records = build_perception_memory_sft_records(result)
-    assert records[0]["metadata"]["episode_target_type"] == "tool"
-    assert "frame_select" in records[0]["messages"][-1]["content"]
+    assert records[0]["metadata"]["process_role"] == "planner"
+    assert records[0]["metadata"]["assistant_target_types"] == ["tool", "stop"]
+    assert "frame_select" in records[0]["messages"][2]["content"]
 
 
 def test_rescue_variant_is_fail_closed_and_changes_run_fingerprint(
@@ -1394,11 +1589,11 @@ def test_runtime_compacts_raw_perception_and_remains_sft_exportable(
         for seed in (17, 42, 73)
     ]
     result["_selection_stable"] = True
-    records = build_perception_memory_sft_records(result)
+    records = build_perception_memory_sft_records(result, include_observer=True)
     memory_target = next(
         record
         for record in records
-        if record["metadata"]["episode_target_type"] == "memory"
+        if record["metadata"]["process_role"] == "observer"
     )
     assert (
         len(json.loads(memory_target["messages"][-1]["content"])["timestamped_facts"])
@@ -1468,11 +1663,11 @@ def test_runtime_accepts_exact_legacy_time_schema_and_canonicalizes_target(
         for seed in (17, 42, 73)
     ]
     result["_selection_stable"] = True
-    records = build_perception_memory_sft_records(result)
+    records = build_perception_memory_sft_records(result, include_observer=True)
     memory_target = next(
         record
         for record in records
-        if record["metadata"]["episode_target_type"] == "memory"
+        if record["metadata"]["process_role"] == "observer"
     )
     exported = json.loads(memory_target["messages"][-1]["content"])
     assert exported["timestamped_facts"][0]["frame_index"] == 0
@@ -1964,7 +2159,8 @@ def test_truncated_controller_action_gets_one_bounded_retry(tmp_path: Path) -> N
     ]
     result["_selection_stable"] = True
     records = build_perception_memory_sft_records(result)
-    assert records[0]["metadata"]["episode_target_type"] == "tool"
+    assert records[0]["metadata"]["process_role"] == "planner"
+    assert records[0]["metadata"]["assistant_target_types"] == ["tool", "stop"]
 
 
 def test_first_controller_failure_on_new_step_does_not_link_previous_step(
@@ -2117,9 +2313,12 @@ def test_bad_confirmation_retries_then_runs_second_perception_and_judge(
             '{"answer":"B","evidence_ids":["E0001"]}',
             bad_confirmation,
             confirmation_call,
-            _indexed_state_json(interval=(30.0, 40.0)),
+            _indexed_state_json(
+                interval=(30.0, 40.0),
+                fact="The person walks outside after checking the doorway.",
+            ),
             '{"evidence_complete":true,"missing_evidence":[]}',
-            '{"answer":"B","evidence_ids":["E0001"]}',
+            '{"answer":"B","evidence_ids":["E0003"]}',
         ]
     )
     session = _DurationOnlySession(tmp_path)

@@ -130,7 +130,7 @@ def _load_perception_memory_role_config(
                 validated[role]["base_url"],
                 api_key,
                 timeout,
-                local_file_urls_as_paths=(local_media_paths and role == "observer"),
+                local_file_urls_as_paths=(local_media_paths and role != "planner"),
             ),
             model=validated[role]["model"],
             artifact_sha256=validated[role]["artifact_sha256"],

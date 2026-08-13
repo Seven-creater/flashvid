@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .datasets import VideoIndex
+from .perception_memory_visual_csv import (
+    VisualCsvJob,
+    build_visual_csv_messages,
+    parse_visual_csv_response,
+    visual_csv_response_format,
+)
 from .privacy import AnnotationLeakError, assert_annotation_free_request
 from .qwen_agents.core import (
     ChatClient,
@@ -56,6 +62,8 @@ RESCUE_TRAJECTORY_VARIANTS = frozenset(
 )
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
 _MAX_NO_NOVEL_ACTION_REJECTIONS = 2
+_MAX_ANSWERER_CITED_FRAMES = 16
+ROLE_SEPARATED_RUNTIME_VERSION = "role_separated_visual_csv_v1"
 PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
 CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v1"
 _CONTROLLER_FRAME_COUNTS = (8, 16, 32, 64, 128)
@@ -620,7 +628,10 @@ def _compact_timestamped_facts(
 
 
 def parse_perception_state(
-    text: str, valid_letters: Iterable[str]
+    text: str,
+    valid_letters: Iterable[str],
+    *,
+    allow_role_separated_schema: bool = False,
 ) -> PerceptionState | None:
     """Strictly parse one perception observation without guessing fields."""
 
@@ -640,7 +651,12 @@ def parse_perception_state(
             "evidence_sufficient",
             "next_evidence_needed",
         }
-        if not isinstance(payload, dict) or set(payload) != required:
+        role_separated_required = required - {
+            "evidence_sufficient",
+            "next_evidence_needed",
+        }
+        expected = role_separated_required if allow_role_separated_schema else required
+        if not isinstance(payload, dict) or set(payload) != expected:
             return None
         interval = payload["interval"]
         if not isinstance(interval, list) or len(interval) != 2:
@@ -678,9 +694,11 @@ def parse_perception_state(
                     item["contradicts"], f"option_evidence.{letter}.contradicts"
                 ),
             )
-        if not isinstance(payload["evidence_sufficient"], bool):
+        if "evidence_sufficient" in payload and not isinstance(
+            payload["evidence_sufficient"], bool
+        ):
             return None
-        next_needed = payload["next_evidence_needed"]
+        next_needed = payload.get("next_evidence_needed", "")
         if not isinstance(next_needed, str):
             return None
         return PerceptionState(
@@ -691,7 +709,7 @@ def parse_perception_state(
                 payload["temporal_changes"], "temporal_changes"
             ),
             unresolved=_string_list(payload["unresolved"], "unresolved"),
-            evidence_sufficient=payload["evidence_sufficient"],
+            evidence_sufficient=bool(payload.get("evidence_sufficient", False)),
             next_evidence_needed=_SPACE_RE.sub(" ", next_needed.strip()),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -704,6 +722,7 @@ def bind_perception_state(
     actual_timestamps: Sequence[float],
     *,
     allow_timestamp_schema: bool = True,
+    allow_role_separated_schema: bool = False,
 ) -> tuple[PerceptionState | None, str]:
     """Bind zero-based frame references to exact sampled-frame timestamps.
 
@@ -727,7 +746,14 @@ def bind_perception_state(
     if not isinstance(facts, list):
         return None, "invalid"
     if not facts:
-        return parse_perception_state(text, valid_letters), "none"
+        return (
+            parse_perception_state(
+                text,
+                valid_letters,
+                allow_role_separated_schema=allow_role_separated_schema,
+            ),
+            "none",
+        )
     if all(
         isinstance(item, dict) and set(item) == {"frame_index", "fact"}
         for item in facts
@@ -753,18 +779,27 @@ def bind_perception_state(
         payload["timestamped_facts"] = rebound
         return (
             parse_perception_state(
-                json.dumps(payload, ensure_ascii=False), valid_letters
+                json.dumps(payload, ensure_ascii=False),
+                valid_letters,
+                allow_role_separated_schema=allow_role_separated_schema,
             ),
             "frame_index",
         )
-    parsed = parse_perception_state(text, valid_letters)
+    parsed = parse_perception_state(
+        text,
+        valid_letters,
+        allow_role_separated_schema=allow_role_separated_schema,
+    )
     if parsed is None or not allow_timestamp_schema:
         return None, "timestamp" if parsed is not None else "invalid"
     return parsed, "timestamp"
 
 
 def perception_model_target(
-    state: PerceptionState, actual_timestamps: Sequence[float]
+    state: PerceptionState,
+    actual_timestamps: Sequence[float],
+    *,
+    role_separated: bool = False,
 ) -> str:
     """Serialize a validated perception state using zero-based frame indices."""
 
@@ -783,9 +818,24 @@ def perception_model_target(
             raise ValueError("perception fact is not bound to an actual frame")
         indexed_facts.append({"frame_index": matches[0], "fact": fact.fact})
     payload["timestamped_facts"] = indexed_facts
+    if role_separated:
+        payload.pop("evidence_sufficient", None)
+        payload.pop("next_evidence_needed", None)
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
+
+
+def perception_state_payload(
+    state: PerceptionState, *, role_separated: bool = False
+) -> dict[str, Any]:
+    """Serialize one normalized observation without assigning stop responsibility."""
+
+    payload = state.to_dict()
+    if role_separated:
+        payload.pop("evidence_sufficient", None)
+        payload.pop("next_evidence_needed", None)
+    return payload
 
 
 def normalize_perception_state(
@@ -978,14 +1028,29 @@ class EvidenceMemory:
             return existing
         return (self._evidence_id(fact, interval, None, source),)
 
-    def merge(self, state: PerceptionState) -> None:
-        """Merge one observation in stable input order and preserve old evidence."""
+    def merge(self, state: PerceptionState) -> tuple[str, ...]:
+        """Merge one observation and return the evidence IDs bound to this step.
+
+        The returned IDs include exact, deterministically reused events.  This lets
+        the confirmation gate distinguish evidence actually observed again in the
+        confirmation step from unrelated IDs that merely exist in the final ledger.
+        """
 
         self.observed_intervals.append(state.interval)
+        bound_ids: list[str] = []
+
+        def bind(evidence_id: str) -> None:
+            if evidence_id not in bound_ids:
+                bound_ids.append(evidence_id)
+
         for item in state.timestamped_facts:
-            self._evidence_id(item.fact, state.interval, item.time, "timestamped_fact")
+            bind(
+                self._evidence_id(
+                    item.fact, state.interval, item.time, "timestamped_fact"
+                )
+            )
         for change in state.temporal_changes:
-            self._evidence_id(change, state.interval, None, "temporal_change")
+            bind(self._evidence_id(change, state.interval, None, "temporal_change"))
         for letter in self.option_letters:
             observation = state.option_evidence[letter]
             current = self.option_ledger[letter]
@@ -995,18 +1060,21 @@ class EvidenceMemory:
                 for evidence_id in self._option_evidence_ids(
                     fact, state.interval, f"option_{letter}_support"
                 ):
+                    bind(evidence_id)
                     if evidence_id not in supports:
                         supports.append(evidence_id)
             for fact in observation.contradicts:
                 for evidence_id in self._option_evidence_ids(
                     fact, state.interval, f"option_{letter}_contradiction"
                 ):
+                    bind(evidence_id)
                     if evidence_id not in contradicts:
                         contradicts.append(evidence_id)
             self.option_ledger[letter] = OptionLedger(
                 tuple(supports), tuple(contradicts)
             )
         self.unresolved = list(dict.fromkeys(state.unresolved))
+        return tuple(bound_ids)
 
     @property
     def evidence_ids(self) -> frozenset[str]:
@@ -1256,12 +1324,62 @@ def build_controller_messages(
     return messages
 
 
+def _with_accepted_planner_history(
+    current_messages: Sequence[Mapping[str, Any]],
+    accepted_history: Sequence[tuple[Mapping[str, Any], str]],
+) -> list[dict[str, Any]]:
+    """Add only successfully executed planner actions before the latest snapshot."""
+
+    if (
+        len(current_messages) != 2
+        or current_messages[0].get("role") != "system"
+        or current_messages[1].get("role") != "user"
+    ):
+        raise ValueError("planner history requires one system and one current user")
+    messages = [copy.deepcopy(dict(current_messages[0]))]
+    for raw_user, raw_action in accepted_history:
+        action = parse_controller_action(raw_action)
+        if action is None or action.action != "observe" or action.request is None:
+            raise ValueError("planner history accepts only valid frame_select actions")
+        if raw_user.get("role") != "user" or set(raw_user) != {"role", "content"}:
+            raise ValueError("planner history requires exact prior user snapshots")
+        messages.extend(
+            [
+                copy.deepcopy(dict(raw_user)),
+                {"role": "assistant", "content": raw_action.strip()},
+            ]
+        )
+    messages.append(copy.deepcopy(dict(current_messages[1])))
+    if sum(message.get("role") == "system" for message in messages) != 1:
+        raise AssertionError("planner accepted history must contain one system message")
+    if messages_have_media(messages):
+        raise AssertionError("planner accepted history must remain text-only")
+    return messages
+
+
+def build_role_separated_controller_messages(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    video_metadata: Mapping[str, float | int],
+    accepted_history: Sequence[tuple[Mapping[str, Any], str]],
+    *,
+    feedback: str = "",
+) -> list[dict[str, Any]]:
+    """Build the explicit-role planner request with accepted-action history only."""
+
+    return _with_accepted_planner_history(
+        build_controller_messages(sample, memory, video_metadata, feedback=feedback),
+        accepted_history,
+    )
+
+
 def build_perception_messages(
     sample: ModelSample,
     observation: FrameObservation,
     evidence_request: str,
     *,
     use_frame_indices: bool = False,
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     """Build a candidate-blind request containing only the current-step frames."""
 
@@ -1273,20 +1391,36 @@ def build_perception_messages(
         if use_frame_indices
         else "time must be the numeric timestamp printed beside an observed frame"
     )
+    output_fields = (
+        "interval, timestamped_facts, option_evidence, temporal_changes, unresolved"
+        if role_separated
+        else (
+            "interval, timestamped_facts, option_evidence, temporal_changes, "
+            "unresolved, evidence_sufficient, next_evidence_needed"
+        )
+    )
+    sufficiency_instruction = (
+        "Completeness and stopping are decided by a separate visual verifier; do "
+        "not output a sufficiency or next-step decision. "
+        if role_separated
+        else (
+            "evidence_sufficient is boolean; next_evidence_needed is one string, "
+            "empty only when no further evidence is needed. evidence_sufficient "
+            "describes only the current accumulated visual question, not benchmark "
+            "correctness. "
+        )
+    )
     system = (
         "You are the visual perception role. Report only facts directly visible in "
         "the current timestamped frames. Do not guess missing actions. Return one JSON "
-        "object with exactly: interval, timestamped_facts, option_evidence, "
-        "temporal_changes, unresolved, evidence_sufficient, next_evidence_needed. "
+        f"object with exactly: {output_fields}. "
         f"timestamped_facts is an array of {fact_schema}; {fact_reference}. "
         "option_evidence must contain "
         f"exactly these option labels: {letters}; each has supports and contradicts "
         "string arrays. interval is two numbers; each timestamped fact contains its "
         "required frame reference and a string fact; temporal_changes and unresolved "
         "are string arrays; "
-        "evidence_sufficient is boolean; next_evidence_needed is one string, empty only "
-        "when no further evidence is needed. evidence_sufficient describes only the "
-        "current accumulated visual question, not benchmark correctness. Keep the state "
+        f"{sufficiency_instruction}Keep the state "
         "short: at most 12 timestamped_facts (the most discriminative facts, at most 20 "
         "words each), at most one support and one contradiction per option, at most four "
         "temporal_changes, at most three unresolved items, and at most 20 words in "
@@ -1333,7 +1467,10 @@ def build_perception_messages(
 
 
 def perception_response_format(
-    valid_letters: Sequence[str], frame_count: int
+    valid_letters: Sequence[str],
+    frame_count: int,
+    *,
+    role_separated: bool = False,
 ) -> dict[str, Any]:
     """Return the strict, per-request schema enforced by the serving runtime."""
 
@@ -1417,6 +1554,14 @@ def perception_response_format(
         ],
         "additionalProperties": False,
     }
+    if role_separated:
+        schema["properties"].pop("evidence_sufficient")
+        schema["properties"].pop("next_evidence_needed")
+        schema["required"] = [
+            key
+            for key in schema["required"]
+            if key not in {"evidence_sufficient", "next_evidence_needed"}
+        ]
     return {
         "type": "json_schema",
         "json_schema": {
@@ -1434,6 +1579,7 @@ def build_perception_retry_messages(
     valid_letters: Sequence[str],
     frame_count: int,
     interval: tuple[float, float],
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     """Add one compact schema correction without changing the observed frames."""
 
@@ -1463,6 +1609,9 @@ def build_perception_retry_messages(
         "evidence_sufficient": False,
         "next_evidence_needed": "",
     }
+    if role_separated:
+        skeleton.pop("evidence_sufficient")
+        skeleton.pop("next_evidence_needed")
     correction = (
         f"Correction after {reason or 'invalid_json_or_schema'}: return one compact "
         "raw JSON object only. The current observation contains exactly "
@@ -1474,7 +1623,7 @@ def build_perception_retry_messages(
         f"{', '.join(letters)}; every option value must be an object with exactly "
         "supports and contradicts string arrays. A bare list as an option value is "
         "forbidden. Preserve every top-level key and its type. Use this exact JSON "
-        "skeleton, replacing only arrays, the boolean, and next_evidence_needed: "
+        "skeleton, replacing only its arrays and observation values: "
         + json.dumps(skeleton, ensure_ascii=False, separators=(",", ":"))
     )
     content.append({"type": "text", "text": correction})
@@ -1544,6 +1693,29 @@ def build_confirmation_controller_messages(
     ]
 
 
+def build_role_separated_confirmation_controller_messages(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    video_metadata: Mapping[str, float | int],
+    hypotheses: tuple[str, str],
+    accepted_history: Sequence[tuple[Mapping[str, Any], str]],
+    *,
+    feedback: str = "",
+) -> list[dict[str, Any]]:
+    """Build the explicit-role confirmation request with accepted history only."""
+
+    return _with_accepted_planner_history(
+        build_confirmation_controller_messages(
+            sample,
+            memory,
+            video_metadata,
+            hypotheses,
+            feedback=feedback,
+        ),
+        accepted_history,
+    )
+
+
 def build_judge_messages(
     sample: ModelSample, memory: EvidenceMemory
 ) -> list[dict[str, Any]]:
@@ -1565,10 +1737,129 @@ def build_judge_messages(
     ]
 
 
+def _deduplicated_frame_inventory(
+    inventory: Sequence[tuple[str, float]],
+) -> tuple[tuple[str, float], ...]:
+    result: list[tuple[str, float]] = []
+    seen: set[tuple[str, float]] = set()
+    for raw_path, raw_timestamp in inventory:
+        resolved = Path(raw_path).resolve()
+        if not resolved.is_file():
+            raise ValueError(f"observed frame is missing: {resolved}")
+        path = str(resolved)
+        timestamp = _finite_number(raw_timestamp, "frame inventory timestamp")
+        item = (path, timestamp)
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return tuple(result)
+
+
+def build_runtime_visual_csv_messages(
+    sample: ModelSample,
+    frame_inventory: Sequence[tuple[str, float]],
+    *,
+    prefix_index: int,
+) -> list[dict[str, Any]]:
+    """Reuse the offline visual-CSV contract for one candidate-blind runtime check."""
+
+    frames = _deduplicated_frame_inventory(frame_inventory)
+    if not frames:
+        raise ValueError("runtime visual CSV requires at least one observed frame")
+    public_sample = replace(sample, candidate_answer=None)
+    source_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "dataset": sample.dataset,
+                "sample_id": sample.sample_id,
+                "prefix_index": prefix_index,
+                "frames": frames,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    job = VisualCsvJob(
+        trajectory_id=f"{sample.dataset}:{sample.sample_id}:runtime",
+        prefix_id=f"{sample.dataset}:{sample.sample_id}:runtime#{prefix_index:03d}",
+        prefix_index=prefix_index,
+        dataset=sample.dataset,
+        sample_id=sample.sample_id,
+        sample=public_sample,
+        frame_paths=tuple(item[0] for item in frames),
+        timestamps=tuple(item[1] for item in frames),
+        source_sha256=source_sha256,
+    )
+    return build_visual_csv_messages(job)
+
+
+def build_cited_judge_messages(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    frame_inventory: Sequence[tuple[str, float]],
+    cited_frame_indices: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Attach at most 16 verifier-cited frames to the evidence-ledger answerer."""
+
+    frames = _deduplicated_frame_inventory(frame_inventory)
+    unique_indices: list[int] = []
+    for raw_index in cited_frame_indices:
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ValueError("cited frame index must be an integer")
+        if raw_index < 0 or raw_index >= len(frames):
+            raise ValueError("cited frame index is outside the accumulated inventory")
+        if raw_index not in unique_indices:
+            unique_indices.append(raw_index)
+        if len(unique_indices) == _MAX_ANSWERER_CITED_FRAMES:
+            break
+    if not unique_indices:
+        raise ValueError("answerer requires at least one verifier-cited frame")
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                f"{_question_text(sample)}\nEvidence memory: {_memory_json(memory)}\n"
+                "The following decisive frames were cited by the candidate-blind "
+                "visual verifier. Answer from the ledger and these frames only."
+            ),
+        }
+    ]
+    for index in unique_indices:
+        path, timestamp = frames[index]
+        content.extend(
+            [
+                {
+                    "type": "text",
+                    "text": f"Cited frame index {index}, timestamp {timestamp:.3f} seconds",
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": Path(path).resolve().as_uri()},
+                },
+            ]
+        )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Answer only from the timestamped evidence ledger and attached cited "
+                "frames. Every choice must cite valid evidence IDs; never fill in an "
+                'unobserved action. Return exactly {"answer":"X","evidence_ids":["E0001"]}.'
+            ),
+        },
+        {"role": "user", "content": content},
+    ]
+    assert_annotation_free_request({"messages": messages})
+    return messages
+
+
 @dataclass(frozen=True)
 class CompletenessDecision:
     evidence_complete: bool
     missing_evidence: tuple[str, ...]
+    answer: str | None = None
+    frame_indices: tuple[int, ...] = ()
 
 
 def parse_completeness(text: str) -> CompletenessDecision | None:
@@ -1647,6 +1938,8 @@ def apply_candidate_gate(
     confirmation: EvidenceDecision | None,
     complete: bool,
     memory: EvidenceMemory,
+    first_valid_evidence_ids: Iterable[str] | None = None,
+    confirmation_valid_evidence_ids: Iterable[str] | None = None,
 ) -> FinalDecision:
     """Apply the conservative Direct-candidate gate without lexical heuristics."""
 
@@ -1657,6 +1950,23 @@ def apply_candidate_gate(
     if first.answer == candidate:
         return FinalDecision(candidate, "evidence_agrees_with_candidate", False)
     if confirmation is None or confirmation.answer != first.answer:
+        return FinalDecision(candidate, "candidate_fallback", True)
+    first_allowed = (
+        frozenset(first_valid_evidence_ids)
+        if first_valid_evidence_ids is not None
+        else frozenset()
+    )
+    confirmation_allowed = (
+        frozenset(confirmation_valid_evidence_ids)
+        if confirmation_valid_evidence_ids is not None
+        else frozenset()
+    )
+    if (
+        not first_allowed
+        or not confirmation_allowed
+        or not set(first.evidence_ids).issubset(first_allowed)
+        or not set(confirmation.evidence_ids).issubset(confirmation_allowed)
+    ):
         return FinalDecision(candidate, "candidate_fallback", True)
     new_ledger = memory.option_ledger.get(first.answer, OptionLedger())
     old_ledger = memory.option_ledger.get(candidate, OptionLedger())
@@ -1799,6 +2109,20 @@ class PerceptionMemoryEvaEvaluator:
             if bool(getattr(observer_client, "local_file_urls_as_paths", False))
             else "file_url"
         )
+        self.role_media_transports = {
+            role: (
+                "path"
+                if bool(
+                    getattr(
+                        self.role_bindings[role].client,
+                        "local_file_urls_as_paths",
+                        False,
+                    )
+                )
+                else "file_url"
+            )
+            for role in PERCEPTION_MEMORY_ROLE_NAMES
+        }
         self.model = model
         self.index = VideoIndex(video_root)
         self.frame_tool = frame_tool or FrameTool(
@@ -1851,6 +2175,7 @@ class PerceptionMemoryEvaEvaluator:
             package_root / "privacy.py",
             package_root / "eva_official.py",
             package_root / "question_time.py",
+            package_root / "perception_memory_visual_csv.py",
             package_root / "qwen_agents" / "core.py",
         )
         implementation_hashes = {
@@ -1915,6 +2240,12 @@ class PerceptionMemoryEvaEvaluator:
             "experiment_config_sha256": self.experiment_config_sha256,
             "diagnostics_gate_sha256": self.diagnostics_gate_sha256,
             "local_media_transport": self.local_media_transport,
+            "role_media_transports": copy.deepcopy(self.role_media_transports),
+            "role_separated_runtime_version": (
+                ROLE_SEPARATED_RUNTIME_VERSION
+                if self.role_config_sha256 is not None
+                else None
+            ),
             "scoring_deferred": self.scoring_deferred,
             "train600_manifest_sha256": self.train600_manifest_sha256,
             "trajectory_schedule_id": self.trajectory_schedule_id,
@@ -1943,13 +2274,17 @@ class PerceptionMemoryEvaEvaluator:
         json_mode: bool,
         response_format: dict[str, Any] | None = None,
         structured_outputs: dict[str, Any] | None = None,
+        tools_disabled: bool = False,
         step_index: int | None = None,
         prefix_index: int | None = None,
     ) -> str:
         assert_annotation_free_request({"messages": messages})
         role_name = perception_memory_role_for_stage(stage)
         role_binding = self.role_bindings[role_name]
-        if role_name != "observer" and messages_have_media(messages):
+        if messages_have_media(messages) and (
+            role_name == "planner"
+            or (self.role_config_sha256 is None and role_name != "observer")
+        ):
             raise AssertionError(f"{role_name} request contains media")
         prompt_hash = hashlib.sha256(
             json.dumps(
@@ -1973,6 +2308,8 @@ class PerceptionMemoryEvaEvaluator:
         extra_body: dict[str, Any] = {"return_token_ids": True}
         if effective_structured_outputs is not None:
             extra_body["structured_outputs"] = effective_structured_outputs
+        if tools_disabled:
+            extra_body["tool_choice"] = "none"
         result = role_binding.client.chat(
             role_binding.model,
             messages,
@@ -2001,6 +2338,7 @@ class PerceptionMemoryEvaEvaluator:
                 "prompt_hash": prompt_hash,
                 "response_format": copy.deepcopy(effective_response_format),
                 "structured_outputs": copy.deepcopy(effective_structured_outputs),
+                "tools_disabled": tools_disabled,
             }
         )
         if result.finish_reason == "length":
@@ -2026,6 +2364,7 @@ class PerceptionMemoryEvaEvaluator:
             observation,
             evidence_request,
             use_frame_indices=True,
+            role_separated=self.role_config_sha256 is not None,
         )
         retry_group_id = _messages_sha256(messages)
         retry_reason: str | None = None
@@ -2044,6 +2383,7 @@ class PerceptionMemoryEvaEvaluator:
                         observation.resolved_start_time,
                         observation.resolved_end_time,
                     ),
+                    role_separated=self.role_config_sha256 is not None,
                 )
             )
             if attempt_index == 0:
@@ -2080,7 +2420,9 @@ class PerceptionMemoryEvaEvaluator:
                     seed_offset=seed_offset,
                     json_mode=True,
                     response_format=perception_response_format(
-                        sample.option_letters, len(observation.timestamps)
+                        sample.option_letters,
+                        len(observation.timestamps),
+                        role_separated=self.role_config_sha256 is not None,
                     ),
                     step_index=step_index,
                     prefix_index=prefix_index,
@@ -2140,6 +2482,7 @@ class PerceptionMemoryEvaEvaluator:
                 # frame within the frozen 1 ms tolerance.  The persisted SFT target
                 # remains canonical frame_index via perception_model_target().
                 allow_timestamp_schema=True,
+                allow_role_separated_schema=self.role_config_sha256 is not None,
             )
             attempt_failure: str | None = None
             validation_error: str | None = None
@@ -2183,7 +2526,9 @@ class PerceptionMemoryEvaEvaluator:
                     "perception_retry_reason": retry_reason,
                     "timestamp_reference_mode": timestamp_reference_mode,
                     "perception_model_target": perception_model_target(
-                        state, observation.timestamps
+                        state,
+                        observation.timestamps,
+                        role_separated=self.role_config_sha256 is not None,
                     ),
                 }
             retry_reason = attempt_failure
@@ -2202,7 +2547,50 @@ class PerceptionMemoryEvaEvaluator:
         seed_offset: int,
         step_index: int | None = None,
         prefix_index: int | None = None,
+        frame_inventory: Sequence[tuple[str, float]] = (),
     ) -> CompletenessDecision | None:
+        if self.role_config_sha256 is not None:
+            frames = _deduplicated_frame_inventory(frame_inventory)
+            if not frames:
+                return CompletenessDecision(False, ("no visual frames observed",))
+            effective_prefix = prefix_index if prefix_index is not None else -1
+            messages = build_runtime_visual_csv_messages(
+                sample, frames, prefix_index=effective_prefix
+            )
+            content = self._chat(
+                trace,
+                messages,
+                stage="completeness",
+                max_tokens=self.judge_max_tokens,
+                seed_offset=seed_offset,
+                json_mode=False,
+                response_format=visual_csv_response_format(sample.option_letters),
+                tools_disabled=True,
+                step_index=step_index,
+                prefix_index=prefix_index,
+            )
+            decision = parse_visual_csv_response(
+                content, sample.option_letters, len(frames)
+            )
+            trace[-1].update(
+                {
+                    "candidate_blind": True,
+                    "ledger_blind": True,
+                    "prior_reasoning_blind": True,
+                    "frame_inventory_count": len(frames),
+                    "cited_frame_indices": (
+                        list(decision.frame_indices) if decision is not None else []
+                    ),
+                }
+            )
+            if decision is None:
+                return None
+            return CompletenessDecision(
+                evidence_complete=decision.evidence_complete,
+                missing_evidence=decision.missing_evidence,
+                answer=decision.answer,
+                frame_indices=decision.frame_indices,
+            )
         content = self._chat(
             trace,
             build_completeness_messages(sample, memory),
@@ -2224,17 +2612,36 @@ class PerceptionMemoryEvaEvaluator:
         stage: str,
         step_index: int | None = None,
         prefix_index: int | None = None,
+        frame_inventory: Sequence[tuple[str, float]] = (),
+        cited_frame_indices: Sequence[int] = (),
     ) -> EvidenceDecision | None:
+        messages = build_judge_messages(sample, memory)
+        if self.role_config_sha256 is not None:
+            messages = build_cited_judge_messages(
+                sample, memory, frame_inventory, cited_frame_indices
+            )
         content = self._chat(
             trace,
-            build_judge_messages(sample, memory),
+            messages,
             stage=stage,
             max_tokens=self.judge_max_tokens,
             seed_offset=seed_offset,
             json_mode=True,
+            tools_disabled=self.role_config_sha256 is not None,
             step_index=step_index,
             prefix_index=prefix_index,
         )
+        if self.role_config_sha256 is not None:
+            trace[-1].update(
+                {
+                    "frame_inventory_count": len(
+                        _deduplicated_frame_inventory(frame_inventory)
+                    ),
+                    "cited_frame_indices": list(cited_frame_indices)[
+                        :_MAX_ANSWERER_CITED_FRAMES
+                    ],
+                }
+            )
         return parse_evidence_decision(
             content, sample.option_letters, memory.evidence_ids
         )
@@ -2269,6 +2676,13 @@ class PerceptionMemoryEvaEvaluator:
         no_novel_action_rejections = 0
         no_novel_action_reason: str | None = None
         stopped_without_novel_action = False
+        accepted_planner_history: list[tuple[dict[str, Any], str]] = []
+        frame_inventory: list[tuple[str, float]] = []
+        decisive_frame_indices: tuple[int, ...] = ()
+        confirmation_decisive_frame_indices: tuple[int, ...] = ()
+        first_valid_evidence_ids: frozenset[str] = frozenset()
+        confirmation_bound_evidence_ids: tuple[str, ...] = ()
+        confirmation_new_evidence_ids: tuple[str, ...] = ()
 
         try:
             video = self.index.resolve(sample.video)
@@ -2297,6 +2711,23 @@ class PerceptionMemoryEvaEvaluator:
                 )
             last_controller_rejection: str | None = None
             controller_step_attempts = 0
+
+            def planner_messages(*, current_feedback: str = "") -> list[dict[str, Any]]:
+                if self.role_config_sha256 is None:
+                    return build_controller_messages(
+                        sample,
+                        memory,
+                        session.metadata,
+                        feedback=current_feedback,
+                    )
+                return build_role_separated_controller_messages(
+                    sample,
+                    memory,
+                    session.metadata,
+                    accepted_planner_history,
+                    feedback=current_feedback,
+                )
+
             while (
                 evidence_steps < self.max_turns
                 and controller_attempts < self.max_controller_attempts
@@ -2307,12 +2738,10 @@ class PerceptionMemoryEvaEvaluator:
                 controller_step_attempts += 1
                 retry_reason = last_controller_rejection
                 controller_retry_group_id = _messages_sha256(
-                    build_controller_messages(sample, memory, session.metadata)
+                    planner_messages()
                 )
                 if controller_attempt_index == 0 and rescue_request is not None:
-                    controller_messages = build_controller_messages(
-                        sample, memory, session.metadata, feedback=feedback
-                    )
+                    controller_messages = planner_messages(current_feedback=feedback)
                     assert_annotation_free_request({"messages": controller_messages})
                     controller_text = _controller_tool_call(rescue_request)
                     request_trace.append(
@@ -2354,12 +2783,11 @@ class PerceptionMemoryEvaEvaluator:
                         }
                     )
                 else:
+                    controller_messages = planner_messages(current_feedback=feedback)
                     try:
                         controller_text = self._chat(
                             request_trace,
-                            build_controller_messages(
-                                sample, memory, session.metadata, feedback=feedback
-                            ),
+                            controller_messages,
                             stage="controller",
                             max_tokens=self.controller_max_tokens,
                             seed_offset=evidence_steps * 10,
@@ -2422,6 +2850,7 @@ class PerceptionMemoryEvaEvaluator:
                     last_controller_rejection = rejection_reason
                     continue
                 if action.action == "stop":
+                    controller_trace = request_trace[-1]
                     decision = self._completeness(
                         sample,
                         memory,
@@ -2429,20 +2858,22 @@ class PerceptionMemoryEvaEvaluator:
                         controller_attempt_index * 10 + 1,
                         step_index=evidence_steps,
                         prefix_index=len(perception_states) - 1,
+                        frame_inventory=frame_inventory,
                     )
                     if (
                         decision is not None
                         and decision.evidence_complete
                         and memory.event_ledger
                     ):
-                        request_trace[-2]["action_accepted"] = True
+                        controller_trace["action_accepted"] = True
+                        decisive_frame_indices = decision.frame_indices
                         complete = True
                         stop_reason = "evidence_complete"
                         if perception_states:
                             perception_states[-1]["evidence_complete"] = True
                         break
-                    request_trace[-2]["action_accepted"] = False
-                    request_trace[-2]["action_rejection_reason"] = "incomplete_evidence"
+                    controller_trace["action_accepted"] = False
+                    controller_trace["action_rejection_reason"] = "incomplete_evidence"
                     missing = (
                         decision.missing_evidence
                         if decision
@@ -2493,6 +2924,7 @@ class PerceptionMemoryEvaEvaluator:
                             controller_attempt_index * 10 + 1,
                             step_index=evidence_steps - 1,
                             prefix_index=len(perception_states) - 1,
+                            frame_inventory=frame_inventory,
                         )
                         if (
                             decision is not None
@@ -2500,6 +2932,7 @@ class PerceptionMemoryEvaEvaluator:
                             and memory.event_ledger
                         ):
                             complete = True
+                            decisive_frame_indices = decision.frame_indices
                             stop_reason = "evidence_complete_after_duplicate_stall"
                             perception_states[-1]["evidence_complete"] = True
                             break
@@ -2545,6 +2978,15 @@ class PerceptionMemoryEvaEvaluator:
                     prefix_index=state_index,
                 )
                 memory.merge(state)
+                frame_inventory.extend(
+                    zip(observation.frame_paths, observation.timestamps, strict=True)
+                )
+                accepted_planner_history.append(
+                    (copy.deepcopy(dict(controller_messages[-1])), controller_text.strip())
+                )
+                perception_payload = perception_state_payload(
+                    state, role_separated=self.role_config_sha256 is not None
+                )
                 perception_states.append(
                     {
                         "step_index": state_index,
@@ -2552,8 +2994,8 @@ class PerceptionMemoryEvaEvaluator:
                         "request": action.request.to_tool_arguments(),
                         "frame_paths": list(observation.frame_paths),
                         "timestamps": list(observation.timestamps),
-                        "perception": state.to_dict(),
-                        "perception_response": state.to_dict(),
+                        "perception": perception_payload,
+                        "perception_response": copy.deepcopy(perception_payload),
                         **perception_audit,
                         "memory_after": memory.to_dict(),
                         "evidence_complete": False,
@@ -2604,17 +3046,21 @@ class PerceptionMemoryEvaEvaluator:
                             len(perception_states) - 1 if perception_states else None
                         ),
                         prefix_index=len(perception_states) - 1,
+                        frame_inventory=frame_inventory,
                     )
                     complete = bool(
                         decision and decision.evidence_complete and memory.event_ledger
                     )
                     if complete and perception_states:
+                        assert decision is not None
+                        decisive_frame_indices = decision.frame_indices
                         perception_states[-1]["evidence_complete"] = True
                     stop_reason = (
                         "max_turns_complete" if complete else "max_turns_incomplete"
                     )
 
             if complete:
+                first_valid_evidence_ids = memory.evidence_ids
                 first = self._judge(
                     sample,
                     memory,
@@ -2625,6 +3071,11 @@ class PerceptionMemoryEvaEvaluator:
                         len(perception_states) - 1 if perception_states else None
                     ),
                     prefix_index=len(perception_states) - 1,
+                    frame_inventory=frame_inventory,
+                    cited_frame_indices=decisive_frame_indices,
+                )
+                request_trace[-1]["valid_evidence_ids_at_stage"] = sorted(
+                    first_valid_evidence_ids
                 )
                 if perception_states:
                     perception_states[-1]["judge_confirmations"].append(
@@ -2648,25 +3099,38 @@ class PerceptionMemoryEvaEvaluator:
                     confirmation_observation: FrameObservation | None = None
                     confirmation_feedback = ""
                     confirmation_retry_reason: str | None = None
-                    confirmation_retry_group_id = _messages_sha256(
-                        build_confirmation_controller_messages(
+
+                    def confirmation_planner_messages(
+                        *, current_feedback: str = ""
+                    ) -> list[dict[str, Any]]:
+                        if self.role_config_sha256 is None:
+                            return build_confirmation_controller_messages(
+                                sample,
+                                memory,
+                                session.metadata,
+                                (candidate, first.answer),
+                                feedback=current_feedback,
+                            )
+                        return build_role_separated_confirmation_controller_messages(
                             sample,
                             memory,
                             session.metadata,
                             (candidate, first.answer),
+                            accepted_planner_history,
+                            feedback=current_feedback,
                         )
+
+                    confirmation_retry_group_id = _messages_sha256(
+                        confirmation_planner_messages()
                     )
                     for confirmation_attempt in range(2):
+                        confirmation_messages = confirmation_planner_messages(
+                            current_feedback=confirmation_feedback
+                        )
                         try:
                             confirmation_text = self._chat(
                                 request_trace,
-                                build_confirmation_controller_messages(
-                                    sample,
-                                    memory,
-                                    session.metadata,
-                                    (candidate, first.answer),
-                                    feedback=confirmation_feedback,
-                                ),
+                                confirmation_messages,
                                 stage="confirmation_controller",
                                 max_tokens=self.controller_max_tokens,
                                 seed_offset=2001,
@@ -2789,7 +3253,31 @@ class PerceptionMemoryEvaEvaluator:
                                 prefix_index=len(perception_states),
                             )
                         )
-                        memory.merge(confirmation_state)
+                        confirmation_bound_evidence_ids = memory.merge(
+                            confirmation_state
+                        )
+                        confirmation_new_evidence_ids = tuple(
+                            evidence_id
+                            for evidence_id in confirmation_bound_evidence_ids
+                            if evidence_id not in first_valid_evidence_ids
+                        )
+                        frame_inventory.extend(
+                            zip(
+                                confirmation_observation.frame_paths,
+                                confirmation_observation.timestamps,
+                                strict=True,
+                            )
+                        )
+                        accepted_planner_history.append(
+                            (
+                                copy.deepcopy(dict(confirmation_messages[-1])),
+                                confirmation_text.strip(),
+                            )
+                        )
+                        confirmation_payload = perception_state_payload(
+                            confirmation_state,
+                            role_separated=self.role_config_sha256 is not None,
+                        )
                         perception_states.append(
                             {
                                 "step_index": len(perception_states),
@@ -2799,10 +3287,18 @@ class PerceptionMemoryEvaEvaluator:
                                     confirmation_observation.frame_paths
                                 ),
                                 "timestamps": list(confirmation_observation.timestamps),
-                                "perception": confirmation_state.to_dict(),
-                                "perception_response": confirmation_state.to_dict(),
+                                "perception": confirmation_payload,
+                                "perception_response": copy.deepcopy(
+                                    confirmation_payload
+                                ),
                                 **confirmation_perception_audit,
                                 "memory_after": memory.to_dict(),
+                                "confirmation_bound_evidence_ids": list(
+                                    confirmation_bound_evidence_ids
+                                ),
+                                "confirmation_new_evidence_ids": list(
+                                    confirmation_new_evidence_ids
+                                ),
                                 "evidence_complete": False,
                                 "judge_confirmations": [],
                                 "stage": "change_confirmation",
@@ -2815,8 +3311,12 @@ class PerceptionMemoryEvaEvaluator:
                             2003,
                             step_index=len(perception_states) - 1,
                             prefix_index=len(perception_states) - 1,
+                            frame_inventory=frame_inventory,
                         )
                         if confirmed_complete and confirmed_complete.evidence_complete:
+                            confirmation_decisive_frame_indices = (
+                                confirmed_complete.frame_indices
+                            )
                             perception_states[-1]["evidence_complete"] = True
                             confirmation = self._judge(
                                 sample,
@@ -2826,6 +3326,13 @@ class PerceptionMemoryEvaEvaluator:
                                 "confirmation_judge",
                                 step_index=len(perception_states) - 1,
                                 prefix_index=len(perception_states) - 1,
+                                frame_inventory=frame_inventory,
+                                cited_frame_indices=(
+                                    confirmation_decisive_frame_indices
+                                ),
+                            )
+                            request_trace[-1]["valid_evidence_ids_at_stage"] = list(
+                                confirmation_bound_evidence_ids
                             )
                     if perception_states:
                         perception_states[-1]["judge_confirmations"].append(
@@ -2847,6 +3354,10 @@ class PerceptionMemoryEvaEvaluator:
                     confirmation=confirmation,
                     complete=complete,
                     memory=memory,
+                    first_valid_evidence_ids=first_valid_evidence_ids,
+                    confirmation_valid_evidence_ids=(
+                        confirmation_bound_evidence_ids
+                    ),
                 )
             else:
                 stop_reason = stop_reason or "incomplete_evidence"
@@ -2942,6 +3453,22 @@ class PerceptionMemoryEvaEvaluator:
             "controller_attempt_limit_reason": controller_attempt_limit_reason,
             "no_novel_action_rejections": no_novel_action_rejections,
             "no_novel_action_reason": no_novel_action_reason,
+            "frame_inventory": [
+                {"path": path, "timestamp": timestamp}
+                for path, timestamp in _deduplicated_frame_inventory(frame_inventory)
+            ],
+            "decisive_frame_indices": list(decisive_frame_indices),
+            "confirmation_decisive_frame_indices": list(
+                confirmation_decisive_frame_indices
+            ),
+            "first_valid_evidence_ids": sorted(first_valid_evidence_ids),
+            "confirmation_bound_evidence_ids": list(
+                confirmation_bound_evidence_ids
+            ),
+            "confirmation_new_evidence_ids": list(confirmation_new_evidence_ids),
+            "accepted_planner_actions": [
+                action for _user, action in accepted_planner_history
+            ],
             "tool_steps": tool_steps,
             "perception_states": perception_states,
             "judge_answers": [
@@ -3000,7 +3527,11 @@ __all__ = [
     "apply_candidate_gate",
     "bind_perception_state",
     "build_completeness_messages",
+    "build_cited_judge_messages",
     "build_confirmation_controller_messages",
+    "build_role_separated_confirmation_controller_messages",
+    "build_role_separated_controller_messages",
+    "build_runtime_visual_csv_messages",
     "build_controller_messages",
     "build_judge_messages",
     "build_perception_messages",
@@ -3015,6 +3546,7 @@ __all__ = [
     "parse_evidence_decision",
     "parse_perception_state",
     "perception_model_target",
+    "perception_state_payload",
     "perception_memory_role_for_stage",
     "perception_response_format",
     "normalize_perception_state",

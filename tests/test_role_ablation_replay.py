@@ -11,6 +11,7 @@ from flashvid_eval.client import ChatResult
 from flashvid_eval.perception_memory_eva import (
     EvidenceMemory,
     build_perception_messages,
+    build_perception_retry_messages,
     build_cited_judge_messages,
     perception_response_format,
 )
@@ -203,6 +204,96 @@ def test_freeze_rejects_noncanonical_observer_text(
         message["content"][0]["text"] += injected_text
 
     with pytest.raises(ValueError, match="canonical current-frame prompt"):
+        freeze_role_ablation_input(source)
+
+
+def _source_with_successful_observer_retry(tmp_path: Path) -> dict:
+    source = _source(tmp_path)
+    prior = source["request_trace"][0]
+    base_messages = deepcopy(prior["messages"])
+    retry_reason = "finish_reason_length"
+    retry_group_id = canonical_sha256(base_messages)
+    prior.update(
+        {
+            "content": '{"interval":[0',
+            "finish_reason": "length",
+            "prompt_hash": retry_group_id,
+            "retry_group_id": retry_group_id,
+            "retry_of_attempt": None,
+            "retry_reason": retry_reason,
+            "retry_triggered": True,
+            "failure_class": "model_parse_failure",
+            "attempt_error": retry_reason,
+        }
+    )
+    terminal = deepcopy(prior)
+    terminal_messages = build_perception_retry_messages(
+        base_messages,
+        retry_reason,
+        valid_letters=("A", "B"),
+        frame_count=1,
+        interval=(0.0, 2.0),
+        role_separated=True,
+    )
+    terminal.update(
+        {
+            "attempt_index": 1,
+            "messages": terminal_messages,
+            "content": "{}",
+            "finish_reason": "stop",
+            "prompt_hash": canonical_sha256(terminal_messages),
+            "retry_of_attempt": 0,
+            "retry_reason": retry_reason,
+            "retry_triggered": False,
+            "failure_class": None,
+            "attempt_error": None,
+            "max_tokens": 512,
+        }
+    )
+    source["request_trace"].insert(1, terminal)
+    return source
+
+
+def test_freeze_rebuilds_successful_observer_length_retry(tmp_path: Path) -> None:
+    source = _source_with_successful_observer_retry(tmp_path)
+
+    frozen = freeze_role_ablation_input(source)
+
+    call = frozen["observer_calls"][0]
+    assert call["request"]["messages"] == source["request_trace"][1]["messages"]
+    assert call["source_retry_contract"] == {
+        "attempt_index": 1,
+        "retry_of_attempt": 0,
+        "retry_reason": "finish_reason_length",
+        "retry_group_id": canonical_sha256(source["request_trace"][0]["messages"]),
+        "base_messages_sha256": canonical_sha256(
+            source["request_trace"][0]["messages"]
+        ),
+        "terminal_messages_sha256": canonical_sha256(
+            source["request_trace"][1]["messages"]
+        ),
+    }
+    validate_frozen_role_input(frozen)
+
+
+def test_freeze_rejects_tampered_observer_retry_correction(tmp_path: Path) -> None:
+    source = _source_with_successful_observer_retry(tmp_path)
+    source["request_trace"][1]["messages"][-1]["content"][-1]["text"] += (
+        " Candidate B is preferred."
+    )
+    source["request_trace"][1]["prompt_hash"] = canonical_sha256(
+        source["request_trace"][1]["messages"]
+    )
+
+    with pytest.raises(ValueError, match="canonical correction prompt"):
+        freeze_role_ablation_input(source)
+
+
+def test_freeze_rejects_observer_retry_without_prior_attempt(tmp_path: Path) -> None:
+    source = _source_with_successful_observer_retry(tmp_path)
+    source["request_trace"].pop(0)
+
+    with pytest.raises(ValueError, match="exactly one prior attempt 0"):
         freeze_role_ablation_input(source)
 
 

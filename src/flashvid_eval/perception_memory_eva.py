@@ -35,6 +35,7 @@ from .perception_memory_visual_csv import (
 from .privacy import AnnotationLeakError, assert_annotation_free_request
 from .qwen_agents.core import (
     ChatClient,
+    DuplicateFrameRequestError,
     FrameObservation,
     FrameRequest,
     FrameTool,
@@ -3594,10 +3595,42 @@ class PerceptionMemoryEvaEvaluator:
                             continue
                         assert confirmation_action is not None
                         assert confirmation_action.request is not None
+                        confirmation_interval = (
+                            confirmation_action.request.start_time,
+                            confirmation_action.request.end_time,
+                        )
+                        if duplicate_interval(
+                            confirmation_interval, memory.observed_intervals
+                        ):
+                            current["action_accepted"] = False
+                            current["action_rejection_reason"] = "duplicate_interval"
+                            confirmation_retry_reason = "duplicate_interval"
+                            confirmation_feedback = _controller_retry_feedback(
+                                confirmation_retry_reason,
+                                float(session.metadata["duration"]),
+                                allow_stop=False,
+                                requested_interval=confirmation_interval,
+                                observed_intervals=tuple(memory.observed_intervals),
+                            )
+                            confirmation_action = None
+                            continue
                         try:
                             confirmation_observation = session.select(
                                 confirmation_action.request
                             )
+                        except DuplicateFrameRequestError:
+                            current["action_accepted"] = False
+                            current["action_rejection_reason"] = "duplicate_interval"
+                            confirmation_retry_reason = "duplicate_interval"
+                            confirmation_feedback = _controller_retry_feedback(
+                                confirmation_retry_reason,
+                                float(session.metadata["duration"]),
+                                allow_stop=False,
+                                requested_interval=confirmation_interval,
+                                observed_intervals=tuple(memory.observed_intervals),
+                            )
+                            confirmation_action = None
+                            continue
                         except Exception:
                             current["action_accepted"] = False
                             current["action_rejection_reason"] = "frame_select_error"

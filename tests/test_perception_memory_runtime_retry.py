@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +22,16 @@ def _sample(candidate: str = "B") -> ModelSample:
     )
 
 
-def _state_json(*, support: str = "A", contradict: str = "B") -> str:
+def _state_json(
+    *,
+    support: str = "A",
+    contradict: str = "B",
+    interval: tuple[float, float] = (10.0, 20.0),
+) -> str:
     fact = "The person walks outside."
     return json.dumps(
         {
-            "interval": [10.0, 20.0],
+            "interval": list(interval),
             "timestamped_facts": [{"frame_index": 0, "fact": fact}],
             "option_evidence": {
                 letter: {
@@ -50,14 +56,29 @@ def _tool_call() -> str:
     )
 
 
+def _confirmation_tool_call() -> str:
+    return (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check independent confirmation evidence"}}</tool_call>'
+    )
+
+
 class _Session:
     def __init__(self, observation: FrameObservation) -> None:
         self.observation = observation
         self.metadata = {"duration": 100.0, "width": 1920, "height": 1080}
 
     def select(self, request: FrameRequest) -> FrameObservation:
-        assert request == self.observation.request
-        return self.observation
+        if request == self.observation.request:
+            return self.observation
+        return replace(
+            self.observation,
+            request=request,
+            resolved_start_time=request.start_time,
+            resolved_end_time=request.end_time,
+            timestamps=((request.start_time + request.end_time) / 2.0,),
+        )
 
 
 class _FrameTool:
@@ -168,9 +189,9 @@ def test_runtime_retries_truncated_perception_once_with_same_frames_and_trace(
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"A","evidence_ids":["E0001"]}',
-            _tool_call(),
+            _confirmation_tool_call(),
             "invalid confirmation",
-            _state_json(),
+            _state_json(interval=(30.0, 40.0)),
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"A","evidence_ids":["E0001"]}',
         ]

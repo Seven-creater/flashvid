@@ -22,6 +22,7 @@ from .perception_memory_eva import (
     EvidenceMemory,
     bind_perception_state,
     build_perception_messages,
+    build_perception_retry_messages,
     build_cited_judge_messages,
     build_runtime_visual_csv_messages,
     parse_evidence_decision,
@@ -51,6 +52,12 @@ _ANSWERER_STAGES = {
     "evidence_judge",
     "answerer",
     "confirmation_judge",
+}
+_OBSERVER_RETRY_REASONS = {
+    "finish_reason_length",
+    "invalid_json_or_schema",
+    "invalid_observation_binding",
+    "legacy_timestamp_schema",
 }
 
 
@@ -193,6 +200,101 @@ def _terminal_trace(
     ):
         raise ValueError("frozen role source has no successful terminal request")
     return terminal
+
+
+def _observer_terminal_messages(
+    trace: Sequence[Any],
+    *,
+    step_index: int,
+    canonical_messages: Sequence[Mapping[str, Any]],
+    valid_letters: Sequence[str],
+    frame_count: int,
+    interval: tuple[float, float],
+) -> tuple[Mapping[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+    """Validate and reproduce the only supported same-frame Observer retry."""
+
+    matching: list[Mapping[str, Any]] = []
+    for raw in trace:
+        if not isinstance(raw, Mapping):
+            raise ValueError("request_trace entries must be objects")
+        if (
+            str(raw.get("stage") or "").casefold() in _OBSERVER_STAGES
+            and raw.get("step_index") == step_index
+        ):
+            matching.append(raw)
+    terminal = _terminal_trace(trace, _OBSERVER_STAGES, step_index)
+    if terminal is None:
+        raise ValueError(f"source has no observer request for step {step_index}")
+    terminal_attempt = terminal.get("attempt_index", 0)
+    if terminal_attempt == 0:
+        expected = copy.deepcopy(list(canonical_messages))
+        if terminal.get("messages") != expected:
+            raise ValueError(
+                "frozen Observer request does not match the canonical current-frame prompt"
+            )
+        return terminal, expected, None
+    if terminal_attempt != 1:
+        raise ValueError("frozen Observer supports only one bounded retry")
+
+    attempt_zero = [item for item in matching if item.get("attempt_index", 0) == 0]
+    attempt_one = [item for item in matching if item.get("attempt_index", 0) == 1]
+    if len(attempt_zero) != 1 or len(attempt_one) != 1:
+        raise ValueError("frozen Observer retry requires exactly one prior attempt 0")
+    prior = attempt_zero[0]
+    if prior.get("stage") != terminal.get("stage"):
+        raise ValueError("frozen Observer retry changed request stage")
+    if prior.get("messages") != list(canonical_messages):
+        raise ValueError(
+            "frozen Observer retry attempt 0 is not the canonical current-frame prompt"
+        )
+
+    reason = prior.get("attempt_error")
+    if (
+        reason not in _OBSERVER_RETRY_REASONS
+        or prior.get("retry_reason") != reason
+        or prior.get("retry_triggered") is not True
+        or prior.get("retry_of_attempt") is not None
+        or terminal.get("retry_reason") != reason
+        or terminal.get("retry_of_attempt") != 0
+        or terminal.get("retry_triggered") is not False
+    ):
+        raise ValueError("frozen Observer retry audit is inconsistent")
+    if (reason == "finish_reason_length") != (prior.get("finish_reason") == "length"):
+        raise ValueError("frozen Observer retry failure reason is inconsistent")
+
+    retry_group_id = canonical_sha256(canonical_messages)
+    if (
+        prior.get("retry_group_id") != retry_group_id
+        or terminal.get("retry_group_id") != retry_group_id
+        or prior.get("prompt_hash") != retry_group_id
+        or prior.get("failure_class") != "model_parse_failure"
+    ):
+        raise ValueError("frozen Observer retry group audit is inconsistent")
+    expected = build_perception_retry_messages(
+        canonical_messages,
+        reason,
+        valid_letters=valid_letters,
+        frame_count=frame_count,
+        interval=interval,
+        role_separated=True,
+    )
+    terminal_prompt_sha256 = canonical_sha256(expected)
+    if (
+        terminal.get("messages") != expected
+        or terminal.get("prompt_hash") != terminal_prompt_sha256
+    ):
+        raise ValueError(
+            "frozen Observer retry does not match the canonical correction prompt"
+        )
+    retry_contract = {
+        "attempt_index": 1,
+        "retry_of_attempt": 0,
+        "retry_reason": reason,
+        "retry_group_id": retry_group_id,
+        "base_messages_sha256": retry_group_id,
+        "terminal_messages_sha256": terminal_prompt_sha256,
+    }
+    return terminal, expected, retry_contract
 
 
 def _latest_terminal_trace(
@@ -358,9 +460,6 @@ def freeze_role_ablation_input(source: Mapping[str, Any]) -> dict[str, Any]:
     for step_index, raw_state in enumerate(states):
         if not isinstance(raw_state, Mapping) or raw_state.get("step_index", step_index) != step_index:
             raise ValueError("source perception states must be contiguous")
-        terminal = _terminal_trace(trace, _OBSERVER_STAGES, step_index)
-        if terminal is None:
-            raise ValueError(f"source has no observer request for step {step_index}")
         frames = _frame_records(raw_state.get("frame_paths"), raw_state.get("timestamps"))
         response = raw_state.get("perception_response")
         interval = response.get("interval") if isinstance(response, Mapping) else None
@@ -376,10 +475,18 @@ def freeze_role_ablation_input(source: Mapping[str, Any]) -> dict[str, Any]:
         expected_messages = _canonical_observer_messages(
             sample, raw_state, frames, interval
         )
-        if terminal.get("messages") != expected_messages:
-            raise ValueError(
-                "frozen Observer request does not match the canonical current-frame prompt"
+        terminal, expected_terminal_messages, retry_contract = (
+            _observer_terminal_messages(
+                trace,
+                step_index=step_index,
+                canonical_messages=expected_messages,
+                valid_letters=sample.option_letters,
+                frame_count=len(frames),
+                interval=(float(interval[0]), float(interval[1])),
             )
+        )
+        if terminal.get("messages") != expected_terminal_messages:
+            raise AssertionError("validated Observer terminal request changed")
         contract = _request_contract(
             terminal,
             fallback_max_tokens=int(source.get("perception_max_tokens") or 1024),
@@ -396,6 +503,7 @@ def freeze_role_ablation_input(source: Mapping[str, Any]) -> dict[str, Any]:
                 "frames": frames,
                 "actual_timestamps": [frame["timestamp"] for frame in frames],
                 "resolved_interval": [float(interval[0]), float(interval[1])],
+                "source_retry_contract": retry_contract,
                 "request": contract,
             }
         )

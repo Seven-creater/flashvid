@@ -1691,6 +1691,11 @@ def test_confirmation_runtime_uses_the_same_indexed_perception_protocol(
         '{"start_time":10,"end_time":20,"nframes":2,"resize":0.75,'
         '"evidence_request":"check the action"}}</tool_call>'
     )
+    confirmation_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":2,"resize":0.75,'
+        '"evidence_request":"check independent confirmation evidence"}}</tool_call>'
+    )
     indexed = _indexed_state_json(frame_indices=(0, 1))
     client = _FakeClient(
         [
@@ -1699,7 +1704,7 @@ def test_confirmation_runtime_uses_the_same_indexed_perception_protocol(
             '{"action":"stop"}',
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"B","evidence_ids":["E0001"]}',
-            tool_call,
+            confirmation_call,
             indexed,
             '{"evidence_complete":true,"missing_evidence":[]}',
             '{"answer":"B","evidence_ids":["E0001"]}',
@@ -2621,6 +2626,130 @@ def test_bad_confirmation_retries_then_runs_second_perception_and_judge(
     assert feedback_text in retry_prompt
     assert "Direct" not in retry_prompt
     assert "candidate" not in retry_prompt.lower()
+    assert len(result["perception_states"]) == 2
+    assert result["perception_states"][1]["stage"] == "change_confirmation"
+    assert len(result["judge_answers"]) == 2
+    assert [request.start_time for request in session.requests] == [10.0, 30.0]
+
+
+def test_duplicate_confirmation_attempts_fall_back_without_runtime_error(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(),
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+            first_call,
+            first_call,
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    confirmations = [
+        item
+        for item in result["request_trace"]
+        if item["stage"] == "confirmation_controller"
+    ]
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["final_prediction"] == "A"
+    assert result["decision_source"] == "candidate_fallback"
+    assert result["fallback_to_candidate"] is True
+    assert len(confirmations) == 2
+    assert [item["action_accepted"] for item in confirmations] == [False, False]
+    assert [item["action_rejection_reason"] for item in confirmations] == [
+        "duplicate_interval",
+        "duplicate_interval",
+    ]
+    assert confirmations[1]["retry_reason"] == "duplicate_interval"
+    assert "Already observed intervals: [10.000, 20.000]" in json.dumps(
+        confirmations[1]["messages"], ensure_ascii=False
+    )
+    assert not any(
+        item["stage"] in {"confirmation_perception", "confirmation_judge"}
+        for item in result["request_trace"]
+    )
+    assert len(result["perception_states"]) == 1
+    assert len(result["judge_answers"]) == 1
+    assert [request.start_time for request in session.requests] == [10.0]
+
+
+def test_duplicate_confirmation_retry_can_select_novel_interval(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"placeholder")
+    first_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":10,"end_time":20,"nframes":1,"resize":0.75,'
+        '"evidence_request":"check the action"}}</tool_call>'
+    )
+    novel_call = (
+        '<tool_call>{"tool":"frame_select","arguments":'
+        '{"start_time":30,"end_time":40,"nframes":1,"resize":0.75,'
+        '"evidence_request":"symmetrically distinguish A and B"}}</tool_call>'
+    )
+    client = _FakeClient(
+        [
+            first_call,
+            _indexed_state_json(),
+            '{"action":"stop"}',
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0001"]}',
+            first_call,
+            novel_call,
+            _indexed_state_json(
+                interval=(30.0, 40.0),
+                fact="The person walks outside after checking the doorway.",
+            ),
+            '{"evidence_complete":true,"missing_evidence":[]}',
+            '{"answer":"B","evidence_ids":["E0003"]}',
+        ]
+    )
+    session = _DurationOnlySession(tmp_path)
+    evaluator = PerceptionMemoryEvaEvaluator(
+        client,
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        frame_tool=_DurationOnlyFrameTool(session),  # type: ignore[arg-type]
+        max_turns=2,
+    )
+
+    result = evaluator.run(_sample("A"))
+
+    confirmations = [
+        item
+        for item in result["request_trace"]
+        if item["stage"] == "confirmation_controller"
+    ]
+    assert result["error"] is None
+    assert result["failure_class"] is None
+    assert result["final_prediction"] == "B"
+    assert result["decision_source"] == "confirmed_visual_change"
+    assert [item["action_accepted"] for item in confirmations] == [False, True]
+    assert confirmations[0]["action_rejection_reason"] == "duplicate_interval"
+    assert confirmations[1]["retry_reason"] == "duplicate_interval"
     assert len(result["perception_states"]) == 2
     assert result["perception_states"][1]["stage"] == "change_confirmation"
     assert len(result["judge_answers"]) == 2

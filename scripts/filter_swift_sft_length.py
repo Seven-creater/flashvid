@@ -49,6 +49,60 @@ def _metadata(row: Mapping[str, Any]) -> Mapping[str, Any]:
     return value
 
 
+def _validate_trajectory_targets(
+    rows: Sequence[Mapping[str, Any]], indexes: Sequence[int], trajectory_id: str
+) -> None:
+    """Accept either the legacy split episodes or one role-separated episode set."""
+
+    metadata = [_metadata(rows[index]) for index in indexes]
+    process_roles = [str(item.get("process_role") or "") for item in metadata]
+    if any(process_roles):
+        if any(role not in {"planner", "observer"} for role in process_roles):
+            raise ValueError(
+                f"retained trajectory {trajectory_id!r} has an invalid process role"
+            )
+        planner = [item for item in metadata if item.get("process_role") == "planner"]
+        if len(planner) != 1:
+            raise ValueError(
+                f"retained trajectory {trajectory_id!r} must contain exactly one "
+                "Planner episode"
+            )
+        if planner[0].get("episode_schema") != "planner_complete_episode_v1":
+            raise ValueError(
+                f"retained trajectory {trajectory_id!r} has an invalid Planner schema"
+            )
+        targets = planner[0].get("assistant_target_types")
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or any(target not in {"tool", "plan", "stop"} for target in targets)
+            or targets.count("tool") < 1
+            or targets.count("stop") != 1
+            or targets[-1] != "stop"
+        ):
+            raise ValueError(
+                f"retained trajectory {trajectory_id!r} must contain at least one "
+                "tool target and end with exactly one stop target"
+            )
+        for item in metadata:
+            if item.get("process_role") != "observer":
+                continue
+            observer_targets = item.get("assistant_target_types")
+            if observer_targets != ["memory"]:
+                raise ValueError(
+                    f"retained trajectory {trajectory_id!r} has an invalid "
+                    "Observer episode"
+                )
+        return
+
+    target_types = [str(item.get("episode_target_type") or "") for item in metadata]
+    if target_types.count("final") != 1 or "tool" not in target_types:
+        raise ValueError(
+            f"retained trajectory {trajectory_id!r} must contain at least one "
+            "tool target and exactly one final target"
+        )
+
+
 def select_length_safe_trajectories(
     rows: Sequence[Mapping[str, Any]],
     encoded_lengths: Sequence[int],
@@ -94,15 +148,7 @@ def select_length_safe_trajectories(
             )
             continue
 
-        target_types = [
-            str(_metadata(rows[index]).get("episode_target_type") or "")
-            for index in indexes
-        ]
-        if target_types.count("final") != 1 or "tool" not in target_types:
-            raise ValueError(
-                f"retained trajectory {trajectory_id!r} must contain at least one "
-                "tool target and exactly one final target"
-            )
+        _validate_trajectory_targets(rows, indexes, trajectory_id)
         retained.extend(indexes)
 
     retained.sort()

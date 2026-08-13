@@ -17,6 +17,34 @@ def _row(trajectory: str, target: str, *, sample: str = "1") -> dict:
     }
 
 
+def _planner_row(trajectory: str, *, sample: str = "1") -> dict:
+    return {
+        "metadata": {
+            "trajectory_id": trajectory,
+            "episode_id": f"{trajectory}#role-planner",
+            "episode_schema": "planner_complete_episode_v1",
+            "process_role": "planner",
+            "assistant_target_types": ["tool", "plan", "tool", "stop"],
+            "dataset": "demo",
+            "sample_id": sample,
+        }
+    }
+
+
+def _observer_row(trajectory: str, *, sample: str = "1") -> dict:
+    return {
+        "metadata": {
+            "trajectory_id": trajectory,
+            "episode_id": f"{trajectory}#role-observer#prefix-000",
+            "episode_schema": "observer_current_frame_episode_v1",
+            "process_role": "observer",
+            "assistant_target_types": ["memory"],
+            "dataset": "demo",
+            "sample_id": sample,
+        }
+    }
+
+
 def test_rejects_entire_trajectory_when_one_episode_is_too_long() -> None:
     rows = [
         _row("keep", "tool"),
@@ -55,3 +83,34 @@ def test_length_boundary_is_retained() -> None:
 
     assert retained == [0, 1]
     assert report["maximum_retained_tokens"] == 16_384
+
+
+def test_accepts_one_complete_role_separated_planner_episode() -> None:
+    retained, report = select_length_safe_trajectories(
+        [_planner_row("planner")], [1_000], max_length=16_384
+    )
+
+    assert retained == [0]
+    assert report["retained_trajectories"] == 1
+
+
+def test_accepts_planner_with_image_bearing_observer_probe() -> None:
+    rows = [_planner_row("probe"), _observer_row("probe")]
+    retained, report = select_length_safe_trajectories(
+        rows, [1_000, 2_000], max_length=16_384
+    )
+
+    assert retained == [0, 1]
+    assert report["retained_rows"] == 2
+
+
+@pytest.mark.parametrize(
+    "targets",
+    (["tool"], ["stop"], ["tool", "stop", "plan"], ["tool", "final", "stop"]),
+)
+def test_rejects_invalid_role_separated_planner_targets(targets: list[str]) -> None:
+    row = _planner_row("broken")
+    row["metadata"]["assistant_target_types"] = targets
+
+    with pytest.raises(ValueError, match="tool target.*stop target"):
+        select_length_safe_trajectories([row], [100])

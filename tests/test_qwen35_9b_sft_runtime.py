@@ -120,6 +120,8 @@ def test_training_launcher_preserves_lora_and_loss_contract() -> None:
         "training_update.json",
         "--formal-output-dir",
         "--smoke-report",
+        "--smoke-probe-data",
+        "smoke-probe data has no image-bearing record",
         "qwen_sft_smoke_gate.py",
     ):
         assert expected in text

@@ -53,6 +53,7 @@ def bind_smoke_report(
     formal_output_dir: Path,
     train_data: Path,
     base_model_artifact_sha256: str,
+    smoke_probe_data: Path | None = None,
 ) -> dict[str, Any]:
     report = _load_report(report_path)
     if report.get("status") != "passed" or report.get("global_step") != 1:
@@ -75,6 +76,13 @@ def bind_smoke_report(
             "base_model_artifact_sha256",
         ),
     }
+    if smoke_probe_data is not None:
+        if not smoke_probe_data.is_file():
+            raise FileNotFoundError(smoke_probe_data)
+        gate["smoke_probe_data"] = {
+            "path": str(smoke_probe_data.resolve()),
+            "sha256": _sha256_file(smoke_probe_data),
+        }
     report["formal_training_gate"] = gate
     _atomic_write(report_path, report)
     return report
@@ -86,6 +94,7 @@ def validate_smoke_report(
     formal_output_dir: Path,
     train_data: Path,
     base_model_artifact_sha256: str,
+    smoke_probe_data: Path | None = None,
 ) -> dict[str, Any]:
     report = _load_report(report_path)
     if report.get("status") != "passed" or report.get("global_step") != 1:
@@ -112,6 +121,19 @@ def validate_smoke_report(
     )
     if gate.get("base_model_artifact_sha256") != expected_model:
         raise ValueError("smoke report is bound to a different base-model artifact")
+    probe_reference = gate.get("smoke_probe_data")
+    if probe_reference is None:
+        if smoke_probe_data is not None:
+            raise ValueError("smoke report is not bound to smoke-probe data")
+    else:
+        if not isinstance(probe_reference, Mapping) or smoke_probe_data is None:
+            raise ValueError("formal training requires the bound smoke-probe data")
+        if not smoke_probe_data.is_file():
+            raise FileNotFoundError(smoke_probe_data)
+        if probe_reference.get("path") != str(smoke_probe_data.resolve()):
+            raise ValueError("smoke report is bound to different smoke-probe data")
+        if probe_reference.get("sha256") != _sha256_file(smoke_probe_data):
+            raise ValueError("smoke-probe data changed after the smoke run")
     return dict(gate)
 
 
@@ -124,6 +146,7 @@ def main() -> int:
         child.add_argument("--formal-output-dir", type=Path, required=True)
         child.add_argument("--train-data", type=Path, required=True)
         child.add_argument("--base-model-artifact-sha256", required=True)
+        child.add_argument("--smoke-probe-data", type=Path)
         if command == "bind":
             child.add_argument("--smoke-output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -134,6 +157,7 @@ def main() -> int:
             formal_output_dir=args.formal_output_dir,
             train_data=args.train_data,
             base_model_artifact_sha256=args.base_model_artifact_sha256,
+            smoke_probe_data=args.smoke_probe_data,
         )
         payload: Mapping[str, Any] = report["formal_training_gate"]
     else:
@@ -142,6 +166,7 @@ def main() -> int:
             formal_output_dir=args.formal_output_dir,
             train_data=args.train_data,
             base_model_artifact_sha256=args.base_model_artifact_sha256,
+            smoke_probe_data=args.smoke_probe_data,
         )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0

@@ -129,3 +129,68 @@ def test_failed_or_unbound_smoke_report_cannot_start_formal(tmp_path: Path) -> N
             train_data=train_data,
             base_model_artifact_sha256=MODEL_SHA,
         )
+
+
+def test_image_bearing_probe_is_bound_and_cannot_change(tmp_path: Path) -> None:
+    smoke = tmp_path / "smoke"
+    formal = tmp_path / "formal"
+    train_data = tmp_path / "planner.jsonl"
+    probe_data = tmp_path / "observer_probe.jsonl"
+    train_data.write_text("planner\n", encoding="utf-8")
+    probe_data.write_text("image probe\n", encoding="utf-8")
+    report = _passed_report(smoke)
+
+    bound = bind_smoke_report(
+        report,
+        smoke_output_dir=smoke,
+        formal_output_dir=formal,
+        train_data=train_data,
+        base_model_artifact_sha256=MODEL_SHA,
+        smoke_probe_data=probe_data,
+    )
+    assert bound["formal_training_gate"]["smoke_probe_data"]["path"] == str(
+        probe_data.resolve()
+    )
+    validate_smoke_report(
+        report,
+        formal_output_dir=formal,
+        train_data=train_data,
+        base_model_artifact_sha256=MODEL_SHA,
+        smoke_probe_data=probe_data,
+    )
+
+    probe_data.write_text("changed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="smoke-probe data changed"):
+        validate_smoke_report(
+            report,
+            formal_output_dir=formal,
+            train_data=train_data,
+            base_model_artifact_sha256=MODEL_SHA,
+            smoke_probe_data=probe_data,
+        )
+
+
+def test_bound_image_probe_must_be_supplied_to_formal_gate(tmp_path: Path) -> None:
+    smoke = tmp_path / "smoke"
+    formal = tmp_path / "formal"
+    train_data = tmp_path / "planner.jsonl"
+    probe_data = tmp_path / "observer_probe.jsonl"
+    train_data.write_text("planner\n", encoding="utf-8")
+    probe_data.write_text("image probe\n", encoding="utf-8")
+    report = _passed_report(smoke)
+    bind_smoke_report(
+        report,
+        smoke_output_dir=smoke,
+        formal_output_dir=formal,
+        train_data=train_data,
+        base_model_artifact_sha256=MODEL_SHA,
+        smoke_probe_data=probe_data,
+    )
+
+    with pytest.raises(ValueError, match="requires the bound smoke-probe"):
+        validate_smoke_report(
+            report,
+            formal_output_dir=formal,
+            train_data=train_data,
+            base_model_artifact_sha256=MODEL_SHA,
+        )

@@ -20,11 +20,12 @@ smoke=0
 output_dir_explicit=0
 formal_output_dir_explicit=0
 smoke_report=""
+smoke_probe_data=""
 release_project_services=0
 load_weights_preflight=0
 
 usage() {
-  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke --formal-output-dir DIR | --smoke-report FILE] [--release-project-services] [--load-weights-preflight]" >&2
+  echo "usage: $0 --train-data FILE [--output-dir DIR] [--resume] [--smoke --formal-output-dir DIR | --smoke-report FILE] [--smoke-probe-data FILE] [--release-project-services] [--load-weights-preflight]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -49,6 +50,11 @@ while [[ $# -gt 0 ]]; do
     --smoke-report)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       smoke_report="$2"
+      shift 2
+      ;;
+    --smoke-probe-data)
+      [[ $# -ge 2 ]] || { usage; exit 2; }
+      smoke_probe_data="$2"
       shift 2
       ;;
     --resume)
@@ -112,6 +118,12 @@ if [[ "$load_weights_preflight" -eq 1 && "$smoke" -ne 1 ]]; then
 fi
 
 [[ -f "$train_data" ]] || { echo "training JSONL not found: $train_data" >&2; exit 2; }
+if [[ -n "$smoke_probe_data" ]]; then
+  [[ -f "$smoke_probe_data" ]] || {
+    echo "smoke-probe JSONL not found: $smoke_probe_data" >&2
+    exit 2
+  }
+fi
 [[ -e "$MODEL_PATH" ]] || { echo "Qwen3.5-9B model not found: $MODEL_PATH" >&2; exit 2; }
 [[ -x "$SWIFT_BIN" && -x "$SWIFT_PYTHON" ]] || {
   echo "ms-swift environment not found at $SFT_ENV_DIR" >&2
@@ -146,11 +158,16 @@ fi
   exit 2
 }
 if [[ "$smoke" -eq 0 ]]; then
+  smoke_probe_gate_args=()
+  if [[ -n "$smoke_probe_data" ]]; then
+    smoke_probe_gate_args=(--smoke-probe-data "$smoke_probe_data")
+  fi
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/qwen_sft_smoke_gate.py" check \
     --report "$smoke_report" \
     --formal-output-dir "$OUTPUT_DIR" \
     --train-data "$train_data" \
-    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256"
+    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256" \
+    "${smoke_probe_gate_args[@]}"
 fi
 
 # The server cannot reach huggingface.co. Training uses the frozen local model;
@@ -222,7 +239,13 @@ loss_mask_samples=3
 if [[ "$smoke" -eq 1 ]]; then
   training_data="$OUTPUT_DIR/preflight/smoke_one_sample.jsonl"
   smoke_rank_padding=$((gpu_count * gradient_accumulation_steps))
-  "$SWIFT_PYTHON" - "$train_data" "$training_data" "$smoke_rank_padding" <<'PY'
+  smoke_source_data="$train_data"
+  require_image_probe=0
+  if [[ -n "$smoke_probe_data" ]]; then
+    smoke_source_data="$smoke_probe_data"
+    require_image_probe=1
+  fi
+  "$SWIFT_PYTHON" - "$smoke_source_data" "$training_data" "$smoke_rank_padding" "$require_image_probe" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -230,6 +253,7 @@ import sys
 source = Path(sys.argv[1])
 output = Path(sys.argv[2])
 copies = int(sys.argv[3])
+require_image_probe = bool(int(sys.argv[4]))
 if copies < 1:
     raise SystemExit("smoke rank padding must be positive")
 with source.open(encoding="utf-8") as handle:
@@ -248,6 +272,8 @@ with source.open(encoding="utf-8") as handle:
             selected = value
             break
     if selected is None:
+        if require_image_probe:
+            raise SystemExit("smoke-probe data has no image-bearing record")
         selected = fallback
     if selected is None:
         raise SystemExit("SFT data is empty")
@@ -415,10 +441,15 @@ if [[ "$smoke" -eq 1 ]]; then
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/verify_qwen35_lora_smoke.py" \
     --output-dir "$OUTPUT_DIR" \
     --report "$OUTPUT_DIR/preflight/training_update.json"
+  smoke_probe_gate_args=()
+  if [[ -n "$smoke_probe_data" ]]; then
+    smoke_probe_gate_args=(--smoke-probe-data "$smoke_probe_data")
+  fi
   "$SWIFT_PYTHON" "$PROJECT_DIR/scripts/qwen_sft_smoke_gate.py" bind \
     --report "$OUTPUT_DIR/preflight/training_update.json" \
     --smoke-output-dir "$OUTPUT_DIR" \
     --formal-output-dir "$FORMAL_OUTPUT_DIR" \
     --train-data "$train_data" \
-    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256"
+    --base-model-artifact-sha256 "$EXPECTED_MODEL_ARTIFACT_SHA256" \
+    "${smoke_probe_gate_args[@]}"
 fi

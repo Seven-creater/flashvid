@@ -2,8 +2,9 @@
 """Fail-closed post-repair Perception-Memory process-SFT pipeline.
 
 This wrapper does not create new training logic.  It only binds and resumes the
-registered stages after the repair lane: prefix Judges, offline selection, SFT
-export, owned-service shutdown, the required one-step smoke, and formal SFT.
+registered stages after the repair lane: visual-only CSV Judges, offline
+selection, SFT export, owned-service shutdown, the required one-step smoke,
+and formal SFT.
 """
 
 from __future__ import annotations
@@ -20,15 +21,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from flashvid_eval.perception_memory_prefix_judge import bind_prefix_jobs
+from flashvid_eval.perception_memory_visual_csv import bind_visual_csv_jobs
 from flashvid_eval.qwen_sft import read_jsonl
 
 
-AUTOPILOT_VERSION = "perception_memory_post_repair_sft_v1"
+AUTOPILOT_VERSION = "perception_memory_post_repair_visual_csv_sft_v2"
 EXPECTED_REPAIR_ROWS = 2917
 EXPECTED_PORTS = tuple(range(8200, 8208))
 TRAIN600_SHA256 = "3995454d973aeb6efe6887e821cd5197e0f17a5b9cc32d7c719e6583b487e6c0"
-SELECTION_MINIMA = (360, 100, 90, 20)
 
 
 def _now() -> str:
@@ -255,7 +255,7 @@ def _judge_command(
 ) -> list[str]:
     command = [
         args.python,
-        str(args.repo_root / "scripts/judge_perception_memory_prefixes.py"),
+        str(args.repo_root / "scripts/judge_perception_memory_visual_csv.py"),
         "--trajectories",
         str(trajectories),
         "--output",
@@ -266,6 +266,7 @@ def _judge_command(
         str(args.judge_concurrency),
         "--timeout",
         str(args.request_timeout),
+        "--local-media-paths",
         "--judge-seed",
         "17",
         "--judge-seed",
@@ -288,10 +289,13 @@ def _selection_command(
     directory = args.run_root / "selection"
     command = [
         args.python,
-        str(args.repo_root / "scripts/select_perception_memory_trajectories.py"),
+        str(
+            args.repo_root
+            / "scripts/select_perception_memory_visual_csv_trajectories.py"
+        ),
         "--trajectories",
         str(trajectories),
-        "--prefix-judgments",
+        "--visual-csv-results",
         str(judgments),
         "--answers",
         str(args.answers),
@@ -321,14 +325,8 @@ def _build_command(args: argparse.Namespace) -> list[str]:
         str(output),
         "--summary",
         str(summary),
-        "--minimum-total",
-        str(SELECTION_MINIMA[0]),
-        "--minimum-per-dataset",
-        str(SELECTION_MINIMA[1]),
-        "--minimum-candidate-fixes",
-        str(SELECTION_MINIMA[2]),
-        "--minimum-candidate-fixes-per-dataset",
-        str(SELECTION_MINIMA[3]),
+        "--completion-gate-kind",
+        "visual_csv",
     ]
     if output.exists() or summary.exists():
         command.append("--overwrite")
@@ -378,33 +376,45 @@ def _training_env(args: argparse.Namespace) -> dict[str, str]:
 
 
 def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
-    expected_ids = {job.prefix_id for job in bind_prefix_jobs(read_jsonl(trajectories))}
+    expected_ids = {
+        job.prefix_id for job in bind_visual_csv_jobs(read_jsonl(trajectories))
+    }
     rows = read_jsonl(output)
     actual_ids = [str(row.get("prefix_id") or "") for row in rows]
     if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != expected_ids:
-        raise RuntimeError("prefix Judge output does not exactly cover the merged input")
+        raise RuntimeError("visual CSV output does not exactly cover the merged input")
     infrastructure_errors = 0
     evidence_insufficient = 0
     required_seeds = {17, 42, 73}
     for row in rows:
+        if row.get("visual_csv_status") not in {
+            "complete",
+            "complete_with_failures",
+        }:
+            raise RuntimeError("visual CSV row does not contain all three seeds")
         if row.get("annotation_leak_check") != "passed":
-            raise RuntimeError("prefix Judge row failed annotation leak audit")
-        confirmations = row.get("judge_confirmations")
+            raise RuntimeError("visual CSV row failed annotation leak audit")
+        if (
+            row.get("candidate_blind") is not True
+            or row.get("tools_disabled") is not True
+        ):
+            raise RuntimeError("visual CSV row violated the candidate/tool isolation gate")
+        confirmations = row.get("visual_csv_confirmations")
         if not isinstance(confirmations, list) or len(confirmations) != len(
             required_seeds
         ):
-            raise RuntimeError("prefix Judge row lacks exactly three confirmations")
+            raise RuntimeError("visual CSV row lacks exactly three confirmations")
         if any(not isinstance(item, Mapping) for item in confirmations):
-            raise RuntimeError("prefix Judge confirmation must be an object")
+            raise RuntimeError("visual CSV confirmation must be an object")
         seeds = [int(item.get("judge_seed")) for item in confirmations]
         if len(seeds) != len(set(seeds)) or set(seeds) != required_seeds:
-            raise RuntimeError("prefix Judge seeds must be exactly 17/42/73")
+            raise RuntimeError("visual CSV seeds must be exactly 17/42/73")
         if any(
             item.get("annotation_leak_check") != "passed"
             or item.get("failure_class") == "annotation_leak"
             for item in confirmations
         ):
-            raise RuntimeError("prefix Judge confirmation failed annotation leak audit")
+            raise RuntimeError("visual CSV confirmation failed annotation leak audit")
         errors = [
             item
             for item in confirmations
@@ -413,10 +423,7 @@ def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
         infrastructure_errors += len(errors)
         if errors:
             continue
-        if any(
-            item.get("parsed_valid") is not True
-            for item in confirmations
-        ):
+        if any(item.get("parsed_valid") is not True for item in confirmations):
             evidence_insufficient += 1
     return {
         "expected_prefixes": len(expected_ids),
@@ -564,7 +571,7 @@ def _fingerprint(args: argparse.Namespace) -> str:
             "sft_env_dir": str(args.sft_env_dir.resolve()),
             "model_path": str(args.model_path.resolve()),
             "model_artifact_sha256": args.expected_model_artifact_sha256,
-            "selection_minima": SELECTION_MINIMA,
+            "selection_quantity_policy": "advisory_only",
         }
     )
 
@@ -642,11 +649,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             ):
                 raise RuntimeError("passed repair partition changed")
 
-        judgments = args.run_root / "prefix_judgments.jsonl"
+        judgments = args.run_root / "visual_csv_results.jsonl"
         progress = judgments.with_suffix(judgments.suffix + ".progress.jsonl")
-        if not _stage_passed(state, "prefix_judge"):
-            state["current_stage"] = "prefix_judge"
-            judge_stage = state["stages"].setdefault("prefix_judge", {})
+        if not _stage_passed(state, "visual_csv_judge"):
+            state["current_stage"] = "visual_csv_judge"
+            judge_stage = state["stages"].setdefault("visual_csv_judge", {})
             command = _judge_command(
                 args,
                 merged,
@@ -657,8 +664,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             judge_stage["input"] = _jsonl_record(merged)
             judge_stage.setdefault("commands", []).append(_command_record(command))
             _save_state(status_path, state)
-            if _run_command(command, cwd=args.repo_root, log_path=args.run_root / "logs/prefix_judge.log"):
-                raise RuntimeError("prefix Judge command failed")
+            if _run_command(
+                command,
+                cwd=args.repo_root,
+                log_path=args.run_root / "logs/visual_csv_judge.log",
+            ):
+                raise RuntimeError("visual CSV Judge command failed")
             judge_audit = _audit_judgments(merged, judgments)
             if judge_audit.get("infrastructure_errors", judge_audit["failures"]):
                 if judge_stage.get("retry_started"):
@@ -675,9 +686,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     if _run_command(
                         retry,
                         cwd=args.repo_root,
-                        log_path=args.run_root / "logs/prefix_judge_retry.log",
+                        log_path=args.run_root / "logs/visual_csv_judge_retry.log",
                     ):
-                        raise RuntimeError("prefix Judge retry command failed")
+                        raise RuntimeError("visual CSV Judge retry command failed")
                     judge_audit = _audit_judgments(merged, judgments)
                     judge_stage["persistent_infrastructure_failures"] = (
                         judge_audit.get(
@@ -688,8 +699,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 {"status": "passed", "ended_at": _now(), "audit": judge_audit}
             )
             _save_state(status_path, state)
-        elif _audit_judgments(merged, judgments)["output_sha256"] != state["stages"]["prefix_judge"]["audit"]["output_sha256"]:
-            raise RuntimeError("passed prefix Judge output changed")
+        elif _audit_judgments(merged, judgments)["output_sha256"] != state[
+            "stages"
+        ]["visual_csv_judge"]["audit"]["output_sha256"]:
+            raise RuntimeError("passed visual CSV Judge output changed")
 
         for stage, command in (
             ("selection", _selection_command(args, merged, judgments)),

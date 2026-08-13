@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -587,11 +588,11 @@ def _validate_result_for_job(result: Mapping[str, Any], job: VisualCsvJob) -> No
     }
     if len(observed) != len(confirmations) or observed != set(raw_seeds):
         raise ValueError("visual CSV confirmations do not match configured seeds")
-    if result.get("visual_csv_status") != "complete" or any(
-        item.get("parsed_valid") is not True or item.get("error") is not None
-        for item in confirmations
-    ):
-        raise ValueError("visual CSV result is not three-seed complete")
+    if result.get("visual_csv_status") not in {
+        "complete",
+        "complete_with_failures",
+    }:
+        raise ValueError("visual CSV result does not contain all three seeds")
 
 
 class VisualCsvVerifier:
@@ -915,8 +916,11 @@ def attach_visual_csv_results(
                 or result.get("sample_id") != row.get("sample_id")
             ):
                 raise ValueError("visual CSV result identity mismatch")
-            if result.get("visual_csv_status") != "complete":
-                raise ValueError("visual CSV result is not three-seed complete")
+            if result.get("visual_csv_status") not in {
+                "complete",
+                "complete_with_failures",
+            }:
+                raise ValueError("visual CSV result does not contain all three seeds")
             confirmations = result.get("visual_csv_confirmations")
             if not isinstance(confirmations, list) or len(confirmations) != 3:
                 raise ValueError("visual CSV result requires exactly three confirmations")
@@ -947,6 +951,8 @@ def attach_visual_csv_results(
 def label_visual_csv_prefixes(
     trajectories: Iterable[Mapping[str, Any]],
     answers: Mapping[tuple[str, str], str],
+    *,
+    candidate_answers: Mapping[tuple[str, str], str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Join labels offline and materialize STOP/CONTINUE without serializing GT."""
 
@@ -960,6 +966,15 @@ def label_visual_csv_prefixes(
         answer = str(answers.get(identity) or "").strip().upper()
         if len(answer) != 1 or not "A" <= answer <= "H":
             raise ValueError(f"missing offline answer for {identity[0]}/{identity[1]}")
+        if candidate_answers is not None:
+            candidate = str(candidate_answers.get(identity) or "").strip().upper()
+            if len(candidate) != 1 or not "A" <= candidate <= "H":
+                raise ValueError(
+                    f"missing frozen candidate for {identity[0]}/{identity[1]}"
+                )
+            row["candidate_training_stratum"] = (
+                "candidate_correct" if candidate == answer else "candidate_wrong"
+            )
         states = row.get("perception_states")
         if not isinstance(states, list) or not states:
             raise ValueError("trajectory has no visual CSV prefixes")
@@ -1019,10 +1034,264 @@ def label_visual_csv_prefixes(
             state["evidence_complete"] = bool(
                 valid and all(prediction == answer for prediction in predictions)
             )
+            state["visual_csv_label_valid"] = valid
+            state["evidence_prediction"] = (
+                predictions[0]
+                if valid and len(set(predictions)) == 1
+                else None
+            )
             state["completion_gate_kind"] = "visual_csv_3of3_offline_label"
         row["offline_label_join"] = "ground_truth_used_for_boolean_only_not_serialized"
         output.append(row)
     return tuple(output)
+
+
+def _non_negative_number(value: Any) -> float:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    ):
+        return float(value)
+    return float("inf")
+
+
+def _optional_non_negative_number(value: Any) -> float:
+    number = _non_negative_number(value)
+    return 0.0 if math.isinf(number) else number
+
+
+def _request_usage_total(request: Mapping[str, Any]) -> float:
+    usage = request.get("usage")
+    return (
+        _optional_non_negative_number(usage.get("total_tokens"))
+        if isinstance(usage, Mapping)
+        else 0.0
+    )
+
+
+def _trace_through_visual_prefix(
+    row: Mapping[str, Any], prefix_index: int
+) -> list[dict[str, Any]]:
+    trace = row.get("request_trace")
+    if not isinstance(trace, list) or not trace:
+        raise ValueError("stable visual CSV trajectory requires request_trace")
+    observation_stages = {"perception", "observation", "observer"}
+    matching: list[int] = []
+    for position, raw in enumerate(trace):
+        if not isinstance(raw, Mapping):
+            raise ValueError("request_trace entry must be an object")
+        stage = str(raw.get("stage") or raw.get("request_kind") or "").casefold()
+        if stage in observation_stages and raw.get("prefix_index") == prefix_index:
+            matching.append(position)
+    if not matching:
+        raise ValueError("complete prefix has no accepted Observer request")
+    retained = [deepcopy(dict(item)) for item in trace[: matching[-1] + 1]]
+
+    def accepted_planners(index: int) -> int:
+        return sum(
+            str(item.get("stage") or item.get("request_kind") or "").casefold()
+            in {"controller", "planner"}
+            and item.get("prefix_index") == index
+            and item.get("action_accepted") is True
+            for item in retained
+        )
+
+    if accepted_planners(-1) != 1:
+        raise ValueError("stable trajectory requires one accepted initial Planner action")
+    for index in range(prefix_index):
+        if accepted_planners(index) != 1:
+            raise ValueError(
+                f"incomplete prefix {index} requires one accepted next Planner action"
+            )
+    return retained
+
+
+def _selected_cost(row: Mapping[str, Any]) -> tuple[float, float, int, float, str]:
+    return (
+        _non_negative_number(row.get("retained_total_tokens")),
+        _non_negative_number(row.get("retained_visual_tokens")),
+        int(row.get("retained_tool_steps") or 0),
+        _non_negative_number(row.get("retained_latency_s")),
+        str(row.get("trajectory_id") or ""),
+    )
+
+
+def _truncate_visual_csv_trajectory(
+    row: Mapping[str, Any], prefix_index: int, prediction: str
+) -> dict[str, Any]:
+    selected = deepcopy(dict(row))
+    states = selected.get("perception_states")
+    steps = selected.get("tool_steps")
+    if not isinstance(states, list) or prefix_index >= len(states):
+        raise ValueError("complete visual CSV prefix is outside perception_states")
+    if not isinstance(steps, list) or len(steps) <= prefix_index:
+        raise ValueError("complete visual CSV prefix is outside tool_steps")
+    retained_states = states[: prefix_index + 1]
+    retained_steps = steps[: prefix_index + 1]
+    retained_trace = _trace_through_visual_prefix(selected, prefix_index)
+    final_memory = retained_states[-1].get("memory_after")
+    if not isinstance(final_memory, Mapping):
+        raise ValueError("complete visual CSV prefix has no memory_after")
+    source_request_tokens = sum(_request_usage_total(item) for item in retained_trace)
+    visual_csv_tokens = sum(
+        _request_usage_total(item)
+        for item in retained_states[-1]["visual_csv_confirmations"]
+        if isinstance(item, Mapping)
+    )
+    retained_visual_tokens = sum(
+        _optional_non_negative_number(item.get("visual_tokens"))
+        for item in retained_steps
+        if isinstance(item, Mapping)
+    )
+    retained_latency = sum(
+        _optional_non_negative_number(item.get("latency_s"))
+        for item in (*retained_trace, *retained_steps)
+        if isinstance(item, Mapping)
+    )
+    selected.update(
+        {
+            "perception_states": retained_states,
+            "tool_steps": retained_steps,
+            "request_trace": retained_trace,
+            "prediction": prediction,
+            "final_prediction": prediction,
+            "evidence_complete": True,
+            "stop_reason": "earliest_visual_csv_3of3_prefix",
+            "earliest_complete_prefix_index": prefix_index,
+            "event_ledger": deepcopy(final_memory.get("event_ledger") or []),
+            "option_ledger": deepcopy(final_memory.get("option_ledger") or {}),
+            "unresolved": deepcopy(final_memory.get("unresolved") or []),
+            "observed_intervals": deepcopy(
+                final_memory.get("observed_intervals") or []
+            ),
+            "rounds": prefix_index + 1,
+            "turn_count": len(retained_trace),
+            "retained_source_total_tokens": source_request_tokens,
+            "retained_visual_csv_total_tokens": visual_csv_tokens,
+            "retained_total_tokens": source_request_tokens + visual_csv_tokens,
+            "retained_visual_tokens": retained_visual_tokens,
+            "retained_tool_steps": prefix_index + 1,
+            "retained_latency_s": retained_latency,
+            "total_tokens": source_request_tokens + visual_csv_tokens,
+            "visual_tokens": retained_visual_tokens,
+            "latency_s": retained_latency,
+            "_selection_stable": True,
+        }
+    )
+    usage = selected.get("usage")
+    if isinstance(usage, Mapping):
+        selected["usage"] = {
+            **deepcopy(dict(usage)),
+            "total_tokens": source_request_tokens + visual_csv_tokens,
+        }
+    _strip_private_trajectory_fields(selected)
+    return selected
+
+
+def select_visual_csv_trajectories(
+    trajectories: Iterable[Mapping[str, Any]],
+    results: Iterable[Mapping[str, Any]],
+    answers: Mapping[tuple[str, str], str],
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], dict[str, Any]]:
+    """Offline-label visual prefixes and select one deterministic stable trace/sample."""
+
+    sources = [dict(row) for row in trajectories]
+    candidate_answers: dict[tuple[str, str], str] = {}
+    source_samples: set[tuple[str, str]] = set()
+    for source in sources:
+        identity = (str(source.get("dataset") or ""), str(source.get("sample_id") or ""))
+        candidate = str(
+            source.get("candidate_answer", source.get("direct_candidate", "")) or ""
+        ).strip().upper()
+        if len(candidate) != 1 or not "A" <= candidate <= "H":
+            raise ValueError(f"trajectory lacks frozen candidate for {identity}")
+        previous = candidate_answers.setdefault(identity, candidate)
+        if previous != candidate:
+            raise ValueError(f"frozen candidate drift across trajectories for {identity}")
+        source_samples.add(identity)
+
+    attached = attach_visual_csv_results(sources, results)
+    labeled_rows = list(
+        label_visual_csv_prefixes(
+            attached, answers, candidate_answers=candidate_answers
+        )
+    )
+    stable_by_sample: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    prefix_counts: Counter[str] = Counter()
+    for row in labeled_rows:
+        states = row["perception_states"]
+        earliest: tuple[int, str] | None = None
+        for index, state in enumerate(states):
+            complete = state.get("evidence_complete") is True
+            prefix_counts["complete" if complete else "incomplete"] += 1
+            prediction = str(state.get("evidence_prediction") or "").upper()
+            if complete and earliest is None:
+                if len(prediction) != 1 or not "A" <= prediction <= "H":
+                    raise ValueError("complete visual CSV prefix has no unanimous answer")
+                earliest = (index, prediction)
+        row["_selection_stable"] = False
+        identity = (str(row["dataset"]), str(row["sample_id"]))
+        stable = (
+            earliest is not None
+            and row.get("annotation_leak_check") == "passed"
+            and int(row.get("candidate_rerun") or 0) == 0
+            and row.get("fallback_used") is not True
+            and row.get("fallback_to_candidate") is not True
+            and not any(row.get(field) for field in ("error", "error_type", "api_error"))
+            and all(
+                state.get("visual_csv_label_valid") is True
+                for state in states[: earliest[0] + 1]
+            )
+        )
+        if stable:
+            assert earliest is not None
+            stable_row = _truncate_visual_csv_trajectory(
+                row, earliest[0], earliest[1]
+            )
+            stable_by_sample.setdefault(identity, []).append(stable_row)
+
+    selected = [
+        deepcopy(min(stable_by_sample[identity], key=_selected_cost))
+        for identity in sorted(stable_by_sample)
+    ]
+    selected_by_dataset = Counter(str(row["dataset"]) for row in selected)
+    selected_by_stratum = Counter(
+        str(row["candidate_training_stratum"]) for row in selected
+    )
+    all_answer_samples = set(answers)
+    no_stable = sorted(all_answer_samples - set(stable_by_sample))
+    no_stable_ids = {
+        dataset: [
+            sample_id
+            for sample_dataset, sample_id in no_stable
+            if sample_dataset == dataset
+        ]
+        for dataset in sorted({item[0] for item in all_answer_samples})
+    }
+    summary = {
+        "trajectories": len(sources),
+        "samples": len(all_answer_samples),
+        "samples_with_trajectories": len(source_samples),
+        "prefixes": sum(prefix_counts.values()),
+        "prefix_status": dict(sorted(prefix_counts.items())),
+        "stable_trajectories": sum(len(rows) for rows in stable_by_sample.values()),
+        "selected": len(selected),
+        "selected_by_dataset": dict(sorted(selected_by_dataset.items())),
+        "selected_by_candidate_stratum": dict(sorted(selected_by_stratum.items())),
+        "candidate_fixes": selected_by_stratum.get("candidate_wrong", 0),
+        "no_stable": len(no_stable),
+        "no_stable_by_dataset": {
+            dataset: len(ids) for dataset, ids in no_stable_ids.items()
+        },
+        "no_stable_sample_ids": no_stable_ids,
+        "judge_seeds": list(VISUAL_CSV_SEEDS),
+        "answers_serialized_into_selected": 0,
+        "candidates_serialized_into_selected": 0,
+        "training_quantity_policy": "advisory_only",
+    }
+    return tuple(labeled_rows), tuple(selected), summary
 
 
 __all__ = [
@@ -1037,5 +1306,6 @@ __all__ = [
     "build_visual_csv_messages",
     "label_visual_csv_prefixes",
     "parse_visual_csv_response",
+    "select_visual_csv_trajectories",
     "visual_csv_response_format",
 ]

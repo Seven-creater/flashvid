@@ -36,7 +36,7 @@ def _args(tmp_path: Path) -> argparse.Namespace:
     )
 
 
-def test_commands_preserve_frozen_judges_and_selection_gate(tmp_path: Path) -> None:
+def test_commands_preserve_frozen_judges_and_visual_csv_quality_gate(tmp_path: Path) -> None:
     args = _args(tmp_path)
     trajectories = tmp_path / "merged.jsonl"
     judgments = tmp_path / "judgments.jsonl"
@@ -51,12 +51,22 @@ def test_commands_preserve_frozen_judges_and_selection_gate(tmp_path: Path) -> N
         if value == "--judge-seed"
     ] == ["17", "42", "73"]
     assert "--resume" in judge and "--retry-errors" in judge
+    assert any(
+        argument.endswith("judge_perception_memory_visual_csv.py")
+        for argument in judge
+    )
+
+    selection = autopilot._selection_command(args, trajectories, judgments)
+    assert any(
+        argument.endswith("select_perception_memory_visual_csv_trajectories.py")
+        for argument in selection
+    )
+    assert "--visual-csv-results" in selection
+    assert "--prefix-judgments" not in selection
 
     build = autopilot._build_command(args)
-    assert build[build.index("--minimum-total") + 1] == "360"
-    assert build[build.index("--minimum-per-dataset") + 1] == "100"
-    assert build[build.index("--minimum-candidate-fixes") + 1] == "90"
-    assert build[build.index("--minimum-candidate-fixes-per-dataset") + 1] == "20"
+    assert build[build.index("--completion-gate-kind") + 1] == "visual_csv"
+    assert not any(argument.startswith("--minimum-") for argument in build)
 
 
 def _audit_confirmation(
@@ -71,6 +81,8 @@ def _audit_confirmation(
         "error_type": "TimeoutError" if error else None,
         "failure_class": "infrastructure_error" if error else "model_parse_failure",
         "annotation_leak_check": "passed",
+        "candidate_blind": True,
+        "tools_disabled": True,
     }
 
 
@@ -81,13 +93,15 @@ def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
     trajectories.write_text("{}\n", encoding="utf-8")
     output = tmp_path / "judgments.jsonl"
     monkeypatch.setattr(
-        autopilot, "bind_prefix_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
+        autopilot, "bind_visual_csv_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
     )
     row = {
         "prefix_id": "p1",
         "annotation_leak_check": "passed",
-        "judge_status": "complete_with_failures",
-        "judge_confirmations": [
+        "candidate_blind": True,
+        "tools_disabled": True,
+        "visual_csv_status": "complete_with_failures",
+        "visual_csv_confirmations": [
             _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 73)
         ],
     }
@@ -98,7 +112,7 @@ def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
     assert semantic["infrastructure_errors"] == 0
     assert semantic["evidence_insufficient"] == 1
 
-    row["judge_confirmations"][0] = _audit_confirmation(
+    row["visual_csv_confirmations"][0] = _audit_confirmation(
         17, parsed_valid=False, error="TimeoutError: request timed out"
     )
     _write_jsonl(output, [row])
@@ -116,12 +130,15 @@ def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
     trajectories.write_text("{}\n", encoding="utf-8")
     output = tmp_path / "judgments.jsonl"
     monkeypatch.setattr(
-        autopilot, "bind_prefix_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
+        autopilot, "bind_visual_csv_jobs", lambda _rows: [SimpleNamespace(prefix_id="p1")]
     )
     row = {
         "prefix_id": "p1",
         "annotation_leak_check": "passed",
-        "judge_confirmations": [
+        "candidate_blind": True,
+        "tools_disabled": True,
+        "visual_csv_status": "complete_with_failures",
+        "visual_csv_confirmations": [
             _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 42)
         ],
     }
@@ -129,10 +146,10 @@ def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
     with pytest.raises(RuntimeError, match="seeds must be exactly"):
         autopilot._audit_judgments(trajectories, output)
 
-    row["judge_confirmations"] = [
+    row["visual_csv_confirmations"] = [
         _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 73)
     ]
-    row["judge_confirmations"][0]["annotation_leak_check"] = "failed"
+    row["visual_csv_confirmations"][0]["annotation_leak_check"] = "failed"
     _write_jsonl(output, [row])
     with pytest.raises(RuntimeError, match="annotation leak"):
         autopilot._audit_judgments(trajectories, output)
@@ -380,12 +397,12 @@ def test_successful_pipeline_is_resumable_without_reissuing_commands(
         command = list(command)
         commands.append(command)
         joined = " ".join(command)
-        if "judge_perception_memory_prefixes.py" in joined:
-            (args.run_root / "prefix_judgments.jsonl").write_text(
-                '{"prefix_id":"p1","judge_status":"complete"}\n',
+        if "judge_perception_memory_visual_csv.py" in joined:
+            (args.run_root / "visual_csv_results.jsonl").write_text(
+                '{"prefix_id":"p1","visual_csv_status":"complete"}\n',
                 encoding="utf-8",
             )
-        elif "select_perception_memory_trajectories.py" in joined:
+        elif "select_perception_memory_visual_csv_trajectories.py" in joined:
             directory = args.run_root / "selection"
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "labeled.jsonl").write_text("{}\n", encoding="utf-8")

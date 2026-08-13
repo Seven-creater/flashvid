@@ -16,8 +16,10 @@ from flashvid_eval.perception_memory_visual_csv import (
     build_visual_csv_messages,
     label_visual_csv_prefixes,
     parse_visual_csv_response,
+    select_visual_csv_trajectories,
 )
 from scripts import judge_perception_memory_visual_csv as visual_csv_cli
+from scripts import select_perception_memory_visual_csv_trajectories as selector_cli
 
 
 def _response(
@@ -120,6 +122,57 @@ def _trajectory(tmp_path: Path) -> dict:
             },
         ],
     }
+
+
+def _selectable_trajectory(tmp_path: Path, *, variant: str, request_tokens: int) -> dict:
+    row = _trajectory(tmp_path)
+    row.update(
+        {
+            "trajectory_id": f"lvbench:sample-1:visual:{variant}",
+            "candidate_answer": "B",
+            "train600_manifest_sha256": "f" * 64,
+            "tool_steps": [
+                {"visual_tokens": 11, "latency_s": 0.1},
+                {"visual_tokens": 13, "latency_s": 0.2},
+            ],
+            "request_trace": [
+                {
+                    "stage": "planner",
+                    "prefix_index": -1,
+                    "action_accepted": True,
+                    "usage": {"total_tokens": request_tokens},
+                    "latency_s": 0.01,
+                },
+                {
+                    "stage": "observer",
+                    "prefix_index": 0,
+                    "usage": {"total_tokens": request_tokens},
+                    "latency_s": 0.02,
+                },
+                {
+                    "stage": "planner",
+                    "prefix_index": 0,
+                    "action_accepted": True,
+                    "usage": {"total_tokens": request_tokens},
+                    "latency_s": 0.03,
+                },
+                {
+                    "stage": "observer",
+                    "prefix_index": 1,
+                    "usage": {"total_tokens": request_tokens},
+                    "latency_s": 0.04,
+                },
+                {
+                    "stage": "planner",
+                    "prefix_index": 1,
+                    "action_accepted": True,
+                    "usage": {"total_tokens": 999},
+                    "latency_s": 9.0,
+                },
+            ],
+        }
+    )
+    return row
 
 
 def test_jobs_accumulate_only_real_frames_and_messages_are_private_free(
@@ -293,6 +346,108 @@ def test_offline_attach_and_label_uses_three_predictions_not_model_boolean(
         state["evidence_complete"] is False
         for state in wrong[0]["perception_states"]
     )
+
+
+def test_offline_selector_keeps_earliest_correct_prefix_and_strips_private_values(
+    tmp_path: Path,
+) -> None:
+    expensive = _selectable_trajectory(tmp_path, variant="expensive", request_tokens=20)
+    cheap = _selectable_trajectory(tmp_path, variant="cheap", request_tokens=5)
+    results: list[dict] = []
+    for trajectory in (expensive, cheap):
+        first, second = bind_visual_csv_jobs([trajectory])
+        results.append(VisualCsvVerifier(_Client(_response(answer="B"))).verify(first))
+        results.append(VisualCsvVerifier(_Client(_response(answer="A"))).verify(second))
+
+    labeled, selected, summary = select_visual_csv_trajectories(
+        [expensive, cheap], results, {("lvbench", "sample-1"): "A"}
+    )
+
+    assert [state["evidence_complete"] for state in labeled[0]["perception_states"]] == [
+        False,
+        True,
+    ]
+    assert len(selected) == 1
+    winner = selected[0]
+    assert winner["trajectory_id"].endswith(":cheap")
+    assert winner["earliest_complete_prefix_index"] == 1
+    assert winner["candidate_training_stratum"] == "candidate_wrong"
+    assert winner["final_prediction"] == "A"
+    assert winner["_selection_stable"] is True
+    assert len(winner["perception_states"]) == len(winner["tool_steps"]) == 2
+    assert len(winner["request_trace"]) == 4
+    assert summary["stable_trajectories"] == 2
+    assert summary["candidate_fixes"] == 1
+    serialized = json.dumps((labeled, selected), ensure_ascii=False)
+    for forbidden in (
+        "SECRET_CANDIDATE_VALUE",
+        "SECRET_GROUND_TRUTH_VALUE",
+    ):
+        assert forbidden not in serialized
+    assert all("candidate_answer" not in row and "ground_truth" not in row for row in labeled)
+    assert all("candidate_answer" not in row and "ground_truth" not in row for row in selected)
+
+
+def test_offline_selector_fails_closed_on_missing_trace_action(tmp_path: Path) -> None:
+    trajectory = _selectable_trajectory(tmp_path, variant="broken", request_tokens=5)
+    trajectory["request_trace"][2]["action_accepted"] = False
+    jobs = bind_visual_csv_jobs([trajectory])
+    results = [
+        VisualCsvVerifier(_Client(_response(answer="B"))).verify(jobs[0]),
+        VisualCsvVerifier(_Client(_response(answer="A"))).verify(jobs[1]),
+    ]
+
+    with pytest.raises(ValueError, match="accepted next Planner action"):
+        select_visual_csv_trajectories(
+            [trajectory], results, {("lvbench", "sample-1"): "A"}
+        )
+
+
+def test_selector_cli_binds_train600_and_publishes_all_outputs(
+    tmp_path: Path,
+) -> None:
+    answers_path = tmp_path / "train600.jsonl"
+    answer_rows = [
+        {"dataset": dataset, "sample_id": f"{dataset}-{index}", "answer": "A"}
+        for dataset in ("lvbench", "lsdbench", "cgbench")
+        for index in range(200)
+    ]
+    answer_rows[0]["sample_id"] = "sample-1"
+    answers_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in answer_rows), encoding="utf-8"
+    )
+    answers_sha = selector_cli._sha256(answers_path)
+    trajectory = _selectable_trajectory(tmp_path, variant="cli", request_tokens=5)
+    trajectory["train600_manifest_sha256"] = answers_sha
+    trajectory_path = tmp_path / "trajectory.jsonl"
+    trajectory_path.write_text(json.dumps(trajectory) + "\n", encoding="utf-8")
+    jobs = bind_visual_csv_jobs([trajectory])
+    results = [
+        VisualCsvVerifier(_Client(_response(answer="B"))).verify(jobs[0]),
+        VisualCsvVerifier(_Client(_response(answer="A"))).verify(jobs[1]),
+    ]
+    result_path = tmp_path / "visual.csv.jsonl"
+    result_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in results), encoding="utf-8"
+    )
+    args = argparse.Namespace(
+        trajectories=[trajectory_path],
+        visual_csv_results=[result_path],
+        answers=answers_path,
+        expected_answers_sha256=answers_sha,
+        labeled_output=tmp_path / "selection/labeled.jsonl",
+        selected_output=tmp_path / "selection/selected.jsonl",
+        summary=tmp_path / "selection/summary.json",
+        overwrite=False,
+    )
+
+    report = selector_cli.run(args)
+
+    assert report["selected"] == 1
+    assert report["samples"] == 600
+    assert report["training_quantity_policy"] == "advisory_only"
+    assert all(path.is_file() for path in (args.labeled_output, args.selected_output, args.summary))
+    assert "candidate_answer" not in args.selected_output.read_text(encoding="utf-8")
 
 
 def test_cli_is_multi_endpoint_resumable_and_fingerprint_locked(

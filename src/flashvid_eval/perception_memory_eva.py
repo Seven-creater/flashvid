@@ -66,6 +66,8 @@ RESCUE_TRAJECTORY_VARIANTS = frozenset(
 _ALLOWED_TRAJECTORY_VARIANTS = frozenset({"base", *RESCUE_TRAJECTORY_VARIANTS})
 _MAX_NO_NOVEL_ACTION_REJECTIONS = 2
 _MAX_ANSWERER_CITED_FRAMES = 16
+RUNTIME_VERIFIER_MAX_FRAMES = 16
+RUNTIME_VERIFIER_FRAME_SELECTION_POLICY = "uniform_full_inventory_endpoints_v1"
 ROLE_SEPARATED_RUNTIME_VERSION = "role_separated_visual_csv_v1"
 PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
 CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v1"
@@ -146,6 +148,8 @@ def role_prompt_schema_bundle_sha256() -> str:
         build_perception_retry_messages,
         perception_response_format,
         bind_perception_state,
+        select_runtime_verifier_frames,
+        map_runtime_verifier_frame_indices,
         build_runtime_visual_csv_messages,
         parse_visual_csv_response,
         build_cited_judge_messages,
@@ -159,6 +163,10 @@ def role_prompt_schema_bundle_sha256() -> str:
             EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
         ),
         "visual_csv_schema_version": VISUAL_CSV_SCHEMA_VERSION,
+        "runtime_verifier_max_frames": RUNTIME_VERIFIER_MAX_FRAMES,
+        "runtime_verifier_frame_selection_policy": (
+            RUNTIME_VERIFIER_FRAME_SELECTION_POLICY
+        ),
         "contracts": {
             function.__name__: inspect.getsource(function) for function in builders
         },
@@ -2001,6 +2009,55 @@ def _deduplicated_frame_inventory(
     return tuple(result)
 
 
+def select_runtime_verifier_frames(
+    frame_inventory: Sequence[tuple[str, float]],
+) -> tuple[tuple[tuple[str, float], ...], tuple[int, ...]]:
+    """Select at most 16 frames with deterministic full-inventory provenance."""
+
+    frames = _deduplicated_frame_inventory(frame_inventory)
+    frame_count = len(frames)
+    if frame_count <= RUNTIME_VERIFIER_MAX_FRAMES:
+        full_indices = tuple(range(frame_count))
+    else:
+        denominator = RUNTIME_VERIFIER_MAX_FRAMES - 1
+        full_indices = tuple(
+            (
+                local_index * (frame_count - 1)
+                + denominator // 2
+            )
+            // denominator
+            for local_index in range(RUNTIME_VERIFIER_MAX_FRAMES)
+        )
+    return tuple(frames[index] for index in full_indices), full_indices
+
+
+def map_runtime_verifier_frame_indices(
+    local_indices: Sequence[int],
+    selected_full_indices: Sequence[int],
+) -> tuple[int, ...]:
+    """Map verifier-local citations back to the complete frame inventory."""
+
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) or index < 0
+        for index in selected_full_indices
+    ):
+        raise ValueError("selected verifier frame indices must be non-negative integers")
+    full_indices = tuple(selected_full_indices)
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw_index in local_indices:
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int):
+            raise ValueError("runtime verifier citations must be integer local indices")
+        local_index = raw_index
+        if local_index < 0 or local_index >= len(full_indices):
+            raise ValueError("runtime verifier cited an invalid local frame index")
+        full_index = full_indices[local_index]
+        if full_index not in seen:
+            seen.add(full_index)
+            result.append(full_index)
+    return tuple(result)
+
+
 def build_runtime_visual_csv_messages(
     sample: ModelSample,
     frame_inventory: Sequence[tuple[str, float]],
@@ -2009,7 +2066,7 @@ def build_runtime_visual_csv_messages(
 ) -> list[dict[str, Any]]:
     """Reuse the offline visual-CSV contract for one candidate-blind runtime check."""
 
-    frames = _deduplicated_frame_inventory(frame_inventory)
+    frames, _full_indices = select_runtime_verifier_frames(frame_inventory)
     if not frames:
         raise ValueError("runtime visual CSV requires at least one observed frame")
     public_sample = replace(sample, candidate_answer=None)
@@ -2457,6 +2514,10 @@ class PerceptionMemoryEvaEvaluator:
             "evidence_request_content_signature_version": (
                 EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
             ),
+            "runtime_verifier_max_frames": RUNTIME_VERIFIER_MAX_FRAMES,
+            "runtime_verifier_frame_selection_policy": (
+                RUNTIME_VERIFIER_FRAME_SELECTION_POLICY
+            ),
             "model": self.model,
             "role_config_sha256": self.role_config_sha256,
             "role_models": {
@@ -2810,6 +2871,9 @@ class PerceptionMemoryEvaEvaluator:
             frames = _deduplicated_frame_inventory(frame_inventory)
             if not frames:
                 return CompletenessDecision(False, ("no visual frames observed",))
+            verifier_frames, selected_full_indices = select_runtime_verifier_frames(
+                frames
+            )
             effective_prefix = prefix_index if prefix_index is not None else -1
             messages = build_runtime_visual_csv_messages(
                 sample, frames, prefix_index=effective_prefix
@@ -2827,7 +2891,13 @@ class PerceptionMemoryEvaEvaluator:
                 prefix_index=prefix_index,
             )
             decision = parse_visual_csv_response(
-                content, sample.option_letters, len(frames)
+                content, sample.option_letters, len(verifier_frames)
+            )
+            local_cited_indices = (
+                decision.frame_indices if decision is not None else ()
+            )
+            cited_full_indices = map_runtime_verifier_frame_indices(
+                local_cited_indices, selected_full_indices
             )
             trace[-1].update(
                 {
@@ -2835,9 +2905,18 @@ class PerceptionMemoryEvaEvaluator:
                     "ledger_blind": True,
                     "prior_reasoning_blind": True,
                     "frame_inventory_count": len(frames),
-                    "cited_frame_indices": (
-                        list(decision.frame_indices) if decision is not None else []
+                    "verifier_frame_selection_policy": (
+                        RUNTIME_VERIFIER_FRAME_SELECTION_POLICY
                     ),
+                    "verifier_frame_selection_limit": RUNTIME_VERIFIER_MAX_FRAMES,
+                    "verifier_selected_frame_count": len(verifier_frames),
+                    "verifier_selected_full_frame_indices": list(
+                        selected_full_indices
+                    ),
+                    "verifier_local_cited_frame_indices": list(
+                        local_cited_indices
+                    ),
+                    "cited_frame_indices": list(cited_full_indices),
                 }
             )
             if decision is None:
@@ -2846,7 +2925,7 @@ class PerceptionMemoryEvaEvaluator:
                 evidence_complete=decision.evidence_complete,
                 missing_evidence=decision.missing_evidence,
                 answer=decision.answer,
-                frame_indices=decision.frame_indices,
+                frame_indices=cited_full_indices,
             )
         content = self._chat(
             trace,
@@ -3818,6 +3897,8 @@ __all__ = [
     "PERCEPTION_RESPONSE_SCHEMA_VERSION",
     "REPAIR_ONLY_TRAJECTORY_VARIANTS",
     "RESCUE_TRAJECTORY_VARIANTS",
+    "RUNTIME_VERIFIER_FRAME_SELECTION_POLICY",
+    "RUNTIME_VERIFIER_MAX_FRAMES",
     "TimestampedFact",
     "apply_candidate_gate",
     "bind_perception_state",
@@ -3837,6 +3918,7 @@ __all__ = [
     "explicit_time_rescue_request",
     "interval_iou",
     "messages_have_media",
+    "map_runtime_verifier_frame_indices",
     "parse_completeness",
     "parse_controller_action",
     "parse_evidence_decision",
@@ -3848,6 +3930,7 @@ __all__ = [
     "perception_response_format",
     "normalize_perception_state",
     "rescue_frame_request",
+    "select_runtime_verifier_frames",
     "validate_perception_state_observation",
     "validate_perception_memory_role_config",
 ]

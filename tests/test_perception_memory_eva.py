@@ -20,6 +20,8 @@ from flashvid_eval.perception_memory_eva import (
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
     PERCEPTION_MEMORY_ROLE_NAMES,
+    RUNTIME_VERIFIER_FRAME_SELECTION_POLICY,
+    RUNTIME_VERIFIER_MAX_FRAMES,
     PerceptionMemoryEvaEvaluator,
     PerceptionMemoryRoleBinding,
     REPAIR_ONLY_TRAJECTORY_VARIANTS,
@@ -40,6 +42,7 @@ from flashvid_eval.perception_memory_eva import (
     explicit_time_rescue_request,
     interval_iou,
     messages_have_media,
+    map_runtime_verifier_frame_indices,
     parse_completeness,
     parse_controller_action,
     parse_perception_state,
@@ -47,6 +50,8 @@ from flashvid_eval.perception_memory_eva import (
     perception_memory_role_for_stage,
     perception_response_format,
     rescue_frame_request,
+    role_prompt_schema_bundle_sha256,
+    select_runtime_verifier_frames,
     validate_perception_state_observation,
     validate_perception_memory_role_config,
 )
@@ -371,7 +376,7 @@ def test_role_separated_visual_csv_is_ledger_free_and_answerer_caps_citations(
     serialized_verifier = json.dumps(verifier, ensure_ascii=False)
     assert "Evidence memory" not in serialized_verifier
     assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_verifier
-    assert serialized_verifier.count('"type": "image_url"') == 20
+    assert serialized_verifier.count('"type": "image_url"') == 16
 
     answerer = build_cited_judge_messages(
         sample, memory, frames, tuple(range(20))
@@ -380,6 +385,169 @@ def test_role_separated_visual_csv_is_ledger_free_and_answerer_caps_citations(
     assert "Evidence memory:" in serialized_answerer
     assert "PRIVATE_CANDIDATE_SENTINEL" not in serialized_answerer
     assert serialized_answerer.count('"type": "image_url"') == 16
+
+
+def test_runtime_verifier_uniformly_selects_16_frames_with_endpoint_coverage(
+    tmp_path: Path,
+) -> None:
+    frames = []
+    for index in range(64):
+        path = tmp_path / f"frame-{index:02d}.jpg"
+        path.write_bytes(f"frame-{index}".encode())
+        frames.append((str(path), float(index)))
+
+    selected, full_indices = select_runtime_verifier_frames(frames)
+
+    assert full_indices == (
+        0,
+        4,
+        8,
+        13,
+        17,
+        21,
+        25,
+        29,
+        34,
+        38,
+        42,
+        46,
+        50,
+        55,
+        59,
+        63,
+    )
+    assert len(selected) == RUNTIME_VERIFIER_MAX_FRAMES
+    assert selected[0][1] == 0.0
+    assert selected[-1][1] == 63.0
+    messages = build_runtime_visual_csv_messages(_sample(), frames, prefix_index=0)
+    assert json.dumps(messages).count('"type": "image_url"') == 16
+
+
+def test_runtime_verifier_keeps_small_inventory_and_maps_local_indices(
+    tmp_path: Path,
+) -> None:
+    frames = []
+    for index in range(8):
+        path = tmp_path / f"frame-{index}.jpg"
+        path.write_bytes(f"frame-{index}".encode())
+        frames.append((str(path), float(index)))
+
+    selected, full_indices = select_runtime_verifier_frames(frames)
+
+    assert selected == tuple(
+        (str(Path(path).resolve()), timestamp) for path, timestamp in frames
+    )
+    assert full_indices == tuple(range(8))
+    assert map_runtime_verifier_frame_indices((0, 3, 7), full_indices) == (0, 3, 7)
+    with pytest.raises(ValueError, match="integer local indices"):
+        map_runtime_verifier_frame_indices((True,), full_indices)
+    with pytest.raises(ValueError, match="integer local indices"):
+        map_runtime_verifier_frame_indices((1.0,), full_indices)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-negative integers"):
+        map_runtime_verifier_frame_indices((0,), (False,))
+
+
+def test_runtime_verifier_maps_local_citations_to_full_inventory(
+    tmp_path: Path,
+) -> None:
+    frames = []
+    for index in range(64):
+        path = tmp_path / f"frame-{index:02d}.jpg"
+        path.write_bytes(f"frame-{index}".encode())
+        frames.append((str(path), float(index)))
+    clients = {
+        role: _FakeClient(
+            [
+                json.dumps(
+                    {
+                        "answer": "B",
+                        "frame_indices": [0, 15],
+                        "evidence_complete": True,
+                        "missing_evidence": [],
+                    }
+                )
+            ]
+            if role == "verifier"
+            else []
+        )
+        for role in PERCEPTION_MEMORY_ROLE_NAMES
+    }
+    bindings = {
+        role: PerceptionMemoryRoleBinding(
+            client=clients[role],
+            model=f"model-{role}",
+            artifact_sha256=f"{index + 1:x}" * 64,
+        )
+        for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+    }
+    evaluator = PerceptionMemoryEvaEvaluator(
+        clients["planner"],
+        "legacy-model",
+        tmp_path,
+        tmp_path / "runtime-frames",
+        role_bindings=bindings,
+        role_config_sha256="a" * 64,
+    )
+    trace: list[dict] = []
+
+    decision = evaluator._completeness(
+        _sample(),
+        EvidenceMemory(("A", "B")),
+        trace,
+        seed_offset=0,
+        prefix_index=3,
+        frame_inventory=frames,
+    )
+
+    assert decision is not None
+    assert decision.frame_indices == (0, 63)
+    request = trace[-1]
+    assert request["frame_inventory_count"] == 64
+    assert request["verifier_frame_selection_policy"] == (
+        RUNTIME_VERIFIER_FRAME_SELECTION_POLICY
+    )
+    assert request["verifier_frame_selection_limit"] == 16
+    assert request["verifier_selected_frame_count"] == 16
+    assert request["verifier_selected_full_frame_indices"][0] == 0
+    assert request["verifier_selected_full_frame_indices"][-1] == 63
+    assert request["verifier_local_cited_frame_indices"] == [0, 15]
+    assert request["cited_frame_indices"] == [0, 63]
+    assert json.dumps(clients["verifier"].messages[0]).count(
+        '"type": "image_url"'
+    ) == 16
+
+
+def test_runtime_verifier_selection_contract_is_audited_and_fingerprinted(
+    tmp_path: Path,
+) -> None:
+    clients = {role: _FakeClient([]) for role in PERCEPTION_MEMORY_ROLE_NAMES}
+    bindings = {
+        role: PerceptionMemoryRoleBinding(
+            client=clients[role],
+            model=f"model-{role}",
+            artifact_sha256=f"{index + 1:x}" * 64,
+        )
+        for index, role in enumerate(PERCEPTION_MEMORY_ROLE_NAMES)
+    }
+    evaluator = PerceptionMemoryEvaEvaluator(
+        clients["planner"],
+        "Qwen3.5-9B",
+        tmp_path,
+        tmp_path / "frames",
+        role_bindings=bindings,
+        role_config_sha256="a" * 64,
+    )
+
+    audit = evaluator.static_audit_fields()
+
+    assert audit["runtime_verifier_max_frames"] == 16
+    assert audit["runtime_verifier_frame_selection_policy"] == (
+        RUNTIME_VERIFIER_FRAME_SELECTION_POLICY
+    )
+    assert len(role_prompt_schema_bundle_sha256()) == 64
+    assert audit["role_prompt_schema_bundle_sha256"] == (
+        role_prompt_schema_bundle_sha256()
+    )
 
 
 def test_perception_sees_only_current_frames_and_no_candidate_or_private_fields(

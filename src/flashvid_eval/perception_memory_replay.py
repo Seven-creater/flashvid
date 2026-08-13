@@ -29,7 +29,10 @@ from .perception_memory_eva import (
     build_controller_messages,
     build_perception_messages,
     build_perception_retry_messages,
+    build_role_separated_controller_messages,
     perception_model_target,
+    perception_response_format,
+    perception_state_payload,
     validate_perception_state_observation,
 )
 from .privacy import AnnotationLeakError, assert_annotation_free_request
@@ -38,7 +41,7 @@ from .runner import parse_question_time_range
 from .schemas import ModelSample
 
 
-REPLAY_VERSION = "perception_memory_replay_v3"
+REPLAY_VERSION = "perception_memory_replay_v4"
 FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
 FRAME_SUBSAMPLE_VERSION = "v1"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
@@ -528,9 +531,16 @@ def bind_replay_perception_state(
 
 
 def _perception_model_target(
-    state: PerceptionState, actual_timestamps: Sequence[float]
+    state: PerceptionState,
+    actual_timestamps: Sequence[float],
+    *,
+    role_separated: bool = False,
 ) -> str:
-    return perception_model_target(state, actual_timestamps)
+    return perception_model_target(
+        state,
+        actual_timestamps,
+        role_separated=role_separated,
+    )
 
 
 def _retry_perception_messages(
@@ -540,6 +550,7 @@ def _retry_perception_messages(
     valid_letters: Sequence[str],
     frame_count: int,
     interval: tuple[float, float],
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     return build_perception_retry_messages(
         messages,
@@ -547,6 +558,7 @@ def _retry_perception_messages(
         valid_letters=valid_letters,
         frame_count=frame_count,
         interval=interval,
+        role_separated=role_separated,
     )
 
 
@@ -579,6 +591,8 @@ class ReplayConfig:
     local_media_transport: str = "file_url"
     max_frames_per_call: int = 128
     request_timeout_s: float = 300.0
+    role_separated_observer: bool = False
+    served_model_artifact_sha256: str | None = None
 
     @property
     def perception_retry_max_tokens(self) -> int:
@@ -604,6 +618,15 @@ class ReplayConfig:
             )
         if self.local_media_transport not in {"file_url", "path"}:
             raise ValueError("local_media_transport must be file_url or path")
+        if self.served_model_artifact_sha256 is not None:
+            _sha256_text(
+                self.served_model_artifact_sha256,
+                "served_model_artifact_sha256",
+            )
+        if self.role_separated_observer and self.served_model_artifact_sha256 is None:
+            raise ValueError(
+                "role-separated Observer replay requires served_model_artifact_sha256"
+            )
 
     def fingerprint(self) -> str:
         return canonical_sha256(
@@ -621,7 +644,13 @@ class ReplayConfig:
                 "frame_subsample_policy": FRAME_SUBSAMPLE_POLICY,
                 "frame_subsample_version": FRAME_SUBSAMPLE_VERSION,
                 "request_timeout_s": float(self.request_timeout_s),
-                "perception_prompt": "build_perception_messages_v1",
+                "role_separated_observer": self.role_separated_observer,
+                "served_model_artifact_sha256": self.served_model_artifact_sha256,
+                "perception_prompt": (
+                    "build_perception_messages_role_separated_v1"
+                    if self.role_separated_observer
+                    else "build_perception_messages_v1"
+                ),
                 "memory_merge": "EvidenceMemory.merge_v1",
                 "implementation_dependencies": (
                     replay_implementation_dependency_hashes()
@@ -691,8 +720,16 @@ class PerceptionMemoryReplay:
         candidate_results_sha256 = _sha256_text(
             source.get("candidate_results_sha256"), "candidate_results_sha256"
         )
-        model_artifact_sha256 = _sha256_text(
-            source.get("model_artifact_sha256"), "model_artifact_sha256"
+        source_model_artifact_sha256 = _sha256_text(
+            source.get("model_artifact_sha256"), "source model_artifact_sha256"
+        )
+        model_artifact_sha256 = (
+            _sha256_text(
+                self.config.served_model_artifact_sha256,
+                "served_model_artifact_sha256",
+            )
+            if self.config.served_model_artifact_sha256 is not None
+            else source_model_artifact_sha256
         )
         trajectory_id = f"{source_trajectory_id}:{REPLAY_VERSION}"
         source_row_sha256 = canonical_sha256(source)
@@ -704,6 +741,7 @@ class PerceptionMemoryReplay:
             }
         )
         memory = EvidenceMemory(sample.option_letters)
+        accepted_planner_history: list[tuple[dict[str, Any], str]] = []
         trace: list[dict[str, Any]] = []
         states: list[dict[str, Any]] = []
         tool_steps: list[dict[str, Any]] = []
@@ -714,16 +752,25 @@ class PerceptionMemoryReplay:
             cached = _cap_cached_frame_step(
                 source_cached, self.config.max_frames_per_call
             )
-            controller_messages = build_controller_messages(
-                sample, memory, video_metadata
+            controller_messages = (
+                build_role_separated_controller_messages(
+                    sample,
+                    memory,
+                    video_metadata,
+                    accepted_planner_history,
+                )
+                if self.config.role_separated_observer
+                else build_controller_messages(sample, memory, video_metadata)
             )
             assert_annotation_free_request({"messages": controller_messages})
+            tool_target = _tool_target(cached.request)
             trace.append(
                 {
                     "stage": "controller",
+                    "role_name": "planner",
                     "model": self.config.model,
                     "messages": copy.deepcopy(controller_messages),
-                    "content": _tool_target(cached.request),
+                    "content": tool_target,
                     "reasoning_content": "",
                     "finish_reason": "source_replay",
                     "usage": {},
@@ -736,11 +783,16 @@ class PerceptionMemoryReplay:
                     "source_cached_action": True,
                 }
             )
+            if self.config.role_separated_observer:
+                accepted_planner_history.append(
+                    (copy.deepcopy(controller_messages[-1]), tool_target)
+                )
             perception_messages = build_perception_messages(
                 sample,
                 cached.observation,
                 cached.request.evidence_request,
                 use_frame_indices=True,
+                role_separated=self.config.role_separated_observer,
             )
             assert_annotation_free_request({"messages": perception_messages})
             retry_group_id = _prompt_hash(perception_messages)
@@ -760,6 +812,7 @@ class PerceptionMemoryReplay:
                             cached.observation.resolved_start_time,
                             cached.observation.resolved_end_time,
                         ),
+                        role_separated=self.config.role_separated_observer,
                     )
                 )
                 assert_annotation_free_request({"messages": attempt_messages})
@@ -774,13 +827,19 @@ class PerceptionMemoryReplay:
                     max_tokens=max_tokens,
                     temperature=0.0,
                     seed=self.config.seed + step_index * 10 + 2,
-                    response_format={"type": "json_object"},
+                    response_format=perception_response_format(
+                        sample.option_letters,
+                        len(cached.observation.timestamps),
+                        role_separated=self.config.role_separated_observer,
+                    ),
                     chat_template_kwargs={"enable_thinking": False},
                 )
-                parsed, timestamp_reference_mode = bind_replay_perception_state(
+                parsed, timestamp_reference_mode = bind_perception_state(
                     result.content,
                     sample.option_letters,
                     cached.observation.timestamps,
+                    allow_timestamp_schema=not self.config.role_separated_observer,
+                    allow_role_separated_schema=self.config.role_separated_observer,
                 )
                 attempt_failure: str | None = None
                 if result.finish_reason == "length":
@@ -799,7 +858,9 @@ class PerceptionMemoryReplay:
                 trace.append(
                     {
                         "stage": "perception",
+                        "role_name": "observer",
                         "model": self.config.model,
+                        "artifact_sha256": model_artifact_sha256,
                         "messages": copy.deepcopy(attempt_messages),
                         "content": result.content,
                         "reasoning_content": result.reasoning_content,
@@ -843,33 +904,41 @@ class PerceptionMemoryReplay:
                 )
             memory.merge(state)
             perception_model_target = _perception_model_target(
-                state, cached.observation.timestamps
+                state,
+                cached.observation.timestamps,
+                role_separated=self.config.role_separated_observer,
             )
-            states.append(
-                {
-                    "step_index": step_index,
-                    "turn_index": step_index,
-                    "request": cached.request.to_tool_arguments(),
-                    "frame_paths": list(cached.observation.frame_paths),
-                    "timestamps": list(cached.observation.timestamps),
-                    "source_frame_count": cached.source_frame_count,
-                    "frame_cap_applied": cached.frame_cap_applied,
-                    "subsample_indices": list(cached.subsample_indices),
-                    "subsample_policy": cached.subsample_policy,
-                    "subsample_version": cached.subsample_version,
-                    "perception": state.to_dict(),
-                    "perception_response": state.to_dict(),
-                    "perception_model_target": perception_model_target,
-                    "memory_after": memory.to_dict(),
-                    # Perception's self-report is not a correctness label.  The
-                    # later three-seed, ground-truth-deferred prefix gate owns this.
-                    "evidence_complete": False,
-                    "judge_confirmations": [],
-                    "source_perception_evidence_sufficient": state.evidence_sufficient,
-                    "perception_attempts": attempt_index + 1,
-                    "perception_retry_reason": retry_reason,
-                }
+            perception_response = perception_state_payload(
+                state,
+                role_separated=self.config.role_separated_observer,
             )
+            state_row = {
+                "step_index": step_index,
+                "turn_index": step_index,
+                "request": cached.request.to_tool_arguments(),
+                "frame_paths": list(cached.observation.frame_paths),
+                "timestamps": list(cached.observation.timestamps),
+                "source_frame_count": cached.source_frame_count,
+                "frame_cap_applied": cached.frame_cap_applied,
+                "subsample_indices": list(cached.subsample_indices),
+                "subsample_policy": cached.subsample_policy,
+                "subsample_version": cached.subsample_version,
+                "perception": perception_response,
+                "perception_response": perception_response,
+                "perception_model_target": perception_model_target,
+                "memory_after": memory.to_dict(),
+                # Perception's self-report is not a correctness label.  The
+                # later three-seed, ground-truth-deferred prefix gate owns this.
+                "evidence_complete": False,
+                "judge_confirmations": [],
+                "perception_attempts": attempt_index + 1,
+                "perception_retry_reason": retry_reason,
+            }
+            if not self.config.role_separated_observer:
+                state_row["source_perception_evidence_sufficient"] = (
+                    state.evidence_sufficient
+                )
+            states.append(state_row)
             tool_step = asdict(
                 ToolStep.from_observation("perception", cached.observation)
             )
@@ -911,6 +980,9 @@ class PerceptionMemoryReplay:
             "dataset_manifest_sha256": dataset_manifest_sha256,
             "candidate_results_sha256": candidate_results_sha256,
             "model_artifact_sha256": model_artifact_sha256,
+            "source_model_artifact_sha256": source_model_artifact_sha256,
+            "served_model_artifact_sha256": model_artifact_sha256,
+            "role_separated_observer": self.config.role_separated_observer,
             "config_sha256": self.config.fingerprint(),
             "experiment_config_sha256": self.config.fingerprint(),
             "run_fingerprint": run_fingerprint,
@@ -922,6 +994,7 @@ class PerceptionMemoryReplay:
                 "question": sample.question,
                 "choices": dict(sample.choices),
             },
+            "video_metadata": video_metadata,
             "model": self.config.model,
             "request_timeout_s": float(self.config.request_timeout_s),
             "endpoint_count": self.endpoint_count,

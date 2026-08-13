@@ -260,7 +260,7 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(
     )
 
     assert result["scoring_deferred"] is True
-    assert result["trajectory_id"].endswith(":perception_memory_replay_v3")
+    assert result["trajectory_id"].endswith(":perception_memory_replay_v4")
     assert (
         result["perception_normalization_version"] == PERCEPTION_NORMALIZATION_VERSION
     )
@@ -315,6 +315,75 @@ def test_replay_binds_frame_index_to_exact_cached_timestamp(tmp_path: Path) -> N
     ]
     assert result["request_trace"][1]["timestamp_reference_mode"] == "frame_index"
     assert "frame_index" in client.calls[0]["messages"][0]["content"]
+
+
+def test_role_separated_replay_uses_five_field_observer_and_served_identity(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+    payload = {
+        "interval": [0.0, 10.0],
+        "timestamped_facts": [{"frame_index": 0, "fact": "The person opens the door."}],
+        "option_evidence": {
+            "A": {"supports": [], "contradicts": ["The person opens the door."]},
+            "B": {"supports": ["The person opens the door."], "contradicts": []},
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+    }
+    client = FakeClient([json.dumps(payload)])
+    config = ReplayConfig(
+        role_separated_observer=True,
+        served_model_artifact_sha256="e" * 64,
+    )
+
+    result = PerceptionMemoryReplay(client, config).replay(
+        source,
+        source_file_sha256="a" * 64,
+        audit_summary_sha256="b" * 64,
+    )
+
+    assert result["role_separated_observer"] is True
+    assert result["model_artifact_sha256"] == "e" * 64
+    assert result["served_model_artifact_sha256"] == "e" * 64
+    assert result["source_model_artifact_sha256"] == "d" * 64
+    state = result["perception_states"][0]
+    assert set(state["perception_response"]) == {
+        "interval",
+        "timestamped_facts",
+        "option_evidence",
+        "temporal_changes",
+        "unresolved",
+    }
+    assert set(json.loads(state["perception_model_target"])) == set(
+        state["perception_response"]
+    )
+    assert "evidence_sufficient" not in client.calls[0]["messages"][0]["content"]
+    schema = client.calls[0]["response_format"]["json_schema"]["schema"]
+    assert "evidence_sufficient" not in schema["properties"]
+    assert set(schema["required"]) == set(state["perception_response"])
+
+
+def test_role_separated_replay_rejects_legacy_timestamp_schema(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+    legacy = _state((0.0, 10.0), "The person opens the door.", sufficient=True)
+    client = FakeClient([legacy, legacy])
+    config = ReplayConfig(
+        role_separated_observer=True,
+        served_model_artifact_sha256="e" * 64,
+    )
+
+    with pytest.raises(ValueError, match="invalid evidence after retry"):
+        PerceptionMemoryReplay(client, config).replay(
+            source,
+            source_file_sha256="a" * 64,
+            audit_summary_sha256="b" * 64,
+        )
+    assert len(client.calls) == 2
+    correction = client.calls[1]["messages"][-1]["content"][-1]["text"]
+    assert "evidence_sufficient" not in correction
 
 
 @pytest.mark.parametrize("language", ["", "json"])
@@ -895,6 +964,21 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
     baseline = ReplayConfig().fingerprint()
     assert ReplayConfig(max_frames_per_call=127).fingerprint() != baseline
     assert ReplayConfig(request_timeout_s=299).fingerprint() != baseline
+    assert ReplayConfig(served_model_artifact_sha256="e" * 64).fingerprint() != baseline
+    with pytest.raises(ValueError, match="requires served_model_artifact"):
+        ReplayConfig(role_separated_observer=True)
+    role_separated = ReplayConfig(
+        role_separated_observer=True,
+        served_model_artifact_sha256="e" * 64,
+    ).fingerprint()
+    assert role_separated != baseline
+    assert (
+        role_separated
+        != ReplayConfig(
+            role_separated_observer=True,
+            served_model_artifact_sha256="f" * 64,
+        ).fingerprint()
+    )
     monkeypatch.setattr(
         replay_module,
         "replay_implementation_dependency_hashes",

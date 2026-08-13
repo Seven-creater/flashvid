@@ -38,6 +38,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "no"))
     parser.add_argument("--model", default="Qwen3.5-9B")
+    parser.add_argument(
+        "--served-model-artifact-sha256",
+        help="SHA-256 of the model stack serving the replayed Observer.",
+    )
+    parser.add_argument(
+        "--role-separated-observer",
+        action="store_true",
+        help=(
+            "Use the frozen five-field Observer protocol with strict frame-index "
+            "binding; requires --served-model-artifact-sha256."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--max-frames-per-call", type=int, default=128)
@@ -58,6 +70,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_frames_per_call=args.max_frames_per_call,
             request_timeout_s=args.timeout,
             local_media_transport="path" if args.local_media_paths else "file_url",
+            role_separated_observer=args.role_separated_observer,
+            served_model_artifact_sha256=args.served_model_artifact_sha256,
         )
         base_urls = args.base_urls or ["http://127.0.0.1:8200/v1"]
         clients = [

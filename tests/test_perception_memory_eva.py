@@ -2259,6 +2259,32 @@ def test_controller_structured_output_accepts_only_canonical_eva_actions() -> No
     assert not re.fullmatch(with_stop, observe.replace("0.75", '"fit"'))
 
 
+def test_role_separated_controller_v2_accepts_bounded_official_actions_only() -> None:
+    role_regex = controller_structured_outputs(
+        allow_stop=False, role_separated=True
+    )["regex"]
+    ten_frames = (
+        '<tool_call>{"arguments":{"end_time":100.0,"evidence_request":'
+        '"Observe the action.","nframes":10,"resize":1.0,"start_time":0.0},'
+        '"tool":"frame_select"}</tool_call>'
+    )
+    one_frame = ten_frames.replace('"nframes":10', '"nframes":1').replace(
+        '"resize":1.0', '"resize":0.05'
+    )
+    assert re.fullmatch(role_regex, ten_frames)
+    assert re.fullmatch(role_regex, one_frame)
+    for invalid in (
+        ten_frames.replace('"nframes":10', '"nframes":129'),
+        ten_frames.replace('"resize":1.0', '"resize":2.01'),
+        ten_frames.replace('"nframes":10', '"fps":1.0'),
+    ):
+        assert not re.fullmatch(role_regex, invalid)
+        assert parse_controller_action(invalid, role_separated=True) is None
+    parsed = parse_controller_action(ten_frames, role_separated=True)
+    assert parsed is not None and parsed.request is not None
+    assert parsed.request.nframes == 10 and parsed.request.resize == 1.0
+
+
 def test_controller_reference_uses_public_explicit_time_and_avoids_observed() -> None:
     sample = ModelSample(
         dataset="lvbench",

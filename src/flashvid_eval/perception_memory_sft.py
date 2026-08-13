@@ -400,7 +400,10 @@ def _normalized_frame_request(value: Any, field: str) -> dict[str, Any]:
 
 
 def _accepted_frame_requests(
-    trace: Sequence[Mapping[str, Any]], retained_count: int,
+    trace: Sequence[Mapping[str, Any]],
+    retained_count: int,
+    *,
+    role_separated: bool = False,
 ) -> tuple[dict[str, Any], ...]:
     requests: list[dict[str, Any]] = []
     for index, raw in enumerate(trace):
@@ -413,7 +416,10 @@ def _accepted_frame_requests(
         ):
             continue
         content = raw.get("content")
-        action = parse_controller_action(content if isinstance(content, str) else "")
+        action = parse_controller_action(
+            content if isinstance(content, str) else "",
+            role_separated=role_separated,
+        )
         if action is None:
             continue
         if action.action == "observe":
@@ -1194,7 +1200,11 @@ def validate_selected_trajectory(
     if len(tool_steps) < retained_count:
         raise ValueError("selected trajectory has fewer tool steps than states")
     retained_tool_steps = tool_steps[:retained_count]
-    accepted_requests = _accepted_frame_requests(trace, retained_count)
+    accepted_requests = _accepted_frame_requests(
+        trace,
+        retained_count,
+        role_separated=completion_gate_kind == "visual_csv",
+    )
     if len(accepted_requests) != retained_count:
         raise ValueError("accepted Planner frame_select count differs from tool steps")
     for index, raw in enumerate(states):

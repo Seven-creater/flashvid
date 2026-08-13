@@ -69,10 +69,13 @@ _MAX_NO_NOVEL_ACTION_REJECTIONS = 2
 _MAX_ANSWERER_CITED_FRAMES = 16
 RUNTIME_VERIFIER_MAX_FRAMES = 16
 RUNTIME_VERIFIER_FRAME_SELECTION_POLICY = "uniform_full_inventory_endpoints_v1"
-ROLE_SEPARATED_RUNTIME_VERSION = "role_separated_visual_csv_v1"
+ROLE_SEPARATED_RUNTIME_VERSION = "role_separated_visual_csv_v2"
 PERCEPTION_RESPONSE_SCHEMA_VERSION = "perception_state_json_schema_v1"
 CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v1"
+ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION = "eva_tool_call_regex_v2"
 EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION = "evidence_request_content_signature_v1"
+DETERMINISTIC_EVIDENCE_REQUEST_POLICY = "public_runtime_reference"
+DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION = "v1"
 _CONTROLLER_FRAME_COUNTS = (8, 16, 32, 64, 128)
 _EVIDENCE_REQUEST_IGNORED_WORDS = frozenset(
     {
@@ -143,6 +146,7 @@ def role_prompt_schema_bundle_sha256() -> str:
     builders = (
         controller_structured_outputs,
         parse_controller_action,
+        deterministic_planner_evidence_request,
         build_role_separated_controller_messages,
         build_role_separated_confirmation_controller_messages,
         build_perception_messages,
@@ -159,9 +163,15 @@ def role_prompt_schema_bundle_sha256() -> str:
     payload = {
         "role_separated_runtime_version": ROLE_SEPARATED_RUNTIME_VERSION,
         "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
-        "controller_output_constraint_version": CONTROLLER_OUTPUT_CONSTRAINT_VERSION,
+        "controller_output_constraint_version": (
+            ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+        ),
         "evidence_request_content_signature_version": (
             EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
+        ),
+        "deterministic_evidence_request_policy": DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
+        "deterministic_evidence_request_policy_version": (
+            DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
         ),
         "visual_csv_schema_version": VISUAL_CSV_SCHEMA_VERSION,
         "runtime_verifier_max_frames": RUNTIME_VERIFIER_MAX_FRAMES,
@@ -436,7 +446,9 @@ class ControllerAction:
             raise ValueError("observe requires a request and stop forbids one")
 
 
-def parse_controller_action(text: str) -> ControllerAction | None:
+def parse_controller_action(
+    text: str, *, role_separated: bool = False
+) -> ControllerAction | None:
     """Parse one official EVA tool call or the exact stop object."""
 
     candidate = (text or "").strip()
@@ -461,6 +473,40 @@ def parse_controller_action(text: str) -> ControllerAction | None:
     arguments = payload.get("arguments")
     if not isinstance(arguments, dict):
         return None
+    if role_separated:
+        if set(arguments) != {
+            "start_time",
+            "end_time",
+            "evidence_request",
+            "nframes",
+            "resize",
+        }:
+            return None
+        raw_nframes = arguments["nframes"]
+        raw_resize = arguments["resize"]
+        raw_evidence_request = arguments["evidence_request"]
+        raw_start = arguments["start_time"]
+        raw_end = arguments["end_time"]
+        if (
+            isinstance(raw_start, bool)
+            or not isinstance(raw_start, (int, float))
+            or not math.isfinite(float(raw_start))
+            or isinstance(raw_end, bool)
+            or not isinstance(raw_end, (int, float))
+            or not math.isfinite(float(raw_end))
+            or isinstance(raw_nframes, bool)
+            or not isinstance(raw_nframes, int)
+            or not 1 <= raw_nframes <= 128
+            or isinstance(raw_resize, bool)
+            or not isinstance(raw_resize, (int, float))
+            or not math.isfinite(float(raw_resize))
+            or not 0.05 <= float(raw_resize) <= 2.0
+            or not isinstance(raw_evidence_request, str)
+            or not 1 <= len(raw_evidence_request) <= _MAX_EVIDENCE_REQUEST_CHARS
+            or '"' in raw_evidence_request
+            or "\\" in raw_evidence_request
+        ):
+            return None
     allowed = {
         "start_time",
         "end_time",
@@ -489,7 +535,9 @@ def parse_controller_action(text: str) -> ControllerAction | None:
     return ControllerAction("observe", request)
 
 
-def _controller_rejection_reason(text: str, video_duration: float) -> str:
+def _controller_rejection_reason(
+    text: str, video_duration: float, *, role_separated: bool = False
+) -> str:
     """Distinguish malformed calls from model-proposed invalid intervals."""
 
     match = _TOOL_CALL_RE.fullmatch((text or "").strip())
@@ -504,6 +552,10 @@ def _controller_rejection_reason(text: str, video_duration: float) -> str:
         return "invalid_controller_action"
     if start < 0.0 or end <= start or end > video_duration:
         return "invalid_interval"
+    if role_separated and parse_controller_action(
+        text, role_separated=True
+    ) is None:
+        return "invalid_controller_action"
     return "invalid_controller_action"
 
 
@@ -526,6 +578,7 @@ def _controller_retry_feedback(
     allow_stop: bool = True,
     requested_interval: tuple[float, float] | None = None,
     observed_intervals: Sequence[tuple[float, float]] = (),
+    role_separated: bool = False,
 ) -> str:
     """Return candidate-blind, format-strict feedback for one controller retry."""
 
@@ -559,14 +612,22 @@ def _controller_retry_feedback(
         if allow_stop
         else ""
     )
+    action_contract = (
+        "resize between 0.05 and 2.0 inclusive; a short evidence_request without "
+        "quotation marks; and integer nframes between 1 and 128 inclusive. Do not "
+        "output fps."
+        if role_separated
+        else (
+            "resize exactly 0.75; a short evidence_request without quotation marks; "
+            "and nframes equal to one of 8, 16, 32, 64, or 128."
+        )
+    )
     return (
         f"{detail} Retry without prose or markdown. {stop_action}return exactly one "
         "official EVA <tool_call> JSON object whose tool is frame_select. Its "
-        "arguments must contain numeric start_time and end_time; resize exactly "
-        "0.75; a short evidence_request without quotation marks; and nframes equal "
-        "to one of 8, 16, 32, 64, or 128. Choose the "
-        "interval from the question and current evidence gap; do not copy an "
-        "illustrative interval."
+        f"arguments must contain numeric start_time and end_time; {action_contract} "
+        "Choose the interval from the question and current evidence gap; do not copy "
+        "an illustrative interval."
     )
 
 
@@ -613,15 +674,31 @@ def evidence_request_addresses_unresolved(
     return False
 
 
-def controller_structured_outputs(*, allow_stop: bool) -> dict[str, Any]:
+def controller_structured_outputs(
+    *, allow_stop: bool, role_separated: bool = False
+) -> dict[str, Any]:
     """Constrain vLLM to one canonical official EVA action surface form."""
 
     number = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
+    nframes = (
+        r"(?:[1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])"
+        if role_separated
+        else r"(?:8|16|32|64|128)"
+    )
+    resize = (
+        r"(?:0\.0(?:5[0-9]*|[6-9][0-9]*)|0\.[1-9][0-9]*|"
+        r"1(?:\.[0-9]+)?|2(?:\.0+)?)"
+        if role_separated
+        else r"0\.75"
+    )
     tool_call = (
         r'<tool_call>\{"arguments":\{"end_time":'
         + number
         + r',"evidence_request":"[^"\\]{1,160}","nframes":'
-        + r'(?:8|16|32|64|128),"resize":0\.75,"start_time":'
+        + nframes
+        + r',"resize":'
+        + resize
+        + r',"start_time":'
         + number
         + r'\},"tool":"frame_select"\}</tool_call>'
     )
@@ -1524,12 +1601,26 @@ def _controller_reference_output(
     )
 
 
+def deterministic_planner_evidence_request(
+    sample: ModelSample,
+    memory: EvidenceMemory,
+    video_duration: float,
+) -> str:
+    """Derive the public-only evidence goal used by the frozen Planner prompt."""
+
+    request = _controller_reference_request(sample, memory, video_duration)
+    if request is not None:
+        return request.evidence_request
+    return "Re-check the decisive visual evidence symmetrically for both hypotheses."
+
+
 def build_controller_messages(
     sample: ModelSample,
     memory: EvidenceMemory,
     video_metadata: Mapping[str, float | int],
     *,
     feedback: str = "",
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the candidate-blind, text-only controller request."""
 
@@ -1537,19 +1628,28 @@ def build_controller_messages(
     width = int(video_metadata.get("width", 0))
     height = int(video_metadata.get("height", 0))
     reference = _controller_reference_output(sample, memory, duration, allow_stop=True)
+    action_contract = (
+        "resize between 0.05 and 2.0 inclusive, a precise evidence_request without "
+        "quotation marks, and integer nframes between 1 and 128 inclusive. Do not "
+        "output fps."
+        if role_separated
+        else (
+            "resize exactly 0.75, a precise evidence_request without quotation marks, "
+            "and nframes equal to one of 8, 16, 32, 64, or 128. Do not output fps."
+        )
+    )
     system = (
         "You are the text-only controller of a long-video evidence agent. Decide "
         "what visual evidence is still missing from the timestamped text ledger. "
         "You cannot see images. Never infer an action that is absent from the ledger. "
         "To observe, output only one official EVA <tool_call> JSON object whose tool "
         "is frame_select. Its arguments must contain numeric start_time, end_time, "
-        "resize exactly 0.75, a precise evidence_request without quotation marks, "
-        "and nframes equal to one of 8, 16, 32, 64, or 128. Do not output fps. The "
+        f"{action_contract} The "
         "user message contains one currently valid, public-input-only "
         "reference action. Copy its wrapper and JSON key structure exactly; use the "
         "reference action itself when it addresses the missing evidence, otherwise "
         "change only its argument values. "
-        "Use exactly one of nframes or fps and do not repeat an observed interval. "
+        "Do not repeat an observed interval. "
         "Only when the ledger is ready for an independent completeness check, output "
         'exactly {"action":"stop"}.'
     )
@@ -1572,6 +1672,8 @@ def build_controller_messages(
 def _with_accepted_planner_history(
     current_messages: Sequence[Mapping[str, Any]],
     accepted_history: Sequence[tuple[Mapping[str, Any], str]],
+    *,
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     """Add only successfully executed planner actions before the latest snapshot."""
 
@@ -1583,7 +1685,9 @@ def _with_accepted_planner_history(
         raise ValueError("planner history requires one system and one current user")
     messages = [copy.deepcopy(dict(current_messages[0]))]
     for raw_user, raw_action in accepted_history:
-        action = parse_controller_action(raw_action)
+        action = parse_controller_action(
+            raw_action, role_separated=role_separated
+        )
         if action is None or action.action != "observe" or action.request is None:
             raise ValueError("planner history accepts only valid frame_select actions")
         if raw_user.get("role") != "user" or set(raw_user) != {"role", "content"}:
@@ -1613,7 +1717,7 @@ def build_role_separated_controller_messages(
     """Build the explicit-role planner request with accepted-action history only."""
 
     messages = build_controller_messages(
-        sample, memory, video_metadata, feedback=feedback
+        sample, memory, video_metadata, feedback=feedback, role_separated=True
     )
     if memory.unresolved:
         messages[0] = copy.deepcopy(messages[0])
@@ -1625,6 +1729,7 @@ def build_role_separated_controller_messages(
     return _with_accepted_planner_history(
         messages,
         accepted_history,
+        role_separated=True,
     )
 
 
@@ -1914,6 +2019,7 @@ def build_confirmation_controller_messages(
     hypotheses: tuple[str, str],
     *,
     feedback: str = "",
+    role_separated: bool = False,
 ) -> list[dict[str, Any]]:
     """Request fresh visual evidence without identifying the Direct branch."""
 
@@ -1934,8 +2040,17 @@ def build_confirmation_controller_messages(
                 "Two equally unprivileged hypotheses disagree. Select one decisive visual "
                 "interval that can distinguish them. Re-observing a prior area is allowed "
                 "only with denser frames or wider before/after context. Return only one "
-                "official EVA frame_select tool call with start_time, end_time, exactly one "
-                "nframes value from 8, 16, 32, 64, or 128, resize exactly 0.75, and "
+                "official EVA frame_select tool call with start_time, end_time, "
+                + (
+                    "integer nframes from 1 through 128, resize from 0.05 through "
+                    "2.0, no fps, and "
+                    if role_separated
+                    else (
+                        "exactly one nframes value from 8, 16, 32, 64, or 128, "
+                        "resize exactly 0.75, and "
+                    )
+                )
+                +
                 "a symmetric evidence_request that tests both hypotheses. Copy the "
                 "reference wrapper and JSON key structure "
                 "exactly; never return bare JSON, args, markdown, or prose."
@@ -1966,8 +2081,10 @@ def build_role_separated_confirmation_controller_messages(
             video_metadata,
             hypotheses,
             feedback=feedback,
+            role_separated=True,
         ),
         accepted_history,
+        role_separated=True,
     )
 
 
@@ -2510,7 +2627,9 @@ class PerceptionMemoryEvaEvaluator:
             "perception_normalization_version": PERCEPTION_NORMALIZATION_VERSION,
             "perception_response_schema_version": PERCEPTION_RESPONSE_SCHEMA_VERSION,
             "controller_output_constraint_version": (
-                CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION
+                if self.role_config_sha256 is not None
+                else CONTROLLER_OUTPUT_CONSTRAINT_VERSION
             ),
             "evidence_request_content_signature_version": (
                 EVIDENCE_REQUEST_CONTENT_SIGNATURE_VERSION
@@ -3139,7 +3258,8 @@ class PerceptionMemoryEvaEvaluator:
                             seed_offset=evidence_steps * 10,
                             json_mode=False,
                             structured_outputs=controller_structured_outputs(
-                                allow_stop=True
+                                allow_stop=True,
+                                role_separated=self.role_config_sha256 is not None,
                             ),
                             step_index=evidence_steps,
                             prefix_index=len(perception_states) - 1,
@@ -3169,6 +3289,7 @@ class PerceptionMemoryEvaEvaluator:
                         feedback = _controller_retry_feedback(
                             "controller_response_truncated",
                             float(session.metadata["duration"]),
+                            role_separated=self.role_config_sha256 is not None,
                         )
                         last_controller_rejection = "controller_response_truncated"
                         continue
@@ -3183,15 +3304,22 @@ class PerceptionMemoryEvaEvaluator:
                             "retry_reason": retry_reason,
                         }
                     )
-                action = parse_controller_action(controller_text)
+                action = parse_controller_action(
+                    controller_text,
+                    role_separated=self.role_config_sha256 is not None,
+                )
                 if action is None:
                     rejection_reason = _controller_rejection_reason(
-                        controller_text, float(session.metadata["duration"])
+                        controller_text,
+                        float(session.metadata["duration"]),
+                        role_separated=self.role_config_sha256 is not None,
                     )
                     request_trace[-1]["action_accepted"] = False
                     request_trace[-1]["action_rejection_reason"] = rejection_reason
                     feedback = _controller_retry_feedback(
-                        rejection_reason, float(session.metadata["duration"])
+                        rejection_reason,
+                        float(session.metadata["duration"]),
+                        role_separated=self.role_config_sha256 is not None,
                     )
                     last_controller_rejection = rejection_reason
                     continue
@@ -3243,7 +3371,9 @@ class PerceptionMemoryEvaEvaluator:
                     request_trace[-1]["action_accepted"] = False
                     request_trace[-1]["action_rejection_reason"] = interval_rejection
                     feedback = _controller_retry_feedback(
-                        interval_rejection, float(session.metadata["duration"])
+                        interval_rejection,
+                        float(session.metadata["duration"]),
+                        role_separated=self.role_config_sha256 is not None,
                     )
                     last_controller_rejection = interval_rejection
                     continue
@@ -3289,6 +3419,7 @@ class PerceptionMemoryEvaEvaluator:
                         float(session.metadata["duration"]),
                         requested_interval=requested_interval,
                         observed_intervals=tuple(memory.observed_intervals),
+                        role_separated=self.role_config_sha256 is not None,
                     )
                     last_controller_rejection = "duplicate_interval"
                     if evidence_steps > 0 and no_novel_action_rejections == 1:
@@ -3511,7 +3642,10 @@ class PerceptionMemoryEvaEvaluator:
                                 seed_offset=2001,
                                 json_mode=False,
                                 structured_outputs=controller_structured_outputs(
-                                    allow_stop=False
+                                    allow_stop=False,
+                                    role_separated=(
+                                        self.role_config_sha256 is not None
+                                    ),
                                 ),
                                 step_index=len(perception_states),
                                 prefix_index=len(perception_states) - 1,
@@ -3545,6 +3679,9 @@ class PerceptionMemoryEvaEvaluator:
                                 confirmation_retry_reason,
                                 float(session.metadata["duration"]),
                                 allow_stop=False,
+                                role_separated=(
+                                    self.role_config_sha256 is not None
+                                ),
                             )
                             continue
                         current = request_trace[-1]
@@ -3561,7 +3698,10 @@ class PerceptionMemoryEvaEvaluator:
                                 "retry_reason": confirmation_retry_reason,
                             }
                         )
-                        confirmation_action = parse_controller_action(confirmation_text)
+                        confirmation_action = parse_controller_action(
+                            confirmation_text,
+                            role_separated=self.role_config_sha256 is not None,
+                        )
                         rejection_reason = None
                         if (
                             confirmation_action is None
@@ -3571,6 +3711,9 @@ class PerceptionMemoryEvaEvaluator:
                             parsed_reason = _controller_rejection_reason(
                                 confirmation_text,
                                 float(session.metadata["duration"]),
+                                role_separated=(
+                                    self.role_config_sha256 is not None
+                                ),
                             )
                             rejection_reason = (
                                 parsed_reason
@@ -3590,6 +3733,9 @@ class PerceptionMemoryEvaEvaluator:
                                 rejection_reason,
                                 float(session.metadata["duration"]),
                                 allow_stop=False,
+                                role_separated=(
+                                    self.role_config_sha256 is not None
+                                ),
                             )
                             confirmation_action = None
                             continue
@@ -3611,6 +3757,9 @@ class PerceptionMemoryEvaEvaluator:
                                 allow_stop=False,
                                 requested_interval=confirmation_interval,
                                 observed_intervals=tuple(memory.observed_intervals),
+                                role_separated=(
+                                    self.role_config_sha256 is not None
+                                ),
                             )
                             confirmation_action = None
                             continue
@@ -3628,6 +3777,9 @@ class PerceptionMemoryEvaEvaluator:
                                 allow_stop=False,
                                 requested_interval=confirmation_interval,
                                 observed_intervals=tuple(memory.observed_intervals),
+                                role_separated=(
+                                    self.role_config_sha256 is not None
+                                ),
                             )
                             confirmation_action = None
                             continue
@@ -3913,6 +4065,10 @@ class PerceptionMemoryEvaEvaluator:
 
 __all__ = [
     "CONTROLLER_OUTPUT_CONSTRAINT_VERSION",
+    "ROLE_SEPARATED_CONTROLLER_OUTPUT_CONSTRAINT_VERSION",
+    "ROLE_SEPARATED_RUNTIME_VERSION",
+    "DETERMINISTIC_EVIDENCE_REQUEST_POLICY",
+    "DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION",
     "CompletenessDecision",
     "ControllerAction",
     "DURATION_RESCUE_TRAJECTORY_VARIANTS",
@@ -3947,6 +4103,7 @@ __all__ = [
     "build_perception_retry_messages",
     "controller_structured_outputs",
     "duplicate_interval",
+    "deterministic_planner_evidence_request",
     "evidence_request_addresses_unresolved",
     "explicit_time_rescue_request",
     "interval_iou",

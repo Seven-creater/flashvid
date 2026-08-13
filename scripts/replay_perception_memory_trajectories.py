@@ -24,8 +24,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--audit-summary",
         type=Path,
-        required=True,
         help="Passed 300-sample paired badcase summary; replay is blocked without it.",
+    )
+    parser.add_argument(
+        "--training-source-lock",
+        type=Path,
+        help="Frozen Train600/source provenance lock for role-separated replay.",
     )
     parser.add_argument(
         "--base-url",
@@ -42,6 +46,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--served-model-artifact-sha256",
         help="SHA-256 of the model stack serving the replayed Observer.",
     )
+    parser.add_argument("--experiment-config-sha256")
+    parser.add_argument("--training-source-lock-sha256")
     parser.add_argument(
         "--role-separated-observer",
         action="store_true",
@@ -72,6 +78,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             local_media_transport="path" if args.local_media_paths else "file_url",
             role_separated_observer=args.role_separated_observer,
             served_model_artifact_sha256=args.served_model_artifact_sha256,
+            experiment_config_sha256=args.experiment_config_sha256,
+            training_source_lock_sha256=args.training_source_lock_sha256,
         )
         base_urls = args.base_urls or ["http://127.0.0.1:8200/v1"]
         clients = [
@@ -88,6 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_path=args.input,
             output_path=args.output,
             audit_summary_path=args.audit_summary,
+            training_source_lock_path=args.training_source_lock,
             replayer=replayer,
             concurrency=args.concurrency,
             resume=args.resume,

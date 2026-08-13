@@ -220,6 +220,17 @@ def _many_frame_source(
     return source
 
 
+def _role_replay_config(**overrides: Any) -> ReplayConfig:
+    values = {
+        "role_separated_observer": True,
+        "served_model_artifact_sha256": "e" * 64,
+        "experiment_config_sha256": "f" * 64,
+        "training_source_lock_sha256": "1" * 64,
+        **overrides,
+    }
+    return ReplayConfig(**values)
+
+
 def _timestamp_index_source(tmp_path: Path) -> dict:
     source = _source(tmp_path)
     first = source["tool_steps"][0]
@@ -260,7 +271,7 @@ def test_replay_uses_only_current_cached_frames_and_merges_memory(
     )
 
     assert result["scoring_deferred"] is True
-    assert result["trajectory_id"].endswith(":perception_memory_replay_v4")
+    assert result["trajectory_id"].endswith(":perception_memory_replay_v5")
     assert (
         result["perception_normalization_version"] == PERCEPTION_NORMALIZATION_VERSION
     )
@@ -336,6 +347,8 @@ def test_role_separated_replay_uses_five_field_observer_and_served_identity(
     config = ReplayConfig(
         role_separated_observer=True,
         served_model_artifact_sha256="e" * 64,
+        experiment_config_sha256="f" * 64,
+        training_source_lock_sha256="1" * 64,
     )
 
     result = PerceptionMemoryReplay(client, config).replay(
@@ -373,6 +386,8 @@ def test_role_separated_replay_rejects_legacy_timestamp_schema(tmp_path: Path) -
     config = ReplayConfig(
         role_separated_observer=True,
         served_model_artifact_sha256="e" * 64,
+        experiment_config_sha256="f" * 64,
+        training_source_lock_sha256="1" * 64,
     )
 
     with pytest.raises(ValueError, match="invalid evidence after retry"):
@@ -384,6 +399,85 @@ def test_role_separated_replay_rejects_legacy_timestamp_schema(tmp_path: Path) -
     assert len(client.calls) == 2
     correction = client.calls[1]["messages"][-1]["content"][-1]["text"]
     assert "evidence_sufficient" not in correction
+
+
+def test_role_replay_preserves_cached_10_frame_resize_and_accepts_less_than_8(
+    tmp_path: Path,
+) -> None:
+    source = _many_frame_source(tmp_path, 10)
+    source["tool_steps"][0]["resize"] = 1.0
+    payload = {
+        "interval": [0.0, 10.0],
+        "timestamped_facts": [{"frame_index": 0, "fact": "A visible action."}],
+        "option_evidence": {
+            "A": {"supports": ["A visible action."], "contradicts": []},
+            "B": {"supports": [], "contradicts": ["A visible action."]},
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+    }
+    result = PerceptionMemoryReplay(
+        FakeClient([json.dumps(payload)]), _role_replay_config()
+    ).replay(source, source_file_sha256="a" * 64)
+    assert result["tool_steps"][0]["request"]["nframes"] == 10
+    assert result["tool_steps"][0]["request"]["resize"] == 1.0
+
+    small = _many_frame_source(tmp_path, 5)
+    small["trajectory_id"] += ":small"
+    result = PerceptionMemoryReplay(
+        FakeClient([json.dumps(payload)]), _role_replay_config()
+    ).replay(small, source_file_sha256="a" * 64)
+    assert result["tool_steps"][0]["request"]["nframes"] == 5
+
+
+def test_role_replay_rejects_fps_and_keeps_existing_128_cap(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="forbids fps"):
+        PerceptionMemoryReplay(
+            FakeClient([]), _role_replay_config()
+        ).replay(_many_frame_source(tmp_path, 5, use_fps=True), source_file_sha256="a" * 64)
+
+    source = _many_frame_source(tmp_path, 129)
+    payload = {
+        "interval": [0.0, 129.0],
+        "timestamped_facts": [{"frame_index": 0, "fact": "A visible action."}],
+        "option_evidence": {
+            "A": {"supports": ["A visible action."], "contradicts": []},
+            "B": {"supports": [], "contradicts": ["A visible action."]},
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+    }
+    result = PerceptionMemoryReplay(
+        FakeClient([json.dumps(payload)]), _role_replay_config()
+    ).replay(source, source_file_sha256="a" * 64)
+    assert result["tool_steps"][0]["request"]["nframes"] == 128
+    assert result["tool_steps"][0]["source_cached_request"]["nframes"] == 129
+
+
+def test_role_replay_derives_later_request_from_current_unresolved(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    for step in source["tool_steps"]:
+        step.pop("evidence_request")
+    first = {
+        "interval": [0.0, 10.0],
+        "timestamped_facts": [{"frame_index": 0, "fact": "The person waits."}],
+        "option_evidence": {
+            "A": {"supports": ["The person waits."], "contradicts": []},
+            "B": {"supports": [], "contradicts": ["The person waits."]},
+        },
+        "temporal_changes": [],
+        "unresolved": ["what happens next"],
+    }
+    second = {**first, "interval": [20.0, 30.0], "unresolved": []}
+    result = PerceptionMemoryReplay(
+        FakeClient([json.dumps(first), json.dumps(second)]), _role_replay_config()
+    ).replay(source, source_file_sha256="a" * 64)
+    later = result["perception_states"][1]
+    assert later["request"]["evidence_request"] == "Inspect for what happens next"
+    assert later["evidence_request_source"] == "deterministic_runtime_reference"
+    assert "evidence_request" not in later["source_cached_request"]
 
 
 @pytest.mark.parametrize("language", ["", "json"])
@@ -970,6 +1064,8 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
     role_separated = ReplayConfig(
         role_separated_observer=True,
         served_model_artifact_sha256="e" * 64,
+        experiment_config_sha256="f" * 64,
+        training_source_lock_sha256="1" * 64,
     ).fingerprint()
     assert role_separated != baseline
     assert (
@@ -977,6 +1073,8 @@ def test_replay_fingerprint_includes_semantic_source_dependencies(
         != ReplayConfig(
             role_separated_observer=True,
             served_model_artifact_sha256="f" * 64,
+            experiment_config_sha256="f" * 64,
+            training_source_lock_sha256="1" * 64,
         ).fingerprint()
     )
     monkeypatch.setattr(
@@ -1150,6 +1248,49 @@ def test_jsonl_replay_is_atomic_resumable_and_fingerprint_locked(
             audit_summary_path=audit,
             replayer=PerceptionMemoryReplay(FakeClient([])),
             resume=True,
+        )
+
+
+def test_role_jsonl_uses_training_lock_without_test_diagnostics(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jsonl"
+    output_path = tmp_path / "output.jsonl"
+    lock = tmp_path / "training-source-lock.json"
+    lock.write_text('{"split":"train600"}', encoding="utf-8")
+    lock_sha = replay_module.file_sha256(lock)
+    source = _source(tmp_path)
+    source["tool_steps"] = source["tool_steps"][:1]
+    source_path.write_text(json.dumps(source) + "\n", encoding="utf-8")
+    payload = {
+        "interval": [0.0, 10.0],
+        "timestamped_facts": [{"frame_index": 0, "fact": "A visible action."}],
+        "option_evidence": {
+            "A": {"supports": ["A visible action."], "contradicts": []},
+            "B": {"supports": [], "contradicts": ["A visible action."]},
+        },
+        "temporal_changes": [],
+        "unresolved": [],
+    }
+    config = _role_replay_config(training_source_lock_sha256=lock_sha)
+    summary = replay_jsonl(
+        input_path=source_path,
+        output_path=output_path,
+        training_source_lock_path=lock,
+        replayer=PerceptionMemoryReplay(FakeClient([json.dumps(payload)]), config),
+    )
+    row = json.loads(output_path.read_text(encoding="utf-8"))
+    assert row["training_source_lock_sha256"] == lock_sha
+    assert row["experiment_config_sha256"] == "f" * 64
+    assert "diagnostics_gate_sha256" not in row
+    assert "audit_summary_sha256" not in row
+    assert "diagnostics_gate_sha256" not in summary
+
+    lock.write_text('{"split":"changed"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="source lock SHA-256"):
+        replay_jsonl(
+            input_path=source_path,
+            output_path=tmp_path / "other.jsonl",
+            training_source_lock_path=lock,
+            replayer=PerceptionMemoryReplay(FakeClient([]), config),
         )
 
 

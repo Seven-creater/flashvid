@@ -78,7 +78,7 @@ def _row(
         "diagnostics_gate_sha256": "9" * 64,
         "model_artifact_sha256": model_artifact_sha256,
         "role_config_sha256": "f" * 64,
-        "role_separated_runtime_version": "role_separated_visual_csv_v1",
+        "role_separated_runtime_version": "role_separated_visual_csv_v2",
         "role_prompt_schema_bundle_sha256": "b" * 64,
         "role_models": {
             "planner": "Qwen3.5-9B-Planner",

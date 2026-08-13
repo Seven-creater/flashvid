@@ -98,7 +98,7 @@ def _canonical_sha256(value: Any) -> str:
 def _validate_role_audit_fields(
     row: Mapping[str, Any], identity: tuple[str, str]
 ) -> None:
-    if row.get("role_separated_runtime_version") != "role_separated_visual_csv_v1":
+    if row.get("role_separated_runtime_version") != "role_separated_visual_csv_v2":
         raise PerceptionMemoryGateError(
             f"{identity}: role-separated runtime version changed"
         )

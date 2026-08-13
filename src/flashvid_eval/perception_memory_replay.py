@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from .perception_memory_eva import (
+    DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
+    DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION,
     EvidenceMemory,
     PERCEPTION_NORMALIZATION_VERSION,
     PerceptionState,
@@ -30,6 +32,7 @@ from .perception_memory_eva import (
     build_perception_messages,
     build_perception_retry_messages,
     build_role_separated_controller_messages,
+    deterministic_planner_evidence_request,
     perception_model_target,
     perception_response_format,
     perception_state_payload,
@@ -41,7 +44,7 @@ from .runner import parse_question_time_range
 from .schemas import ModelSample
 
 
-REPLAY_VERSION = "perception_memory_replay_v4"
+REPLAY_VERSION = "perception_memory_replay_v5"
 FRAME_SUBSAMPLE_POLICY = "uniform_nearest"
 FRAME_SUBSAMPLE_VERSION = "v1"
 _DATASETS = ("lvbench", "lsdbench", "cgbench")
@@ -329,6 +332,8 @@ class CachedFrameStep:
     subsample_policy: str = FRAME_SUBSAMPLE_POLICY
     subsample_version: str = FRAME_SUBSAMPLE_VERSION
     frame_cap_applied: bool = False
+    source_request: dict[str, Any] | None = None
+    evidence_request_source: str = "source_cached_request"
 
 
 class SourceExplicitTimeParseMismatch(ValueError):
@@ -408,11 +413,13 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
         evidence_request = raw.get(
             "evidence_request", raw.get("controller_evidence_request")
         )
+        evidence_request_source = "source_cached_request"
         if not isinstance(evidence_request, str) or not evidence_request.strip():
             evidence_request = (
                 "Identify directly visible facts in this cached interval that "
                 "distinguish the answer choices."
             )
+            evidence_request_source = "legacy_generic_fallback"
         request = FrameRequest(
             start_time=start,
             end_time=end,
@@ -449,6 +456,22 @@ def cached_frame_steps(row: Mapping[str, Any]) -> tuple[CachedFrameStep, ...]:
                 observation,
                 source_frame_count=len(paths),
                 subsample_indices=tuple(range(len(paths))),
+                source_request={
+                    "start_time": start,
+                    "end_time": end,
+                    "resize": request.resize,
+                    **(
+                        {"nframes": nframes}
+                        if nframes is not None
+                        else {"fps": fps}
+                    ),
+                    **(
+                        {"evidence_request": " ".join(evidence_request.strip().split())}
+                        if evidence_request_source == "source_cached_request"
+                        else {}
+                    ),
+                },
+                evidence_request_source=evidence_request_source,
             )
         )
     return tuple(steps)
@@ -504,6 +527,8 @@ def _cap_cached_frame_step(
         source_frame_count=source_count,
         subsample_indices=indices,
         frame_cap_applied=True,
+        source_request=copy.deepcopy(cached.source_request),
+        evidence_request_source=cached.evidence_request_source,
     )
 
 
@@ -593,6 +618,8 @@ class ReplayConfig:
     request_timeout_s: float = 300.0
     role_separated_observer: bool = False
     served_model_artifact_sha256: str | None = None
+    experiment_config_sha256: str | None = None
+    training_source_lock_sha256: str | None = None
 
     @property
     def perception_retry_max_tokens(self) -> int:
@@ -627,6 +654,21 @@ class ReplayConfig:
             raise ValueError(
                 "role-separated Observer replay requires served_model_artifact_sha256"
             )
+        if self.role_separated_observer:
+            if self.experiment_config_sha256 is None:
+                raise ValueError(
+                    "role-separated Observer replay requires experiment_config_sha256"
+                )
+            if self.training_source_lock_sha256 is None:
+                raise ValueError(
+                    "role-separated Observer replay requires training_source_lock_sha256"
+                )
+        for field, value in (
+            ("experiment_config_sha256", self.experiment_config_sha256),
+            ("training_source_lock_sha256", self.training_source_lock_sha256),
+        ):
+            if value is not None:
+                _sha256_text(value, field)
 
     def fingerprint(self) -> str:
         return canonical_sha256(
@@ -643,9 +685,17 @@ class ReplayConfig:
                 "max_frames_per_call": self.max_frames_per_call,
                 "frame_subsample_policy": FRAME_SUBSAMPLE_POLICY,
                 "frame_subsample_version": FRAME_SUBSAMPLE_VERSION,
+                "deterministic_evidence_request_policy": (
+                    DETERMINISTIC_EVIDENCE_REQUEST_POLICY
+                ),
+                "deterministic_evidence_request_policy_version": (
+                    DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+                ),
                 "request_timeout_s": float(self.request_timeout_s),
                 "role_separated_observer": self.role_separated_observer,
                 "served_model_artifact_sha256": self.served_model_artifact_sha256,
+                "experiment_config_sha256": self.experiment_config_sha256,
+                "training_source_lock_sha256": self.training_source_lock_sha256,
                 "perception_prompt": (
                     "build_perception_messages_role_separated_v1"
                     if self.role_separated_observer
@@ -697,10 +747,16 @@ class PerceptionMemoryReplay:
         source: Mapping[str, Any],
         *,
         source_file_sha256: str,
-        audit_summary_sha256: str,
+        audit_summary_sha256: str | None = None,
     ) -> dict[str, Any]:
         sample = public_model_sample(source)
         steps = cached_frame_steps(source)
+        if self.config.role_separated_observer and any(
+            step.request.fps is not None for step in steps
+        ):
+            raise ValueError(
+                "role-separated cached replay forbids fps source requests"
+            )
         _reject_misparsed_explicit_time_source(sample, steps)
         source_trajectory_id = _nonempty(
             source.get("trajectory_id"), "source trajectory_id"
@@ -737,7 +793,13 @@ class PerceptionMemoryReplay:
             {
                 "config_sha256": self.config.fingerprint(),
                 "source_file_sha256": source_file_sha256,
-                "diagnostics_gate_sha256": audit_summary_sha256,
+                **(
+                    {"training_source_lock_sha256": (
+                        self.config.training_source_lock_sha256
+                    )}
+                    if self.config.role_separated_observer
+                    else {"diagnostics_gate_sha256": audit_summary_sha256}
+                ),
             }
         )
         memory = EvidenceMemory(sample.option_letters)
@@ -752,6 +814,45 @@ class PerceptionMemoryReplay:
             cached = _cap_cached_frame_step(
                 source_cached, self.config.max_frames_per_call
             )
+            evidence_request_source = cached.evidence_request_source
+            if (
+                self.config.role_separated_observer
+                and evidence_request_source == "legacy_generic_fallback"
+            ):
+                derived_evidence_request = deterministic_planner_evidence_request(
+                    sample, memory, duration
+                )
+                request = FrameRequest(
+                    start_time=cached.request.start_time,
+                    end_time=cached.request.end_time,
+                    nframes=cached.request.nframes,
+                    resize=cached.request.resize,
+                    evidence_request=derived_evidence_request,
+                )
+                observation = FrameObservation(
+                    request=request,
+                    resolved_start_time=cached.observation.resolved_start_time,
+                    resolved_end_time=cached.observation.resolved_end_time,
+                    resolved_nframes=cached.observation.resolved_nframes,
+                    frame_paths=cached.observation.frame_paths,
+                    timestamps=cached.observation.timestamps,
+                    backend=cached.observation.backend,
+                    cache_hit=cached.observation.cache_hit,
+                    estimated_visual_tokens=cached.observation.estimated_visual_tokens,
+                    latency_s=cached.observation.latency_s,
+                )
+                cached = CachedFrameStep(
+                    request=request,
+                    observation=observation,
+                    source_frame_count=cached.source_frame_count,
+                    subsample_indices=cached.subsample_indices,
+                    subsample_policy=cached.subsample_policy,
+                    subsample_version=cached.subsample_version,
+                    frame_cap_applied=cached.frame_cap_applied,
+                    source_request=copy.deepcopy(cached.source_request),
+                    evidence_request_source="deterministic_runtime_reference",
+                )
+                evidence_request_source = cached.evidence_request_source
             controller_messages = (
                 build_role_separated_controller_messages(
                     sample,
@@ -781,6 +882,20 @@ class PerceptionMemoryReplay:
                     "prompt_hash": _prompt_hash(controller_messages),
                     "action_accepted": True,
                     "source_cached_action": True,
+                    "source_cached_request": copy.deepcopy(cached.source_request),
+                    "evidence_request_source": evidence_request_source,
+                    "evidence_request_policy": (
+                        DETERMINISTIC_EVIDENCE_REQUEST_POLICY
+                        if evidence_request_source
+                        == "deterministic_runtime_reference"
+                        else None
+                    ),
+                    "evidence_request_policy_version": (
+                        DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+                        if evidence_request_source
+                        == "deterministic_runtime_reference"
+                        else None
+                    ),
                 }
             )
             if self.config.role_separated_observer:
@@ -916,6 +1031,18 @@ class PerceptionMemoryReplay:
                 "step_index": step_index,
                 "turn_index": step_index,
                 "request": cached.request.to_tool_arguments(),
+                "source_cached_request": copy.deepcopy(cached.source_request),
+                "evidence_request_source": evidence_request_source,
+                "evidence_request_policy": (
+                    DETERMINISTIC_EVIDENCE_REQUEST_POLICY
+                    if evidence_request_source == "deterministic_runtime_reference"
+                    else None
+                ),
+                "evidence_request_policy_version": (
+                    DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+                    if evidence_request_source == "deterministic_runtime_reference"
+                    else None
+                ),
                 "frame_paths": list(cached.observation.frame_paths),
                 "timestamps": list(cached.observation.timestamps),
                 "source_frame_count": cached.source_frame_count,
@@ -949,6 +1076,20 @@ class PerceptionMemoryReplay:
                     "subsample_indices": list(cached.subsample_indices),
                     "subsample_policy": cached.subsample_policy,
                     "subsample_version": cached.subsample_version,
+                    "source_cached_request": copy.deepcopy(cached.source_request),
+                    "evidence_request_source": evidence_request_source,
+                    "evidence_request_policy": (
+                        DETERMINISTIC_EVIDENCE_REQUEST_POLICY
+                        if evidence_request_source
+                        == "deterministic_runtime_reference"
+                        else None
+                    ),
+                    "evidence_request_policy_version": (
+                        DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+                        if evidence_request_source
+                        == "deterministic_runtime_reference"
+                        else None
+                    ),
                 }
             )
             tool_steps.append(tool_step)
@@ -973,8 +1114,18 @@ class PerceptionMemoryReplay:
             "source_trajectory_id": source_trajectory_id,
             "source_row_sha256": source_row_sha256,
             "source_file_sha256": source_file_sha256,
-            "diagnostics_gate_sha256": audit_summary_sha256,
-            "audit_summary_sha256": audit_summary_sha256,
+            **(
+                {
+                    "training_source_lock_sha256": (
+                        self.config.training_source_lock_sha256
+                    )
+                }
+                if self.config.role_separated_observer
+                else {
+                    "diagnostics_gate_sha256": audit_summary_sha256,
+                    "audit_summary_sha256": audit_summary_sha256,
+                }
+            ),
             "manifest_sha256": manifest_sha256,
             "train600_manifest_sha256": train600_manifest_sha256,
             "dataset_manifest_sha256": dataset_manifest_sha256,
@@ -983,8 +1134,16 @@ class PerceptionMemoryReplay:
             "source_model_artifact_sha256": source_model_artifact_sha256,
             "served_model_artifact_sha256": model_artifact_sha256,
             "role_separated_observer": self.config.role_separated_observer,
+            "evidence_request_policy": DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
+            "evidence_request_policy_version": (
+                DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+            ),
             "config_sha256": self.config.fingerprint(),
-            "experiment_config_sha256": self.config.fingerprint(),
+            "experiment_config_sha256": (
+                self.config.experiment_config_sha256
+                if self.config.role_separated_observer
+                else self.config.fingerprint()
+            ),
             "run_fingerprint": run_fingerprint,
             "scoring_deferred": True,
             "public_sample": {
@@ -1072,7 +1231,7 @@ def _failure_row(
     error: Exception,
     *,
     source_file_sha256: str,
-    audit_summary_sha256: str,
+    audit_summary_sha256: str | None,
     config: ReplayConfig,
     endpoint_count: int,
 ) -> dict[str, Any]:
@@ -1090,16 +1249,40 @@ def _failure_row(
         "source_trajectory_id": source_id,
         "source_row_sha256": canonical_sha256(source),
         "source_file_sha256": source_file_sha256,
-        "diagnostics_gate_sha256": audit_summary_sha256,
-        "audit_summary_sha256": audit_summary_sha256,
+        **(
+            {
+                "training_source_lock_sha256": config.training_source_lock_sha256,
+            }
+            if config.role_separated_observer
+            else {
+                "diagnostics_gate_sha256": audit_summary_sha256,
+                "audit_summary_sha256": audit_summary_sha256,
+            }
+        ),
         "config_sha256": config.fingerprint(),
+        "experiment_config_sha256": (
+            config.experiment_config_sha256
+            if config.role_separated_observer
+            else config.fingerprint()
+        ),
+        "role_separated_observer": config.role_separated_observer,
+        "evidence_request_policy": DETERMINISTIC_EVIDENCE_REQUEST_POLICY,
+        "evidence_request_policy_version": (
+            DETERMINISTIC_EVIDENCE_REQUEST_POLICY_VERSION
+        ),
         "request_timeout_s": float(config.request_timeout_s),
         "endpoint_count": endpoint_count,
         "run_fingerprint": canonical_sha256(
             {
                 "config_sha256": config.fingerprint(),
                 "source_file_sha256": source_file_sha256,
-                "diagnostics_gate_sha256": audit_summary_sha256,
+                **(
+                    {"training_source_lock_sha256": (
+                        config.training_source_lock_sha256
+                    )}
+                    if config.role_separated_observer
+                    else {"diagnostics_gate_sha256": audit_summary_sha256}
+                ),
             }
         ),
         "scoring_deferred": True,
@@ -1130,7 +1313,8 @@ def replay_jsonl(
     *,
     input_path: Path,
     output_path: Path,
-    audit_summary_path: Path,
+    audit_summary_path: Path | None = None,
+    training_source_lock_path: Path | None = None,
     replayer: PerceptionMemoryReplay,
     concurrency: int = 1,
     resume: bool = False,
@@ -1141,7 +1325,26 @@ def replay_jsonl(
         raise ValueError("concurrency must be positive")
     if not input_path.is_file():
         raise FileNotFoundError(f"source JSONL does not exist: {input_path}")
-    _audit, audit_sha = validate_badcase_audit_summary(audit_summary_path)
+    role_separated = replayer.config.role_separated_observer
+    if role_separated:
+        if audit_summary_path is not None or training_source_lock_path is None:
+            raise ValueError(
+                "role-separated replay requires exactly --training-source-lock"
+            )
+        if not training_source_lock_path.is_file():
+            raise FileNotFoundError(training_source_lock_path)
+        training_source_lock_sha = file_sha256(training_source_lock_path)
+        if (
+            training_source_lock_sha
+            != replayer.config.training_source_lock_sha256
+        ):
+            raise ValueError("training source lock SHA-256 differs from ReplayConfig")
+        audit_sha = None
+    else:
+        if audit_summary_path is None or training_source_lock_path is not None:
+            raise ValueError("legacy replay requires exactly --audit-summary")
+        _audit, audit_sha = validate_badcase_audit_summary(audit_summary_path)
+        training_source_lock_sha = None
     source_sha = file_sha256(input_path)
     rows = _read_jsonl(input_path)
     identities = [_source_identity(row) for row in rows]
@@ -1152,7 +1355,11 @@ def replay_jsonl(
         {
             "config_sha256": replayer.config.fingerprint(),
             "source_file_sha256": source_sha,
-            "diagnostics_gate_sha256": audit_sha,
+            **(
+                {"training_source_lock_sha256": training_source_lock_sha}
+                if role_separated
+                else {"diagnostics_gate_sha256": audit_sha}
+            ),
         }
     )
 
@@ -1170,7 +1377,7 @@ def replay_jsonl(
                 )
             if row.get("run_fingerprint") != expected_fingerprint:
                 raise RuntimeError(
-                    "resume fingerprint mismatch; source/audit/config changed"
+                    "resume fingerprint mismatch; source/provenance/config changed"
                 )
             existing[source_id] = row
         extras = sorted(set(existing) - set(source_ids))
@@ -1225,9 +1432,20 @@ def replay_jsonl(
         "completed": len(results),
         "failed": failed,
         "source_file_sha256": source_sha,
-        "diagnostics_gate_sha256": audit_sha,
-        "audit_summary_sha256": audit_sha,
+        **(
+            {"training_source_lock_sha256": training_source_lock_sha}
+            if role_separated
+            else {
+                "diagnostics_gate_sha256": audit_sha,
+                "audit_summary_sha256": audit_sha,
+            }
+        ),
         "config_sha256": replayer.config.fingerprint(),
+        "experiment_config_sha256": (
+            replayer.config.experiment_config_sha256
+            if role_separated
+            else replayer.config.fingerprint()
+        ),
         "endpoint_count": replayer.endpoint_count,
         "run_fingerprint": expected_fingerprint,
         "output": str(output_path.resolve()),

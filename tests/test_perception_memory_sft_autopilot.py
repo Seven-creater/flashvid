@@ -97,6 +97,7 @@ def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
     )
     row = {
         "prefix_id": "p1",
+        "verifier_artifact_sha256": "b" * 64,
         "annotation_leak_check": "passed",
         "candidate_blind": True,
         "tools_disabled": True,
@@ -106,8 +107,9 @@ def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
         ],
     }
     _write_jsonl(output, [row])
-
-    semantic = autopilot._audit_judgments(trajectories, output)
+    semantic = autopilot._audit_judgments(
+        trajectories, output, verifier_artifact_sha256="b" * 64
+    )
     assert semantic["failures"] == 0
     assert semantic["infrastructure_errors"] == 0
     assert semantic["evidence_insufficient"] == 1
@@ -116,7 +118,9 @@ def test_judgment_audit_accepts_semantic_nonanswers_but_counts_timeouts(
         17, parsed_valid=False, error="TimeoutError: request timed out"
     )
     _write_jsonl(output, [row])
-    timed_out = autopilot._audit_judgments(trajectories, output)
+    timed_out = autopilot._audit_judgments(
+        trajectories, output, verifier_artifact_sha256="b" * 64
+    )
     assert timed_out["failures"] == 1
     assert timed_out["infrastructure_errors"] == 1
     assert timed_out["persistent_infrastructure_failures"] == 1
@@ -134,6 +138,7 @@ def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
     )
     row = {
         "prefix_id": "p1",
+        "verifier_artifact_sha256": "b" * 64,
         "annotation_leak_check": "passed",
         "candidate_blind": True,
         "tools_disabled": True,
@@ -144,7 +149,9 @@ def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
     }
     _write_jsonl(output, [row])
     with pytest.raises(RuntimeError, match="seeds must be exactly"):
-        autopilot._audit_judgments(trajectories, output)
+        autopilot._audit_judgments(
+            trajectories, output, verifier_artifact_sha256="b" * 64
+        )
 
     row["visual_csv_confirmations"] = [
         _audit_confirmation(seed, parsed_valid=False) for seed in (17, 42, 73)
@@ -152,7 +159,9 @@ def test_judgment_audit_fails_closed_on_seed_or_leakage_structure(
     row["visual_csv_confirmations"][0]["annotation_leak_check"] = "failed"
     _write_jsonl(output, [row])
     with pytest.raises(RuntimeError, match="annotation leak"):
-        autopilot._audit_judgments(trajectories, output)
+        autopilot._audit_judgments(
+            trajectories, output, verifier_artifact_sha256="b" * 64
+        )
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -253,6 +262,28 @@ def test_owned_service_scope_must_be_exactly_ports_8200_to_8207() -> None:
         autopilot._parse_service_bindings(values[:-1])
     with pytest.raises(ValueError, match="unique"):
         autopilot._parse_service_bindings(values[:-1] + ["8207=100"])
+
+
+def test_judge_endpoints_bind_exactly_to_owned_local_ports() -> None:
+    urls = [
+        f"http://{'localhost' if index % 2 else '127.0.0.1'}:{8200 + index}/v1/"
+        for index in range(8)
+    ]
+    parsed = autopilot._parse_judge_endpoints(urls)
+    assert tuple(parsed) == autopilot.EXPECTED_PORTS
+
+    with pytest.raises(ValueError, match="exactly once"):
+        autopilot._parse_judge_endpoints(
+            [*urls[:-1], "http://localhost:8200/v1"]
+        )
+    with pytest.raises(ValueError, match="localhost|127.0.0.1"):
+        autopilot._parse_judge_endpoints(
+            [*urls[:-1], "http://10.0.0.2:8207/v1"]
+        )
+    with pytest.raises(ValueError, match="8200-8207"):
+        autopilot._parse_judge_endpoints(
+            [*urls[:-1], "http://localhost:8307/v1"]
+        )
 
 
 def _fake_proc_service(
@@ -377,7 +408,7 @@ def test_successful_pipeline_is_resumable_without_reissuing_commands(
     monkeypatch.setattr(
         autopilot,
         "_audit_judgments",
-        lambda _trajectories, output: {
+        lambda _trajectories, output, **_kwargs: {
             "expected_prefixes": 1,
             "rows": 1,
             "failures": 0,
@@ -407,7 +438,10 @@ def test_successful_pipeline_is_resumable_without_reissuing_commands(
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "labeled.jsonl").write_text("{}\n", encoding="utf-8")
             (directory / "selected.jsonl").write_text("{}\n", encoding="utf-8")
-            (directory / "summary.json").write_text("{}\n", encoding="utf-8")
+            (directory / "summary.json").write_text(
+                '{"quality_balancing":{"status":"applied"}}\n',
+                encoding="utf-8",
+            )
         elif "build_perception_memory_sft.py" in joined:
             directory = args.run_root / "sft_data"
             directory.mkdir(parents=True, exist_ok=True)

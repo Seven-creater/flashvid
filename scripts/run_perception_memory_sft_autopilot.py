@@ -17,6 +17,7 @@ import signal
 import subprocess
 import tempfile
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -25,7 +26,7 @@ from flashvid_eval.perception_memory_visual_csv import bind_visual_csv_jobs
 from flashvid_eval.qwen_sft import read_jsonl
 
 
-AUTOPILOT_VERSION = "perception_memory_post_repair_visual_csv_sft_v2"
+AUTOPILOT_VERSION = "perception_memory_post_repair_visual_csv_sft_v3"
 EXPECTED_REPAIR_ROWS = 2917
 EXPECTED_PORTS = tuple(range(8200, 8208))
 TRAIN600_SHA256 = "3995454d973aeb6efe6887e821cd5197e0f17a5b9cc32d7c719e6583b487e6c0"
@@ -157,6 +158,39 @@ def _parse_service_bindings(values: Sequence[str]) -> dict[int, int]:
     return result
 
 
+def _parse_judge_endpoints(values: Sequence[str]) -> dict[int, str]:
+    """Bind one local OpenAI endpoint to each owned Judge service port."""
+
+    result: dict[int, str] = {}
+    for value in values:
+        parsed = urllib.parse.urlparse(value)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("--base-url contains an invalid port") from error
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"localhost", "127.0.0.1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or port not in EXPECTED_PORTS
+            or parsed.path.rstrip("/") != "/v1"
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "--base-url must be http://localhost:PORT/v1 or "
+                "http://127.0.0.1:PORT/v1 for ports 8200-8207"
+            )
+        if port in result:
+            raise ValueError("Judge endpoints must bind each port exactly once")
+        result[port] = value.rstrip("/")
+    if tuple(sorted(result)) != EXPECTED_PORTS:
+        raise ValueError("Judge endpoints must bind exactly ports 8200-8207")
+    return result
+
+
 def _proc_start_ticks(stat_text: str) -> int:
     close = stat_text.rfind(")")
     if close < 0:
@@ -262,6 +296,8 @@ def _judge_command(
         str(output),
         "--model",
         args.model,
+        "--verifier-artifact-sha256",
+        args.expected_model_artifact_sha256,
         "--concurrency",
         str(args.judge_concurrency),
         "--timeout",
@@ -297,6 +333,8 @@ def _selection_command(
         str(trajectories),
         "--visual-csv-results",
         str(judgments),
+        "--verifier-artifact-sha256",
+        args.expected_model_artifact_sha256,
         "--answers",
         str(args.answers),
         "--expected-answers-sha256",
@@ -375,7 +413,15 @@ def _training_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
-def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
+def _audit_judgments(
+    trajectories: Path, output: Path, *, verifier_artifact_sha256: str
+) -> dict[str, Any]:
+    verifier_artifact_sha256 = str(verifier_artifact_sha256 or "").strip().lower()
+    if len(verifier_artifact_sha256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in verifier_artifact_sha256
+    ):
+        raise ValueError("visual CSV audit verifier artifact must be a SHA-256")
     expected_ids = {
         job.prefix_id for job in bind_visual_csv_jobs(read_jsonl(trajectories))
     }
@@ -387,6 +433,8 @@ def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
     evidence_insufficient = 0
     required_seeds = {17, 42, 73}
     for row in rows:
+        if row.get("verifier_artifact_sha256") != verifier_artifact_sha256:
+            raise RuntimeError("visual CSV verifier artifact SHA-256 changed")
         if row.get("visual_csv_status") not in {
             "complete",
             "complete_with_failures",
@@ -432,6 +480,7 @@ def _audit_judgments(trajectories: Path, output: Path) -> dict[str, Any]:
         "infrastructure_errors": infrastructure_errors,
         "persistent_infrastructure_failures": infrastructure_errors,
         "evidence_insufficient": evidence_insufficient,
+        "verifier_artifact_sha256": verifier_artifact_sha256,
         "output_sha256": _file_sha256(output),
     }
 
@@ -580,13 +629,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     args.repo_root = args.repo_root.resolve()
     args.repair_run_root = args.repair_run_root.resolve()
     args.run_root = args.run_root.resolve()
-    if len(args.base_url) != 8 or len(set(args.base_url)) != 8:
-        raise ValueError("autopilot requires eight unique Judge endpoints")
+    endpoints = _parse_judge_endpoints(args.base_url)
+    args.base_url = [endpoints[port] for port in EXPECTED_PORTS]
+    artifact = str(args.expected_model_artifact_sha256 or "").strip().lower()
+    if len(artifact) != 64 or any(
+        character not in "0123456789abcdef" for character in artifact
+    ):
+        raise ValueError("expected model artifact must be a SHA-256")
+    args.expected_model_artifact_sha256 = artifact
     if args.expected_answers_sha256 != TRAIN600_SHA256:
         raise ValueError("autopilot requires the frozen Train600 SHA-256")
     if _file_sha256(args.answers) != args.expected_answers_sha256:
         raise ValueError("frozen Train600 answer artifact changed")
     bindings = _parse_service_bindings(args.owned_service)
+    if set(endpoints) != set(bindings):
+        raise ValueError("Judge endpoints and owned services must bind one-to-one")
     fingerprint = _fingerprint(args)
     status_path = args.run_root / "status.json"
     if args.run_root.exists():
@@ -670,7 +727,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 log_path=args.run_root / "logs/visual_csv_judge.log",
             ):
                 raise RuntimeError("visual CSV Judge command failed")
-            judge_audit = _audit_judgments(merged, judgments)
+            judge_audit = _audit_judgments(
+                merged,
+                judgments,
+                verifier_artifact_sha256=args.expected_model_artifact_sha256,
+            )
             if judge_audit.get("infrastructure_errors", judge_audit["failures"]):
                 if judge_stage.get("retry_started"):
                     judge_stage["persistent_infrastructure_failures"] = judge_audit.get(
@@ -689,7 +750,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                         log_path=args.run_root / "logs/visual_csv_judge_retry.log",
                     ):
                         raise RuntimeError("visual CSV Judge retry command failed")
-                    judge_audit = _audit_judgments(merged, judgments)
+                    judge_audit = _audit_judgments(
+                        merged,
+                        judgments,
+                        verifier_artifact_sha256=args.expected_model_artifact_sha256,
+                    )
                     judge_stage["persistent_infrastructure_failures"] = (
                         judge_audit.get(
                             "infrastructure_errors", judge_audit["failures"]
@@ -699,7 +764,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 {"status": "passed", "ended_at": _now(), "audit": judge_audit}
             )
             _save_state(status_path, state)
-        elif _audit_judgments(merged, judgments)["output_sha256"] != state[
+        elif _audit_judgments(
+            merged,
+            judgments,
+            verifier_artifact_sha256=args.expected_model_artifact_sha256,
+        )["output_sha256"] != state[
             "stages"
         ]["visual_csv_judge"]["audit"]["output_sha256"]:
             raise RuntimeError("passed visual CSV Judge output changed")
@@ -757,6 +826,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             _save_state(status_path, state)
             if _run_command(command, cwd=args.repo_root, log_path=args.run_root / f"logs/{stage}.log"):
                 raise RuntimeError(f"{stage} command failed")
+            if stage == "selection":
+                selection_summary = _read_json(
+                    args.run_root / "selection/summary.json"
+                )
+                balancing = selection_summary.get("quality_balancing")
+                if (
+                    not isinstance(balancing, Mapping)
+                    or balancing.get("status") != "applied"
+                ):
+                    raise RuntimeError(
+                        "visual CSV stable pool cannot satisfy the frozen quality balance"
+                    )
             output = (
                 args.run_root / "selection/selected.jsonl"
                 if stage == "selection"

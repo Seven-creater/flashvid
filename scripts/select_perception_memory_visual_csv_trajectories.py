@@ -126,7 +126,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 f"trajectory[{index}] is not bound to the supplied Train600 artifact"
             )
     labeled, selected, selection_summary = select_visual_csv_trajectories(
-        trajectories, visual_csv_results, answers
+        trajectories,
+        visual_csv_results,
+        answers,
+        verifier_artifact_sha256=args.verifier_artifact_sha256,
     )
     report = {
         **selection_summary,
@@ -157,6 +160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--visual-csv-results", type=Path, nargs="+", required=True
     )
+    parser.add_argument("--verifier-artifact-sha256", required=True)
     parser.add_argument("--answers", type=Path, required=True)
     parser.add_argument("--expected-answers-sha256", required=True)
     parser.add_argument("--labeled-output", type=Path, required=True)

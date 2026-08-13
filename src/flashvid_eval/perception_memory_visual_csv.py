@@ -21,7 +21,7 @@ from .privacy import AnnotationLeakError, assert_annotation_free_request
 from .schemas import ModelSample
 
 
-VISUAL_CSV_SCHEMA_VERSION = "visual_csv_v2"
+VISUAL_CSV_SCHEMA_VERSION = "visual_csv_v4"
 VISUAL_CSV_SEEDS = (17, 42, 73)
 _PUBLIC_SAMPLE_KEYS = frozenset(
     {"dataset", "sample_id", "video", "question", "choices"}
@@ -85,12 +85,15 @@ _RESULT_KEYS = frozenset(
         "prefix_id",
         "prefix_index",
         "source_sha256",
+        "visual_csv_config",
         "visual_csv_config_sha256",
+        "verifier_artifact_sha256",
         "visual_csv_judge_seeds",
         "candidate_blind",
         "tools_disabled",
         "media_count",
         "frame_paths_sha256",
+        "frame_content_sha256s",
         "timestamps_sha256",
         "annotation_leak_check",
         "visual_csv_confirmations",
@@ -118,6 +121,28 @@ def canonical_sha256(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def frame_content_sha256s(frame_paths: Sequence[str]) -> tuple[str, ...]:
+    """Hash the bytes behind an ordered local-frame inventory."""
+
+    values: list[str] = []
+    for raw_path in frame_paths:
+        path = Path(str(raw_path)).resolve()
+        if not path.is_absolute() or not path.is_file():
+            raise ValueError(f"visual CSV frame is missing: {path}")
+        values.append(_file_sha256(path))
+    if not values:
+        raise ValueError("visual CSV requires at least one frame")
+    return tuple(values)
 
 
 def _strip_private_trajectory_fields(row: dict[str, Any]) -> None:
@@ -168,6 +193,7 @@ class VisualCsvDecision:
 
 @dataclass(frozen=True)
 class VisualCsvConfig:
+    verifier_artifact_sha256: str
     model: str = "Qwen3.5-9B"
     seeds: tuple[int, ...] = VISUAL_CSV_SEEDS
     max_tokens: int = 256
@@ -177,6 +203,12 @@ class VisualCsvConfig:
     def __post_init__(self) -> None:
         if not self.model.strip():
             raise ValueError("model cannot be empty")
+        artifact = str(self.verifier_artifact_sha256 or "").strip().lower()
+        if len(artifact) != 64 or any(
+            character not in "0123456789abcdef" for character in artifact
+        ):
+            raise ValueError("verifier_artifact_sha256 must be a SHA-256")
+        object.__setattr__(self, "verifier_artifact_sha256", artifact)
         if len(self.seeds) != 3 or len(set(self.seeds)) != 3:
             raise ValueError("visual CSV requires exactly three unique seeds")
         if self.max_tokens <= 0 or self.temperature < 0:
@@ -188,10 +220,39 @@ class VisualCsvConfig:
         return canonical_sha256(
             {
                 "schema_version": VISUAL_CSV_SCHEMA_VERSION,
-                "config": asdict(self),
+                "config": self.to_dict(),
                 "prompt": _VISUAL_CSV_SYSTEM,
                 "parser": "strict_visual_csv_four_field_v1",
             }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "seeds": list(self.seeds),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> VisualCsvConfig:
+        if not isinstance(value, Mapping) or set(value) != {
+            "verifier_artifact_sha256",
+            "model",
+            "seeds",
+            "max_tokens",
+            "temperature",
+            "enable_thinking",
+        }:
+            raise ValueError("visual CSV result has an invalid verifier config")
+        seeds = value["seeds"]
+        if not isinstance(seeds, list):
+            raise ValueError("visual CSV verifier config seeds must be an array")
+        return cls(
+            verifier_artifact_sha256=value["verifier_artifact_sha256"],
+            model=value["model"],
+            seeds=tuple(seeds),
+            max_tokens=value["max_tokens"],
+            temperature=value["temperature"],
+            enable_thinking=value["enable_thinking"],
         )
 
 
@@ -205,7 +266,22 @@ class VisualCsvJob:
     sample: ModelSample
     frame_paths: tuple[str, ...]
     timestamps: tuple[float, ...]
+    frame_content_sha256s: tuple[str, ...]
     source_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.frame_paths
+            or len(self.frame_paths) != len(self.timestamps)
+            or len(self.frame_paths) != len(self.frame_content_sha256s)
+        ):
+            raise ValueError("visual CSV job frame provenance must be aligned")
+        if any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in self.frame_content_sha256s
+        ):
+            raise ValueError("visual CSV frame content SHA-256 is invalid")
 
 
 _VISUAL_CSV_SYSTEM = (
@@ -338,6 +414,7 @@ def bind_visual_csv_jobs(
     jobs: list[VisualCsvJob] = []
     seen_trajectories: set[str] = set()
     seen_prefixes: set[str] = set()
+    frame_hash_cache: dict[str, str] = {}
     for row_index, row in enumerate(trajectories):
         if not isinstance(row, Mapping):
             raise ValueError(f"trajectory row {row_index} must be an object")
@@ -392,6 +469,10 @@ def bind_visual_csv_jobs(
             seen_prefixes.add(prefix_id)
             frame_paths = tuple(item[0] for item in accumulated)
             frame_timestamps = tuple(item[1] for item in accumulated)
+            for path in frame_paths:
+                if path not in frame_hash_cache:
+                    frame_hash_cache[path] = _file_sha256(Path(path))
+            content_sha256s = tuple(frame_hash_cache[path] for path in frame_paths)
             public_sample = {
                 "dataset": sample.dataset,
                 "sample_id": sample.sample_id,
@@ -407,6 +488,7 @@ def bind_visual_csv_jobs(
                     "public_sample": public_sample,
                     "frame_paths": frame_paths,
                     "timestamps": frame_timestamps,
+                    "frame_content_sha256s": content_sha256s,
                     "source_run_fingerprint": row.get("run_fingerprint"),
                 }
             )
@@ -420,6 +502,7 @@ def bind_visual_csv_jobs(
                     sample=sample,
                     frame_paths=frame_paths,
                     timestamps=frame_timestamps,
+                    frame_content_sha256s=content_sha256s,
                     source_sha256=source_sha256,
                 )
             )
@@ -551,8 +634,18 @@ def _validate_confirmation(
 
 
 def _validate_result_for_job(result: Mapping[str, Any], job: VisualCsvJob) -> None:
+    if frame_content_sha256s(job.frame_paths) != job.frame_content_sha256s:
+        raise ValueError("visual CSV source frame content changed")
     if set(result) != _RESULT_KEYS:
         raise ValueError("visual CSV result has unexpected fields")
+    verifier_config = VisualCsvConfig.from_dict(result.get("visual_csv_config"))
+    if result.get("visual_csv_config") != verifier_config.to_dict():
+        raise ValueError("visual CSV verifier config is not canonical")
+    artifact = str(result.get("verifier_artifact_sha256") or "")
+    if len(artifact) != 64 or any(
+        character not in "0123456789abcdef" for character in artifact
+    ):
+        raise ValueError("visual CSV verifier artifact SHA-256 is invalid")
     if (
         result.get("schema_version") != 1
         or result.get("visual_csv_schema_version") != VISUAL_CSV_SCHEMA_VERSION
@@ -562,10 +655,14 @@ def _validate_result_for_job(result: Mapping[str, Any], job: VisualCsvJob) -> No
         or result.get("prefix_id") != job.prefix_id
         or result.get("prefix_index") != job.prefix_index
         or result.get("source_sha256") != job.source_sha256
+        or result.get("visual_csv_config_sha256") != verifier_config.fingerprint()
+        or artifact != verifier_config.verifier_artifact_sha256
         or result.get("candidate_blind") is not True
         or result.get("tools_disabled") is not True
         or result.get("media_count") != len(job.frame_paths)
         or result.get("frame_paths_sha256") != canonical_sha256(job.frame_paths)
+        or tuple(result.get("frame_content_sha256s") or ())
+        != job.frame_content_sha256s
         or result.get("timestamps_sha256") != canonical_sha256(job.timestamps)
         or result.get("annotation_leak_check") != "passed"
     ):
@@ -601,13 +698,13 @@ class VisualCsvVerifier:
     def __init__(
         self,
         clients: VisualCsvClient | Sequence[VisualCsvClient],
-        config: VisualCsvConfig | None = None,
+        config: VisualCsvConfig,
     ) -> None:
         values = tuple(clients) if isinstance(clients, Sequence) else (clients,)
         if not values or any(not callable(getattr(item, "chat", None)) for item in values):
             raise ValueError("visual CSV requires one or more clients")
         self.clients = values
-        self.config = config or VisualCsvConfig()
+        self.config = config
 
     def _client(self, prefix_id: str) -> VisualCsvClient:
         digest = hashlib.sha256(prefix_id.encode("utf-8")).digest()
@@ -725,12 +822,15 @@ class VisualCsvVerifier:
             "prefix_id": job.prefix_id,
             "prefix_index": job.prefix_index,
             "source_sha256": job.source_sha256,
+            "visual_csv_config": self.config.to_dict(),
             "visual_csv_config_sha256": self.config.fingerprint(),
+            "verifier_artifact_sha256": self.config.verifier_artifact_sha256,
             "visual_csv_judge_seeds": list(self.config.seeds),
             "candidate_blind": True,
             "tools_disabled": True,
             "media_count": len(job.frame_paths),
             "frame_paths_sha256": canonical_sha256(job.frame_paths),
+            "frame_content_sha256s": list(job.frame_content_sha256s),
             "timestamps_sha256": canonical_sha256(job.timestamps),
             "annotation_leak_check": "passed",
             "visual_csv_confirmations": [],
@@ -774,6 +874,8 @@ class VisualCsvVerifier:
         *,
         retry_errors: bool = False,
     ) -> dict[str, Any]:
+        if frame_content_sha256s(job.frame_paths) != job.frame_content_sha256s:
+            raise RuntimeError("visual CSV frame content changed before request/resume")
         expected = self._base_row(job)
         if existing is None:
             return expected
@@ -789,12 +891,15 @@ class VisualCsvVerifier:
             "prefix_id",
             "prefix_index",
             "source_sha256",
+            "visual_csv_config",
             "visual_csv_config_sha256",
+            "verifier_artifact_sha256",
             "visual_csv_judge_seeds",
             "candidate_blind",
             "tools_disabled",
             "media_count",
             "frame_paths_sha256",
+            "frame_content_sha256s",
             "timestamps_sha256",
             "annotation_leak_check",
         ):
@@ -867,14 +972,23 @@ class VisualCsvVerifier:
 def attach_visual_csv_results(
     trajectories: Iterable[Mapping[str, Any]],
     results: Iterable[Mapping[str, Any]],
+    *,
+    verifier_artifact_sha256: str,
 ) -> tuple[dict[str, Any], ...]:
     """Attach immutable visual-only confirmations to their exact source prefix."""
+
+    expected_verifier = str(verifier_artifact_sha256 or "").strip().lower()
+    if len(expected_verifier) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_verifier
+    ):
+        raise ValueError("expected visual CSV verifier artifact must be a SHA-256")
 
     sources = list(trajectories)
     jobs = bind_visual_csv_jobs(sources)
     job_by_prefix = {job.prefix_id: job for job in jobs}
     result_by_prefix: dict[str, Mapping[str, Any]] = {}
     config_hashes: set[str] = set()
+    verifier_artifact_hashes: set[str] = set()
     configured_seed_sets: set[tuple[int, ...]] = set()
     for raw in results:
         prefix_id = _text(raw.get("prefix_id"), "visual CSV prefix_id")
@@ -884,11 +998,20 @@ def attach_visual_csv_results(
         if job is None:
             raise ValueError(f"visual CSV result has unknown prefix: {prefix_id}")
         _validate_result_for_job(raw, job)
+        if raw.get("verifier_artifact_sha256") != expected_verifier:
+            raise ValueError("visual CSV verifier artifact differs from expected weights")
         result_by_prefix[prefix_id] = raw
         config_hashes.add(str(raw["visual_csv_config_sha256"]))
+        verifier_artifact_hashes.add(str(raw["verifier_artifact_sha256"]))
         configured_seed_sets.add(tuple(raw["visual_csv_judge_seeds"]))
-    if len(config_hashes) != 1 or len(configured_seed_sets) != 1:
-        raise ValueError("visual CSV results mix verifier configs or seed schemas")
+    if (
+        len(config_hashes) != 1
+        or len(verifier_artifact_hashes) != 1
+        or len(configured_seed_sets) != 1
+    ):
+        raise ValueError(
+            "visual CSV results mix verifier configs, artifacts, or seed schemas"
+        )
     output: list[dict[str, Any]] = []
     expected: set[str] = set()
     for source in sources:
@@ -929,11 +1052,18 @@ def attach_visual_csv_results(
             state["visual_csv_config_sha256"] = result.get(
                 "visual_csv_config_sha256"
             )
+            state["visual_csv_config"] = deepcopy(result.get("visual_csv_config"))
+            state["visual_csv_verifier_artifact_sha256"] = result.get(
+                "verifier_artifact_sha256"
+            )
             state["visual_csv_judge_seeds"] = deepcopy(
                 result.get("visual_csv_judge_seeds")
             )
             state["visual_csv_frame_paths_sha256"] = result.get(
                 "frame_paths_sha256"
+            )
+            state["visual_csv_frame_content_sha256s"] = deepcopy(
+                result.get("frame_content_sha256s")
             )
             state["visual_csv_timestamps_sha256"] = result.get(
                 "timestamps_sha256"
@@ -1001,6 +1131,10 @@ def label_visual_csv_prefixes(
             if (
                 state.get("visual_csv_frame_paths_sha256")
                 != canonical_sha256(job.frame_paths)
+                or tuple(state.get("visual_csv_frame_content_sha256s") or ())
+                != job.frame_content_sha256s
+                or frame_content_sha256s(job.frame_paths)
+                != job.frame_content_sha256s
                 or state.get("visual_csv_timestamps_sha256")
                 != canonical_sha256(job.timestamps)
             ):
@@ -1194,6 +1328,8 @@ def select_visual_csv_trajectories(
     trajectories: Iterable[Mapping[str, Any]],
     results: Iterable[Mapping[str, Any]],
     answers: Mapping[tuple[str, str], str],
+    *,
+    verifier_artifact_sha256: str,
 ) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...], dict[str, Any]]:
     """Offline-label visual prefixes and select one deterministic stable trace/sample."""
 
@@ -1212,7 +1348,11 @@ def select_visual_csv_trajectories(
             raise ValueError(f"frozen candidate drift across trajectories for {identity}")
         source_samples.add(identity)
 
-    attached = attach_visual_csv_results(sources, results)
+    attached = attach_visual_csv_results(
+        sources,
+        results,
+        verifier_artifact_sha256=verifier_artifact_sha256,
+    )
     labeled_rows = list(
         label_visual_csv_prefixes(
             attached, answers, candidate_answers=candidate_answers

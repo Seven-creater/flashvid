@@ -57,6 +57,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     trajectories = [row for path in args.trajectories for row in read_jsonl(path)]
     jobs = bind_visual_csv_jobs(trajectories)
     config = VisualCsvConfig(
+        verifier_artifact_sha256=args.verifier_artifact_sha256,
         model=args.model,
         seeds=tuple(args.judge_seed),
         max_tokens=args.max_tokens,
@@ -128,6 +129,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     progress.write_text("", encoding="utf-8")
     return {
         "visual_csv_config_sha256": config.fingerprint(),
+        "verifier_artifact_sha256": config.verifier_artifact_sha256,
         "trajectories": len(trajectories),
         "prefixes": len(jobs),
         "complete": sum(
@@ -150,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-url", action="append", dest="base_urls")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "no"))
     parser.add_argument("--model", default="Qwen3.5-9B")
+    parser.add_argument("--verifier-artifact-sha256", required=True)
     parser.add_argument("--judge-seed", type=int, action="append", default=None)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.2)

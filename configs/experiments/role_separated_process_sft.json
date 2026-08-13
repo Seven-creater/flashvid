@@ -12,48 +12,61 @@
     "candidate_rerun": false
   },
   "roles": {
-    "controller": {
+    "planner": {
       "base_model": "Qwen3.5-9B",
-      "adapter": "trainable_controller_lora",
+      "adapter": "trainable_planner_lora",
       "trainable": true,
       "media_count": 0,
       "loss_targets": [
         "evidence_request",
-        "ledger_update",
         "frame_select",
-        "continue_stop",
-        "final_answer"
+        "continue_stop"
       ]
     },
-    "perception": {
+    "observer": {
       "base_model": "Qwen3.5-9B",
       "adapter": "frozen_base",
       "trainable": false,
       "candidate_blind": true,
       "input_scope": "current_frame_batch_only"
     },
-    "judge": {
+    "verifier": {
       "base_model": "Qwen3.5-9B",
       "adapter": "frozen_base",
       "trainable": false,
       "candidate_blind": true,
-      "includes": [
-        "completeness",
-        "evidence_answer",
-        "confirmation"
-      ]
+      "input_scope": "public_question_options_and_observed_frames_only"
+    },
+    "answerer": {
+      "base_model": "Qwen3.5-9B",
+      "adapter": "frozen_base",
+      "trainable": false,
+      "candidate_blind": true,
+      "input_scope": "ledger_and_up_to_16_verifier_cited_frames"
     }
   },
   "shared_adapter_across_roles_forbidden": true,
   "process_sft": {
     "source_split": "train600_only",
     "templates": [
-      "direct_answer",
       "single_frame_select",
       "timestamp_grounded_select",
       "hierarchical_refinement",
       "multi_interval_exploration"
     ],
+    "minimum_real_frame_selects_per_question": 1,
+    "quality_contract_version": "role_separated_process_sft_quality_v1",
+    "visual_path_classifier_version": "visual_path_classifier_v1",
+    "candidate_training_strata": [
+      "candidate_correct",
+      "candidate_wrong"
+    ],
+    "candidate_strata_ratio_min": 0.9,
+    "candidate_strata_ratio_max": 1.1,
+    "observed_continue_stop_ratio_min": 0.9,
+    "observed_continue_stop_ratio_max": 1.1,
+    "visual_path_all_families_required": true,
+    "visual_path_max_min_ratio": 1.1,
     "real_tool_loop_required": true,
     "incomplete_prefix_targets_continue": true,
     "complete_prefix_stop_requires_3_of_3": true,
@@ -148,42 +161,60 @@
   },
   "role_ablation": {
     "split": "dev",
+    "samples_per_dataset": 10,
+    "total_samples": 30,
     "seeds": [42],
     "may_select_prompt": false,
     "test_access": "forbidden",
     "purpose": "attribute regression to the adapter role before any new SFT selection",
+    "causal_contract": {
+      "base_all_mode": "end_to_end_source_for_frozen_inputs",
+      "planner_old_lora_mode": "end_to_end_system_intervention",
+      "observer_old_lora_mode": "fixed_observer_pair_with_base_downstream",
+      "verifier_old_lora_mode": "fixed_verifier_pair",
+      "answerer_old_lora_mode": "fixed_answerer_pair",
+      "old_lora_all_mode": "end_to_end_interaction_not_single_role_causal",
+      "frame_content_sha256_required": true,
+      "same_frozen_request_sha256_required": true,
+      "offline_scoring_after_both_arms": true
+    },
+    "manifest_derivation": "first_10_rows_of_each_sha256_frozen_dev_manifest",
+    "artifacts": {
+      "base": {
+        "base_url": "http://127.0.0.1:8200/v1",
+        "model": "Qwen3.5-9B",
+        "artifact_sha256": "5f050597da76f16ff28499fb75fcd6562a1fbf4bc20df83124b77709e9ee9d60"
+      },
+      "candidate": {
+        "base_url": "http://127.0.0.1:8201/v1",
+        "model": "Qwen3.5-9B-PerceptionMemory-SFT-E3",
+        "artifact_sha256": "10cf7c7fe364e381ecb2dcc3890f6a87df7d9be2cc67c20975993dc01f62b999"
+      }
+    },
     "cells": [
       {
-        "id": "base_base_base",
-        "bindings": {"controller": "base", "perception": "base", "judge": "base"}
+        "id": "base_all",
+        "bindings": {"planner": "base", "observer": "base", "verifier": "base", "answerer": "base"}
       },
       {
-        "id": "sft_base_base",
-        "bindings": {"controller": "candidate", "perception": "base", "judge": "base"}
+        "id": "planner_old_lora",
+        "bindings": {"planner": "candidate", "observer": "base", "verifier": "base", "answerer": "base"}
       },
       {
-        "id": "base_sft_base",
-        "bindings": {"controller": "base", "perception": "candidate", "judge": "base"}
+        "id": "observer_old_lora",
+        "bindings": {"planner": "base", "observer": "candidate", "verifier": "base", "answerer": "base"}
       },
       {
-        "id": "base_base_sft",
-        "bindings": {"controller": "base", "perception": "base", "judge": "candidate"}
+        "id": "verifier_old_lora",
+        "bindings": {"planner": "base", "observer": "base", "verifier": "candidate", "answerer": "base"}
       },
       {
-        "id": "sft_sft_base",
-        "bindings": {"controller": "candidate", "perception": "candidate", "judge": "base"}
+        "id": "answerer_old_lora",
+        "bindings": {"planner": "base", "observer": "base", "verifier": "base", "answerer": "candidate"}
       },
       {
-        "id": "sft_base_sft",
-        "bindings": {"controller": "candidate", "perception": "base", "judge": "candidate"}
-      },
-      {
-        "id": "base_sft_sft",
-        "bindings": {"controller": "base", "perception": "candidate", "judge": "candidate"}
-      },
-      {
-        "id": "sft_sft_sft",
-        "bindings": {"controller": "candidate", "perception": "candidate", "judge": "candidate"}
+        "id": "old_lora_all",
+        "bindings": {"planner": "candidate", "observer": "candidate", "verifier": "candidate", "answerer": "candidate"}
       }
     ]
   },
@@ -215,7 +246,7 @@
     {
       "name": "long_vt",
       "repository_url": "https://github.com/EvolvingLMMs-Lab/LongVT.git",
-      "commit": "ab1fa2c911676dbcb253628c0b40df1fe256bca1",
+      "commit": "08d755b973e4ad990ac5cdd64fb992c804d840db",
       "paper_url": "https://arxiv.org/abs/2511.20785",
       "reuse_boundary": "Reuse real crop/tool-response episode structure and the documented need to control accumulated visual history.",
       "excluded_boundary": "Do not import semantic scene tools; do not attribute RL or RFT results to SFT."
@@ -247,7 +278,7 @@
   ],
   "orchestration": {
     "source_lock_path": "configs/source_locks/role_separated_process_sft_sources.lock.json",
-    "role_ablation_output": "results/eval/perception_memory_eva_sft/dev_role_ablation",
+    "role_ablation_output": "results/eval/role_separated_process_sft/role_ablation",
     "gate_cli": "scripts/gate_perception_memory.py",
     "setsid": true,
     "nohup": true,

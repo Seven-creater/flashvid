@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "experiment_id": "role-separated-perception-memory-process-sft-v1",
-  "config_sha256": "c65a11eee13e11d606902caa998f227a3da3744a97943f56c804a42575fbc28e",
+  "config_sha256": "927fff5d86d61bb9089f602e8861265da581f920e1e2a9331ca816a0486f0b2c",
   "source_count": 7,
-  "source_set_sha256": "ea57fcd860fe07c48b8af1de8fd90831be43a4e1946addda160a0e13052a5f40",
+  "source_set_sha256": "2fae088be1c1ff0a5bb5a99deb8f08cc095a7ac72d0ca48d6b3b624b19a48b03",
   "network_policy": {
     "code_fetch": "server_only",
     "model_data_dependencies": "hf-mirror_or_domestic_mirror_only",
@@ -37,7 +37,7 @@
     {
       "name": "long_vt",
       "repository_url": "https://github.com/EvolvingLMMs-Lab/LongVT.git",
-      "commit": "ab1fa2c911676dbcb253628c0b40df1fe256bca1",
+      "commit": "08d755b973e4ad990ac5cdd64fb992c804d840db",
       "paper_url": "https://arxiv.org/abs/2511.20785",
       "reuse_boundary": "Reuse real crop/tool-response episode structure and the documented need to control accumulated visual history.",
       "excluded_boundary": "Do not import semantic scene tools; do not attribute RL or RFT results to SFT."

@@ -44,7 +44,8 @@ def _trajectory(dataset: str, sample_id: str, trajectory_id: str, marker: str) -
     }
 
 
-def _record(trajectory_id: str, prefix_index: int, target: str) -> dict:
+def _record(trajectory_id: str, role: str) -> dict:
+    target = "stop" if role == "planner" else "memory"
     return {
         "messages": [
             {"role": "user", "content": "question"},
@@ -52,8 +53,8 @@ def _record(trajectory_id: str, prefix_index: int, target: str) -> dict:
         ],
         "metadata": {
             "trajectory_id": trajectory_id,
-            "prefix_index": prefix_index,
-            "episode_target_type": target,
+            "process_role": role,
+            "terminal_prefix_index": 0,
         },
     }
 
@@ -61,12 +62,9 @@ def _record(trajectory_id: str, prefix_index: int, target: str) -> dict:
 def _install_export_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     gate_calls: list[dict] = []
 
-    def fake_export(row: dict) -> tuple[dict, ...]:
+    def fake_export(row: dict, **_kwargs: object) -> tuple[dict, ...]:
         trajectory_id = row["trajectory_id"]
-        return (
-            _record(trajectory_id, 0, "memory"),
-            _record(trajectory_id, -1, "tool"),
-        )
+        return (_record(trajectory_id, "planner"),)
 
     def fake_gate(trajectories: list[dict], records: list[dict], **kwargs: int) -> dict:
         selected_by_dataset: dict[str, int] = {}
@@ -76,8 +74,8 @@ def _install_export_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         gate_calls.append(
             {
                 "trajectory_ids": [row["trajectory_id"] for row in trajectories],
-                "record_ids": [row["metadata"]["record_id"] for row in records],
-                "thresholds": kwargs,
+            "record_ids": [row["metadata"]["record_id"] for row in records],
+                "kwargs": kwargs,
             }
         )
         return {
@@ -87,6 +85,23 @@ def _install_export_stubs(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
             "candidate_fixes_by_dataset": {
                 dataset: 0 for dataset in selected_by_dataset
             },
+            "candidate_training_strata": {
+                "candidate_correct": 0,
+                "candidate_wrong": 0,
+            },
+            "visual_path_distribution": {
+                "single_frame_select": 0,
+                "timestamp_grounded_select": 0,
+                "hierarchical_refinement": 0,
+                "multi_interval_exploration": 0,
+            },
+            "prefixes": {"complete": len(trajectories)},
+            "planner_decisions": {
+                "observed_incomplete_continue": 0,
+                "stop": len(trajectories),
+            },
+            "role_episodes": {"planner": len(trajectories)},
+            "assistant_targets": {"stop": len(trajectories)},
             "sft_records": len(records),
         }
 
@@ -112,35 +127,25 @@ def test_build_sorts_records_and_freezes_hash_coverage(
         selected_paths=[first, second],
         output=output,
         summary_path=summary_path,
-        minimum_total=2,
-        minimum_per_dataset=0,
-        minimum_candidate_fixes=0,
-        minimum_candidate_fixes_per_dataset=0,
+        completion_gate_kind="legacy_prefix_judge",
     )
 
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     identities = [
         (
             row["metadata"]["trajectory_id"],
-            row["metadata"]["prefix_index"],
-            row["metadata"]["episode_target_type"],
+            row["metadata"]["process_role"],
         )
         for row in records
     ]
     assert identities == [
-        ("trajectory-a", -1, "tool"),
-        ("trajectory-a", 0, "memory"),
-        ("trajectory-b", -1, "tool"),
-        ("trajectory-b", 0, "memory"),
+        ("trajectory-a", "planner"),
+        ("trajectory-b", "planner"),
     ]
-    assert len({row["metadata"]["record_id"] for row in records}) == 4
+    assert len({row["metadata"]["record_id"] for row in records}) == 2
     assert gate_calls[0]["trajectory_ids"] == ["trajectory-a", "trajectory-b"]
-    assert gate_calls[0]["thresholds"] == {
-        "minimum_total": 2,
-        "minimum_per_dataset": 0,
-        "minimum_candidate_fixes": 0,
-        "minimum_candidate_fixes_per_dataset": 0,
-    }
+    assert gate_calls[0]["kwargs"] == {"completion_gate_kind": "legacy_prefix_judge"}
+    assert summary["selection_quality_gate"]["quantity_is_advisory"] is True
     assert summary == json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["outputs"]["sft_jsonl"]["sha256"] == hashlib.sha256(
         output.read_bytes()
@@ -205,10 +210,7 @@ def test_build_rejects_duplicate_sample_and_trajectory(
             selected_paths=[selected],
             output=tmp_path / "sft.jsonl",
             summary_path=tmp_path / "summary.json",
-            minimum_total=0,
-            minimum_per_dataset=0,
-            minimum_candidate_fixes=0,
-            minimum_candidate_fixes_per_dataset=0,
+            completion_gate_kind="legacy_prefix_judge",
         )
 
     assert not (tmp_path / "sft.jsonl").exists()
@@ -221,11 +223,11 @@ def test_build_rejects_duplicate_stable_record_id(
     row = _trajectory("lvbench", "sample", "trajectory", "1")
     selected = tmp_path / "selected.jsonl"
     _write_jsonl(selected, [row])
-    duplicate = _record("trajectory", 0, "memory")
+    duplicate = _record("trajectory", "planner")
     monkeypatch.setattr(
         builder,
         "build_perception_memory_sft_records",
-        lambda _row: (duplicate, deepcopy(duplicate)),
+        lambda _row, **_kwargs: (duplicate, deepcopy(duplicate)),
     )
 
     with pytest.raises(ValueError, match="duplicate process-SFT record_id"):
@@ -233,10 +235,7 @@ def test_build_rejects_duplicate_stable_record_id(
             selected_paths=[selected],
             output=tmp_path / "sft.jsonl",
             summary_path=tmp_path / "summary.json",
-            minimum_total=0,
-            minimum_per_dataset=0,
-            minimum_candidate_fixes=0,
-            minimum_candidate_fixes_per_dataset=0,
+            completion_gate_kind="legacy_prefix_judge",
         )
 
 
@@ -261,10 +260,10 @@ def test_overwrite_is_explicit_and_invalid_input_preserves_existing_pair(
             summary_path=summary_path,
         )
 
-    def fail_on_bad(row: dict) -> tuple[dict, ...]:
+    def fail_on_bad(row: dict, **_kwargs: object) -> tuple[dict, ...]:
         if row["sample_id"] == "bad":
             raise ValueError("invalid selected trajectory")
-        return (_record(row["trajectory_id"], 0, "memory"),)
+        return (_record(row["trajectory_id"], "planner"),)
 
     monkeypatch.setattr(builder, "build_perception_memory_sft_records", fail_on_bad)
     with pytest.raises(ValueError, match="invalid selected trajectory"):
@@ -287,7 +286,7 @@ def test_invalid_row_never_creates_partial_formal_outputs(
     monkeypatch.setattr(
         builder,
         "build_perception_memory_sft_records",
-        lambda _row: (_ for _ in ()).throw(ValueError("broken trajectory")),
+        lambda _row, **_kwargs: (_ for _ in ()).throw(ValueError("broken trajectory")),
     )
     output = tmp_path / "nested" / "sft.jsonl"
     summary_path = tmp_path / "nested" / "summary.json"
@@ -305,7 +304,7 @@ def test_invalid_row_never_creates_partial_formal_outputs(
     assert not output.parent.exists()
 
 
-def test_underfilled_override_is_explicit_audited_and_keeps_frozen_thresholds(
+def test_small_corpus_is_advisory_and_does_not_block_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     gate_calls = _install_export_stubs(monkeypatch)
@@ -319,45 +318,12 @@ def test_underfilled_override_is_explicit_audited_and_keeps_frozen_thresholds(
         selected_paths=[selected],
         output=tmp_path / "sft.jsonl",
         summary_path=tmp_path / "summary.json",
-        allow_underfilled_training_set=True,
-        underfilled_authorization_reason="User explicitly authorized smaller data.",
+        completion_gate_kind="legacy_prefix_judge",
     )
 
-    assert gate_calls[0]["thresholds"] == {
-        "minimum_total": 0,
-        "minimum_per_dataset": 0,
-        "minimum_candidate_fixes": 0,
-        "minimum_candidate_fixes_per_dataset": 0,
-    }
-    gate = summary["selection_gate"]
-    assert gate["thresholds"] == {
-        "minimum_total": 360,
-        "minimum_per_dataset": 100,
-        "minimum_candidate_fixes": 90,
-        "minimum_candidate_fixes_per_dataset": 20,
-    }
-    assert gate["passed_frozen_gate"] is False
-    assert "selected<360" in gate["unmet_conditions"]
-    assert gate["underfilled_override"] == {
-        "enabled": True,
-        "applied": True,
-        "authorization_reason": "User explicitly authorized smaller data.",
-    }
-
-
-def test_underfilled_override_requires_reason(tmp_path: Path) -> None:
-    selected = tmp_path / "selected.jsonl"
-    _write_jsonl(
-        selected,
-        [_trajectory("lvbench", "sample", "trajectory", "1")],
-    )
-    with pytest.raises(ValueError, match="authorization reason"):
-        builder.build(
-            selected_paths=[selected],
-            output=tmp_path / "sft.jsonl",
-            summary_path=tmp_path / "summary.json",
-            allow_underfilled_training_set=True,
-        )
+    assert gate_calls[0]["kwargs"] == {"completion_gate_kind": "legacy_prefix_judge"}
+    assert summary["selection_quality_gate"]["passed"] is True
+    assert summary["quantity_distribution"]["selected_trajectories"] == 1
 
 
 def test_experiment_config_filter_excludes_rows_without_rewriting_provenance(
@@ -374,10 +340,7 @@ def test_experiment_config_filter_excludes_rows_without_rewriting_provenance(
         selected_paths=[selected],
         output=tmp_path / "sft.jsonl",
         summary_path=tmp_path / "summary.json",
-        minimum_total=1,
-        minimum_per_dataset=0,
-        minimum_candidate_fixes=0,
-        minimum_candidate_fixes_per_dataset=0,
+        completion_gate_kind="legacy_prefix_judge",
         include_experiment_config_sha256="b" * 64,
     )
 

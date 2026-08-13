@@ -738,7 +738,7 @@ def validate_paired_role_result(
         if role == "verifier"
         else 1
         if role == "answerer" and isinstance(frozen.get("answerer_call"), Mapping)
-        else -1
+        else 0
     )
     calls = result.get("paired_calls")
     if (
@@ -748,6 +748,12 @@ def validate_paired_role_result(
         or result.get("call_count") != expected_calls
     ):
         raise ValueError("paired role result call coverage differs from frozen input")
+    not_applicable_reason = result.get("not_applicable_reason")
+    if role == "answerer" and expected_calls == 0:
+        if not_applicable_reason != "base_runtime_did_not_reach_answerer":
+            raise ValueError("missing frozen Answerer call must be explicitly not applicable")
+    elif not_applicable_reason is not None:
+        raise ValueError("paired role result has a spurious not-applicable reason")
     for index, call in enumerate(calls):
         if call.get("call_index") != index:
             raise ValueError("paired role call indices must be contiguous")
@@ -1018,9 +1024,7 @@ def run_paired_role_ablation(
         calls = list(frozen["verifier_calls"])
     else:
         answerer = frozen.get("answerer_call")
-        if not isinstance(answerer, Mapping):
-            raise ValueError("frozen input has no successful Base Answerer call")
-        calls = [answerer]
+        calls = [answerer] if isinstance(answerer, Mapping) else []
     paired_calls: list[dict[str, Any]] = []
     for index, call in enumerate(calls):
         control = _arm_result(
@@ -1089,6 +1093,11 @@ def run_paired_role_ablation(
         "frozen_input_sha256": frozen["frozen_input_sha256"],
         "paired_calls": paired_calls,
         "call_count": len(paired_calls),
+        "not_applicable_reason": (
+            "base_runtime_did_not_reach_answerer"
+            if role == "answerer" and not paired_calls
+            else None
+        ),
         "conditioned_downstream": conditioned_downstream,
         "offline_scoring_required": True,
         "labels_serialized": False,

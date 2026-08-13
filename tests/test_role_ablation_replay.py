@@ -22,6 +22,7 @@ from flashvid_eval.role_ablation_replay import (
     freeze_role_ablation_input,
     run_paired_role_ablation,
     validate_frozen_role_input,
+    validate_paired_role_result,
 )
 from flashvid_eval.schemas import ModelSample
 from scripts.run_role_ablation_pair import _frozen_inputs, _run_contract
@@ -425,6 +426,49 @@ def test_paired_result_rejects_invalid_arm(tmp_path: Path) -> None:
             materialized_run_id="answerer_old_lora",
             materialized_run_sha256="d" * 64,
         )
+
+
+def test_answerer_pair_preserves_dev30_row_when_base_never_called_answerer(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    source["request_trace"] = [
+        item
+        for item in source["request_trace"]
+        if item["stage"] not in {"evidence_judge", "answerer", "confirmation_judge"}
+    ]
+    source["decisive_frame_indices"] = []
+    frozen = freeze_role_ablation_input(source)
+    assert frozen["answerer_call"] is None
+    control = _Client('{"answer":"A","evidence_ids":["E0001"]}')
+    treatment = _Client('{"answer":"B","evidence_ids":["E0001"]}')
+
+    result = run_paired_role_ablation(
+        frozen,
+        role="answerer",
+        control_client=control,
+        control_model="base",
+        control_artifact_sha256="b" * 64,
+        treatment_client=treatment,
+        treatment_model="lora",
+        treatment_artifact_sha256="c" * 64,
+        materialized_run_id="answerer_old_lora",
+        materialized_run_sha256="d" * 64,
+    )
+
+    assert result["call_count"] == 0
+    assert result["paired_calls"] == []
+    assert result["not_applicable_reason"] == "base_runtime_did_not_reach_answerer"
+    assert control.calls == treatment.calls == []
+    validate_paired_role_result(result, frozen)
+
+    changed = deepcopy(result)
+    changed["not_applicable_reason"] = None
+    changed["result_sha256"] = canonical_sha256(
+        {key: value for key, value in changed.items() if key != "result_sha256"}
+    )
+    with pytest.raises(ValueError, match="explicitly not applicable"):
+        validate_paired_role_result(changed, frozen)
 
 
 def test_paired_cli_contract_binds_materialized_run_sha(tmp_path: Path) -> None:
